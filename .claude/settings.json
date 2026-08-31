@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c ' *)",
+      "Bash(python \"C:/Users/dell/AppData/Local/Temp/claude/c--Users-dell-Desktop-MEGH---Copy---Copy--2--meghalaya/debd1cd9-68e2-4494-a5d0-60a9433d8d0f/scratchpad/test_node1.py\")",
+      "Bash(python -u -c ' *)",
+      "Bash(python -u \"C:/Users/dell/AppData/Local/Temp/claude/c--Users-dell-Desktop-MEGH---Copy---Copy--2--meghalaya/debd1cd9-68e2-4494-a5d0-60a9433d8d0f/scratchpad/test_node1.py\")",
+      "Bash(python -c \"import ast; [ast.parse\\(open\\(f,encoding='utf-8'\\).read\\(\\)\\) for f in ['backend/services/prompt_assembler.py','backend/services/gemini_service.py','backend/routers/query.py']]; print\\('syntax OK'\\)\")",
+      "Bash(PYTHONIOENCODING=utf-8 python -u -c ' *)",
+      "Bash(powershell -NoProfile -Command 'Get-NetTCPConnection -LocalPort 8000 -State Listen -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess | Sort-Object -Unique | ForEach-Object { Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue }')",
+      "Bash(PYTHONPATH=\"c:/Users/dell/Desktop/MEGH - Copy - Copy \\(2\\)/meghalaya\" ./unified-data/.venv/Scripts/python.exe -m uvicorn gateway.app:app --host 127.0.0.1 --port 8000)",
+      "Bash(break)",
+      "Bash(PYTHONIOENCODING=utf-8 python -u \"C:/Users/dell/AppData/Local/Temp/claude/c--Users-dell-Desktop-MEGH---Copy---Copy--2--meghalaya/debd1cd9-68e2-4494-a5d0-60a9433d8d0f/scratchpad/verify_followup.py\")",
+      "Bash(python -c \"import ast;[ast.parse\\(open\\(f,encoding='utf-8'\\).read\\(\\)\\) for f in ['backend/services/prompt_assembler.py','backend/routers/query.py','backend/services/gemini_service.py']];print\\('syntax OK'\\)\")"
+    ]
+  }
+}
