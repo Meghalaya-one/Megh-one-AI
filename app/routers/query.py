@@ -160,6 +160,9 @@ async def query(req: QueryRequest, request: Request,
 
     latency_ms = (time.monotonic() - started) * 1000
     result["session_id"] = session_id
+    # Surface the real end-to-end time to the UI meta line. On a cache hit this
+    # is recomputed here (the fast path), overwriting whatever was cached.
+    result["execution_time_ms"] = round(latency_ms)
 
     # L1 follow-up context — recorded even on a cache hit, so the next turn's
     # follow-up rewrite still has this question as its antecedent.
