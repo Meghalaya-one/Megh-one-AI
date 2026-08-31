@@ -3233,7 +3233,25 @@ async function startMic() {
   } catch (e) {
     isRecording = false;
     setMicUI(false);
-    alert('Microphone permission denied. Please allow microphone access and try again.');
+    console.error('startMic getUserMedia failed:', e && e.name, e && e.message, e);
+    let msg;
+    switch (e && e.name) {
+      case 'NotAllowedError':
+        // Either the user clicked "Block", or a Permissions-Policy header on this
+        // page disables the mic (check the response header microphone=(self)).
+        msg = 'Microphone access is blocked. Allow it in the browser site settings (and check the OS microphone privacy settings), then try again.';
+        break;
+      case 'NotFoundError':
+      case 'OverconstrainedError':
+        msg = 'No microphone was found. Plug one in or select an input device, then try again.';
+        break;
+      case 'NotReadableError':
+        msg = 'The microphone is in use by another app. Close it and try again.';
+        break;
+      default:
+        msg = 'Could not start the microphone' + (e && e.name ? ' (' + e.name + ')' : '') + '. Please try again.';
+    }
+    alert(msg);
   }
 }
 function stopMic() {

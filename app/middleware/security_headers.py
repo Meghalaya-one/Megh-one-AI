@@ -8,7 +8,7 @@ Adds the standard hardening headers to every response:
                                              base-uri, object-src, form-action are
                                              the parts that actually bite here)
   - Referrer-Policy: no-referrer
-  - Permissions-Policy                     (deny camera / mic / geolocation)
+  - Permissions-Policy                     (deny camera / geolocation; mic = self only)
   - Cross-Origin-Opener-Policy / -Resource-Policy: same-origin
   - Strict-Transport-Security              (when settings.HSTS_ENABLED)
   - Cache-Control: no-store on /api/*      (keep answers/audit data out of caches)
@@ -26,7 +26,9 @@ from starlette.requests import Request
 
 from app.config import settings
 
-_PERMISSIONS_POLICY = "camera=(), microphone=(), geolocation=(), interest-cohort=()"
+# microphone=(self) so the "Speak" voice-query feature on our own pages can call
+# getUserMedia; still denied for cross-origin frames. camera/geolocation stay off.
+_PERMISSIONS_POLICY = "camera=(), microphone=(self), geolocation=(), interest-cohort=()"
 
 
 def apply_security_headers(headers: MutableHeaders, path: str) -> None:
