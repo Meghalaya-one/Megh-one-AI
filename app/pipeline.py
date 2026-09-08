@@ -12,11 +12,14 @@ import numbers
 import re
 
 import httpx
+from rapidfuzz import fuzz
 
 from app import auth, edge, followups, llm, premise_check, prompt_builder, rag
 from app.config import settings
 from app.db import UnsafeSQLError, run_readonly
 from app.entity_resolver import (
+    all_districts,
+    detect_region,
     lookup_geo_term,
     resolve_dimension,
     resolve_house_status,
@@ -70,14 +73,19 @@ class ClarificationNeeded(Exception):
     from the user. `question` is the thing to ask; `options` (optional) is a
     list of {"label", "question"} the UI renders as one-click replies — each
     `question` is a fully-formed standalone question that resumes the flow.
-    `rule` (optional) is a short tag for why we paused (shown in the UI)."""
+    `rule` (optional) is a short tag for why we paused (shown in the UI).
+    `village_hint` (optional) is the exact village-name text the user typed,
+    set only for a village-ambiguity pause — see Session.pending_village_hint
+    for why a free-text resume needs it re-supplied deterministically rather
+    than trusting the LLM mention-extractor to re-tag it in the merged text."""
 
     def __init__(self, question: str, *, options: list[dict] | None = None,
-                 rule: str | None = None):
+                 rule: str | None = None, village_hint: str | None = None):
         super().__init__(question)
         self.question = question
         self.options = options or []
         self.rule = rule
+        self.village_hint = village_hint
 
 
 # ── Follow-up ("what about East Garo Hills?") rewriting ──────────────────────
@@ -88,13 +96,38 @@ _FOLLOWUP_LEAD = re.compile(
     r"same for |what if |now |then )", re.IGNORECASE,
 )
 _FOLLOWUP_PRONOUN = re.compile(
-    r"\b(it|its|that|those|these|them|they|there|this one|the same|same one)\b", re.IGNORECASE,
+    r"\b(it|its|that|those|these|them|they|there|this(?:\s+one)?|the same|same one)\b", re.IGNORECASE,
 )
 # Something that anchors the question on its own — if present, it's not a fragment.
+# Deliberately excludes generic topic words like "documents?", "eligibility?",
+# "what is", "who is", "explain": on their own (esp. as a short bare fragment)
+# these don't name a scheme or a specific metric, so right after a scheme
+# answer "Documents?" / "Eligibility?" reads as a follow-up about THAT scheme,
+# not a fresh self-contained question — they used to trip this anchor and get
+# judged standalone, which silently dropped the active scheme context.
+# "scheme" IS kept as an anchor (unlike those): a fresh, contextless question
+# like "Is there any government scheme that can help my family?" uses "that"
+# as an ordinary relative pronoun, not a reference to a prior turn, but
+# _CONTEXTLESS_REF can't tell the difference — without "scheme" anchoring it,
+# this read as a fragment needing prior context and got the "I don't have an
+# earlier answer to build on" reply instead of being answered directly (TC-008).
 _STANDALONE_ANCHOR = re.compile(
     r"\b(mgnrega|mnrega|nrega|pmay|awaas|person[\s-]?days?|expenditure|houses?|"
-    r"job cards?|wages?|sanction|eligib|documents?|scheme|how many|total|list|"
-    r"what is|who is|explain)\b", re.IGNORECASE,
+    r"job cards?|wages?|sanction|how many|total|list|scheme)\b", re.IGNORECASE,
+)
+# A bare scheme-name fragment — "in MGNREGA?", "for PMAY-G", "and Focus Plus?",
+# "what about MGNREGA" — is the canonical scheme-swap follow-up: it reuses the
+# whole previous question and only changes the scheme. It trips _STANDALONE_ANCHOR
+# (the scheme names are listed there), so without this it is mistaken for a
+# self-contained question and the router reads it as "tell me about MGNREGA".
+_SCHEME_SWAP_FOLLOWUP = re.compile(
+    r"^\s*(?:in|for|and|also|now|then|what about|how about|what of|same for|"
+    r"switch to|change to|with)?\s*"
+    r"(?:mgnrega|mnrega|nrega|pmay[\s-]?g?|awaas?|awas|"
+    r"focus[\s-]?plus|focus\s*\+|focusplus|"
+    r"cm[\s-]?elevate|cmelevate)"
+    r"\s*(?:instead|now|then|scheme)?\s*[?.!]*\s*$",
+    re.IGNORECASE,
 )
 
 
@@ -104,7 +137,7 @@ _STANDALONE_ANCHOR = re.compile(
 # query — e.g. "how launched it?" right after "what is elon musk?" was being
 # turned into a data question. So the previous turn must be one of these.
 _ANTECEDENT_ROUTES = ("data", "knowledge")
-_CONTEXTLESS_REF = re.compile(r"\b(it|its|that|those|these|them|they|this one)\b", re.IGNORECASE)
+_CONTEXTLESS_REF = re.compile(r"\b(it|its|that|those|these|them|they|this(?:\s+one)?)\b", re.IGNORECASE)
 
 
 def _mentions_scheme(question: str) -> bool:
@@ -115,6 +148,11 @@ def looks_like_followup(question: str) -> bool:
     q = question.strip()
     if len(q.split()) > 12:
         return False
+    # "in MGNREGA?" / "for PMAY-G" / "and Focus Plus?" — a scheme-swap fragment.
+    # Checked before _STANDALONE_ANCHOR, which would otherwise veto it because it
+    # names a scheme.
+    if _SCHEME_SWAP_FOLLOWUP.match(q):
+        return True
     if _FOLLOWUP_LEAD.search(q):
         return True
     if _FOLLOWUP_PRONOUN.search(q) and not _STANDALONE_ANCHOR.search(q):
@@ -123,11 +161,46 @@ def looks_like_followup(question: str) -> bool:
     return len(q.split()) <= 6 and not _STANDALONE_ANCHOR.search(q)
 
 
+def _scheme_swap_rewrite(prev_question: str, followup: str) -> "str | None":
+    """Deterministic rewrite for a bare scheme-swap follow-up ("in MGNREGA?",
+    "what about PMAY-G?"). Substitutes the follow-up's scheme for the one named
+    in the previous question, so the intent ("same question, other scheme") is
+    preserved exactly. The LLM rewrite tends to *append* the new scheme instead
+    of replacing the old one ("... in Focus Plus ... in MGNREGA?"), which then
+    reads as a cross-scheme question. Returns None if the fragment names no
+    scheme or the previous question can't be adapted — the caller falls back to
+    the LLM path."""
+    if not _SCHEME_SWAP_FOLLOWUP.match((followup or "").strip()):
+        return None
+    target = next((name for name, pat in _SCHEME_NAME_PATTERN.items()
+                   if pat.search(followup)), None)
+    if not target or not prev_question:
+        return None
+    out = prev_question
+    replaced = False
+    for name, pat in _SCHEME_NAME_PATTERN.items():
+        if name == target:
+            continue
+        if pat.search(out):
+            out = pat.sub(target, out)
+            replaced = True
+    if not replaced:
+        if _SCHEME_NAME_PATTERN[target].search(out):
+            return out  # previous question was already about the target scheme
+        out = f"{out.rstrip(' ?.')} for {target}"
+    out = re.sub(r"\s+,", ",", out).strip()
+    logger.info("follow-up scheme-swap: %r + %r -> %r", prev_question, followup, out)
+    return out
+
+
 async def rewrite_followup(question: str, prev: "object") -> str:
     """Turn a fragment into a standalone question using the previous turn.
     Falls back to the original question on any failure — never raises."""
     if not settings.FOLLOWUP_REWRITE_ENABLED or prev is None:
         return question
+    swap = _scheme_swap_rewrite(getattr(prev, "question", "") or "", question)
+    if swap:
+        return swap
     try:
         prompt = (
             "Rewrite the FOLLOW-UP as a complete, standalone question by reusing "
@@ -175,6 +248,7 @@ _ENTITY_JSON_SCHEMA = {
         "block": {"type": "string"},
         "village": {"type": "string"},
         "year": {"type": "string"},
+        "assembly_constituency": {"type": "string"},
     },
     "additionalProperties": False,
 }
@@ -219,7 +293,66 @@ def _extract_sql(raw: str) -> str:
 _SCHEME_NAME_PATTERN = {
     "MGNREGA": re.compile(r"\bmgnrega\b|\bmnrega\b|\bnrega\b", re.IGNORECASE),
     "PMAY-G": re.compile(r"\bpmay[\s-]?g?\b|\bawa+s?\b", re.IGNORECASE),
+    "Focus Plus": re.compile(r"\bfocus[\s-]?plus\b|\bfocus\s*\+|\bfocusplus\b", re.IGNORECASE),
+    "CM Elevate": re.compile(r"\bcm[\s-]?elevate\b|\bcmelevate\b", re.IGNORECASE),
 }
+# Fuzzy fallback for a scheme name the exact regex above misses because it's
+# misspelled ("manrega", "pamay") — mirrors the RapidFuzz tolerance
+# entity_resolver.py already gives district/block names. Kept separate from
+# _SCHEME_NAME_PATTERN (exact match stays the fast, zero-false-positive path;
+# this only runs when nothing named matches outright).
+_SCHEME_FUZZY_ALIASES = {
+    "MGNREGA": ["mgnrega", "mnrega", "nrega"],
+    "PMAY-G": ["pmay", "pmayg", "awaas", "awas"],
+    "Focus Plus": ["focusplus"],
+    "CM Elevate": ["cmelevate"],
+}
+_FUZZY_SCHEME_ACCEPT = 80
+
+
+def _fuzzy_named_schemes(question: str) -> list[str]:
+    words = [w.lower() for w in re.findall(r"[A-Za-z]+", question or "") if len(w) >= 5]
+    if not words:
+        return []
+    hits: list[str] = []
+    for scheme, aliases in _SCHEME_FUZZY_ALIASES.items():
+        if any(fuzz.ratio(w, a) >= _FUZZY_SCHEME_ACCEPT for w in words for a in aliases):
+            hits.append(scheme)
+    return hits
+
+
+_SCHEME_CANONICAL_SPELLING = {
+    "MGNREGA": "MGNREGA", "PMAY-G": "PMAY-G",
+    "Focus Plus": "Focus Plus", "CM Elevate": "CM Elevate",
+}
+
+
+def _correct_scheme_spelling(question: str) -> str:
+    """Fix an obviously misspelled scheme name in the question text itself
+    ("manrega" -> "MGNREGA", "pamay" -> "PMAY-G") before routing. Without this,
+    a typo'd scheme name only ever gets caught on the DATA path (via
+    _fuzzy_named_schemes) — the KNOWLEDGE/RAG path embeds the raw text
+    verbatim, so the typo silently tanks vector-search relevance against the
+    scheme's own reference docs and the question comes back "not covered".
+    Conservative by construction: a word only gets corrected when it does NOT
+    already exactly match a scheme alias (nothing to fix) and DOES fuzzy-match
+    one closely enough — so it can't mangle an unrelated word."""
+    if not question:
+        return question
+
+    def _sub(m: "re.Match") -> str:
+        word = m.group(0)
+        if len(word) < 5:
+            return word
+        wl = word.lower()
+        for scheme, aliases in _SCHEME_FUZZY_ALIASES.items():
+            if wl in aliases:
+                return word
+            if any(fuzz.ratio(wl, a) >= _FUZZY_SCHEME_ACCEPT for a in aliases):
+                return _SCHEME_CANONICAL_SPELLING[scheme]
+        return word
+
+    return re.sub(r"[A-Za-z]+", _sub, question)
 
 
 # The user explicitly wants a cross-scheme answer — honour it, don't ask.
@@ -234,43 +367,413 @@ _EXPLICIT_BOTH = re.compile(
 # must NOT appear here, or an ambiguous question gets silently mis-routed.
 _MGNREGA_ONLY_TERMS = re.compile(
     r"\b(person[\s-]?days?|job cards?|100[\s-]?days?|hundred days?|muster|"
-    r"households? employed|persons? employed|unskilled wage|semi[\s-]?skilled|"
+    # "households/persons [were/are/have been] employed" — the naive adjacent
+    # phrase ("households? employed") missed the common "persons WERE employed"
+    # wording (TC-024: a plain past-tense employment question with no scheme
+    # named kept falling through to the scheme-clarification prompt).
+    r"households?\s+(?:were\s+|are\s+|have\s+been\s+|has\s+been\s+)?employed|"
+    r"persons?\s+(?:were\s+|are\s+|have\s+been\s+|has\s+been\s+)?employed|"
+    # "received employment" is as common a phrasing as "were employed" — same
+    # gap as above, just a different verb (DATA-004 used exactly this).
+    r"(?:households?|persons?)\s+receiv\w*\s+employment|"
+    # "women [were/are] provided/given employment" / "women employed" — same
+    # missing-verb-phrasing gap as above (DATA-008 used exactly this; there
+    # was no women-employment pattern here at all before, only in edge.py's
+    # unrelated domain whitelist).
+    r"women\s+(?:were\s+|are\s+)?(?:provided|given)\s+employment|"
+    r"women\s+employ\w*|"
+    # assembly_constituency data exists ONLY in mgnrega_employment (see
+    # entity_resolver's assembly_constituency handling) — naming a constituency
+    # pins the scheme on its own even with no other MGNREGA word present.
+    r"assembly constituenc\w*|\bAC\s*\d+\b|"
+    # unskilled/semi-skilled wage(s) — "wage" without the "s?" only matched the
+    # singular; "unskilled wages" (the common plural phrasing, DATA-010) never
+    # matched because \b after "wage" can't land inside "wages".
+    r"unskilled wages?|semi[\s-]?skilled|"
     r"labour budget|works? demanded|wage employment|employment guarantee)\b",
     re.IGNORECASE,
 )
 _PMAY_ONLY_TERMS = re.compile(
     r"\b(house|houses|housing|dwelling units?|pucca house|kutcha house|"
     r"sanctioned houses?|instal?ments?|tranche|geotag|"
-    r"completion certificate|house status|awaas|awas)\b",
+    r"completion certificate|house status|awaas|awas|"
+    # "sanctioned"/"released"/"pending" amount phrasing is PMAY-specific — MGNREGA
+    # never "sanctions" anything (it has expenditure), CM Elevate has no money
+    # column at all, and Focus Plus vocabulary is "disbursement"/"payment"/
+    # "tranche", not "sanctioned". Without these, a bare "how much sanctioned
+    # amount has been released in [village]?" (no scheme named) fell through to
+    # an unnecessary "which scheme?" pause instead of being understood as PMAY-G.
+    # Plural "amounts"/"numbers" ('s?') — the singular-only forms below missed
+    # "sanctioned amountS" (PMAY-OFF-023) and "amount released" is fine as a
+    # fixed phrase, but sanction NUMBER(S) (PMAY-OFF-026) had no pattern at all.
+    r"sanctioned amounts?|amounts? (?:released|sanctioned|pending)|"
+    r"released amounts?|pending amounts?|sanction dates?|sanction numbers?|"
+    # "received (any/the/no) amount", "received full/partial amount" — the
+    # release-status phrasing PMAY-OFF-008/009/010 use, distinct from the
+    # "amount released" form already covered above.
+    r"receiv\w*\s+(?:any|the|no|full|partial)?\s*(?:sanctioned\s+)?amount)\b",
+    re.IGNORECASE,
+)
+# Focus Plus is a Meghalaya STATE farmer cash-benefit scheme. These terms name it or
+# its scheme-specific machinery and belong to no other scheme. "tranche" / "batch" /
+# "disbursement" are deliberately left out — they are shared vocabulary (PMAY also has
+# tranches), so an unnamed question that only uses those still asks "which scheme?".
+_FOCUSPLUS_ONLY_TERMS = re.compile(
+    r"\bfocus[\s-]?plus\b|\bfocus\s*\+|\bfocusplus\b|"
+    r"\bproducer group\b|\bproducer-group\b|\bproducer groups\b|"
+    r"\bmeghalayaone\b|\bmbda\b|\bmeghalaya basin development\b|"
+    r"\bfocus\+?\s*card\b|\b93k\b|\b12\.5k\b",
+    re.IGNORECASE,
+)
+# CM Elevate covers 15 sub-schemes under one programme. These terms name the
+# programme itself or its scheme-specific vocabulary that belongs to no other
+# scheme. "on hold" / "verification" / "application mode" are deliberately left
+# out — they read as generic status words, so an unnamed question using only
+# those still asks "which scheme?".
+_CMELEVATE_ONLY_TERMS = re.compile(
+    r"\bcm[\s-]?elevate\b|\bcmelevate\b|"
+    r"\bpiggery\b|\bpoultry\b|\bgoat farming\b|\bwarehouse scheme\b|"
+    r"\bsericulture\b|\bmotorcaravan\b|\bagro tourism villa\b|"
+    r"\bprime small enterprise\b|\bprime tourism vehicle\b|"
+    r"\bprime agriculture response vehicle\b|\bgreen taxi\b|"
+    r"\bcinema theatre scheme\b|\bsports and wellness centre\b|"
+    r"\bany business venture\b|\brequest_?id\b",
     re.IGNORECASE,
 )
 
 
 def _infer_scheme_from_terms(question: str) -> list[str] | None:
     """A single scheme implied by scheme-specific vocabulary, or None if the
-    question could plausibly mean either."""
-    m = bool(_MGNREGA_ONLY_TERMS.search(question))
-    p = bool(_PMAY_ONLY_TERMS.search(question))
-    if m and not p:
-        return ["MGNREGA"]
-    if p and not m:
-        return ["PMAY-G"]
-    return None
+    question could plausibly mean more than one."""
+    hits = [
+        s for s, rx in (
+            ("MGNREGA", _MGNREGA_ONLY_TERMS),
+            ("PMAY-G", _PMAY_ONLY_TERMS),
+            ("Focus Plus", _FOCUSPLUS_ONLY_TERMS),
+            ("CM Elevate", _CMELEVATE_ONLY_TERMS),
+        ) if rx.search(question)
+    ]
+    return hits if len(hits) == 1 else None
+
+
+# A resumed one-tap question is built by naming the scheme in the stem. Naively
+# appending " for <scheme>" reads fine for a DATA stem ("total person-days for
+# MGNREGA") but produces broken phrasing for a KNOWLEDGE stem that already says
+# the generic word "scheme" ("tell me about scheme" -> "tell me about scheme for
+# Focus Plus") — that phrasing is grammatically odd enough that the RAG answer
+# composer sometimes reads it as asking about a DIFFERENT, uncovered scheme and
+# refuses with "not covered" even though the retrieved passages score well
+# above the medium-confidence floor (verified: top score 0.77, well above the
+# 0.55 floor, yet the composer still said "not covered" on this exact phrasing).
+# When the stem already names "scheme(s)" generically, replace that word with
+# the actual scheme name instead of appending — "tell me about scheme" becomes
+# "tell me about Focus Plus", which both reads naturally and matches how the
+# reference docs open ("Focus Plus is ...").
+_GENERIC_SCHEME_WORD = re.compile(r"\bschemes?\b", re.IGNORECASE)
+
+
+def _scheme_option_question(stem: str, scheme: str) -> str:
+    if _GENERIC_SCHEME_WORD.search(stem):
+        return _GENERIC_SCHEME_WORD.sub(scheme, stem, count=1)
+    return f"{stem} for {scheme}"
 
 
 def _scheme_clarification(question: str) -> "ClarificationNeeded":
     stem = question.strip().rstrip(" ?.")
     options = [
-        {"label": "MGNREGA (rural employment)", "question": f"{stem} for MGNREGA"},
-        {"label": "PMAY-G (rural housing)", "question": f"{stem} for PMAY-G"},
-        {"label": "Compare both schemes", "question": f"{stem} across MGNREGA and PMAY-G"},
+        {"label": "MGNREGA (rural employment)",
+         "question": _scheme_option_question(stem, "MGNREGA")},
+        {"label": "PMAY-G (rural housing)",
+         "question": _scheme_option_question(stem, "PMAY-G")},
+        {"label": "Focus Plus (farmer cash benefit)",
+         "question": _scheme_option_question(stem, "Focus Plus")},
+        {"label": "CM Elevate (livelihood / enterprise schemes)",
+         "question": _scheme_option_question(stem, "CM Elevate")},
+        {"label": "Compare across schemes",
+         "question": f"{stem} across MGNREGA, PMAY-G, Focus Plus and CM Elevate"},
     ]
     return ClarificationNeeded(
-        "Which scheme does your question concern — MGNREGA or PMAY-G? "
-        "Please select one, or choose to have the two schemes compared.",
+        "Which scheme does your question concern — MGNREGA, PMAY-G, Focus Plus, or "
+        "CM Elevate? Please select one, or choose to compare across schemes.",
         options=options,
         rule="scheme-not-specified",
     )
+
+
+# Plain-language, user-facing scheme summaries — separate from SCHEME_CATALOG
+# in schema_context.py, which is written for the SQL-generation prompt (DB
+# grain, money units, join keys) and reads as database jargon to an end user.
+_SCHEME_USER_SUMMARY = {
+    "MGNREGA": "Rural employment guarantee scheme — up to 100 days of guaranteed "
+               "wage employment per household per year.",
+    "PMAY-G": "Rural housing scheme (Gramin) — financial assistance to build a "
+              "pucca house for eligible rural households.",
+    "Focus Plus": "Meghalaya state farmer cash-benefit scheme — direct cash "
+                  "payments (DBT) to registered farmers.",
+    "CM Elevate": "Meghalaya livelihood & enterprise support programme — covers "
+                  "15 individual schemes (piggery, poultry, small enterprise "
+                  "loans, tourism vehicles, and more) under one umbrella.",
+}
+
+# "What schemes are available?" / "what can you help with?" — answered directly
+# and concisely instead of falling through to RAG, which has no single document
+# listing all 4 schemes and tends to elaborate at length on whichever one scores
+# highest in vector search (QA repeatedly saw an over-detailed PMAY-only answer).
+_SCHEME_LISTING_CUE = re.compile(
+    r"\b(what|which) schemes?\b|\bschemes? (?:are|is) available\b|"
+    r"\blist (?:the |all )?schemes?\b|\bschemes? (?:do you|you) (?:support|cover|know|have)\b|"
+    r"\bwhat (?:can|do) you (?:help with|assist with|cover)\b",
+    re.IGNORECASE,
+)
+
+
+def _scheme_listing_answer(question: str) -> "dict | None":
+    if not _SCHEME_LISTING_CUE.search(question or ""):
+        return None
+    lines = [f"- **{name}** — {desc}" for name, desc in _SCHEME_USER_SUMMARY.items()]
+    answer = (
+        "I cover four Meghalaya government schemes:\n\n" + "\n".join(lines) +
+        "\n\nAsk me about any of these — eligibility, benefits, how to apply, "
+        "or the actual data (numbers, by district or year)."
+    )
+    return {"route": "knowledge", "intent": "RAG", "confidence": "high", "sources": [],
+            "answer": answer, **_empty_data_fields()}
+
+
+# "What is the difference between the schemes?" / "compare MGNREGA and PMAY-G" as
+# a KNOWLEDGE question — no per-scheme reference doc contains a cross-scheme
+# comparison, so plain RAG retrieval reliably comes back "not covered". Compose
+# a structured side-by-side directly from _SCHEME_USER_SUMMARY instead.
+_SCHEME_COMPARISON_CUE = re.compile(
+    r"\bdifference between\b[^?]{0,40}\bschemes?\b|\bschemes?\b[^?]{0,40}\bdiffer(?:ence)?\b|"
+    r"\bcompare\b[^?]{0,40}\bschemes?\b|\bhow (?:do|does)\b[^?]{0,40}\bschemes?\b[^?]{0,20}\bdiffer\b|"
+    r"\bdifference between\b.{0,60}\b(mgnrega|pmay|focus\s*plus|cm\s*elevate)\b.{0,20}\b(and|vs\.?|versus)\b",
+    re.IGNORECASE,
+)
+
+
+def _scheme_comparison_answer(question: str) -> "dict | None":
+    if not _SCHEME_COMPARISON_CUE.search(question or ""):
+        return None
+    named = _named_schemes(question)
+    targets = named if len(named) >= 2 else list(SCHEME_CATALOG)
+    lines = [f"- **{name}** — {_SCHEME_USER_SUMMARY.get(name, '')}" for name in targets]
+    answer = (
+        "Here's a high-level comparison:\n\n" + "\n".join(lines) +
+        "\n\nAsk about a specific one — eligibility, benefits, or the application "
+        "process — for more detail."
+    )
+    return {"route": "knowledge", "intent": "RAG", "confidence": "high", "sources": [],
+            "answer": answer, **_empty_data_fields()}
+
+
+# ── Named a scheme we simply don't hold ─────────────────────────────────────
+# A user can reasonably name another Meghalaya / central scheme ("PM-KISAN",
+# "Ujjwala", "Jal Jeevan"). The right answer is not the generic "which scheme?"
+# prompt — it's to say plainly that only four schemes are loaded right now,
+# then let them pick one. Keep this list to real scheme names/aliases; a bare
+# word that is also scheme vocabulary must not appear. CM Elevate is now a
+# supported scheme (see _SCHEME_NAME_PATTERN) and must NOT appear here.
+_UNSUPPORTED_SCHEME = re.compile(
+    r"\b("
+    r"prime\s+meghalaya|meghalaya\s+prime|"
+    r"pm[\s-]?kisan|pmkisan|kisan\s+samman|"
+    r"pmay[\s-]?u\b|pmay\s+urban|awas\s+yojana\s+urban|"
+    r"pmgsy|gram\s+sadak|"
+    r"pmuy|ujjwala|ujwala|"
+    r"saubhagya|"
+    r"jal\s+jeevan(\s+mission)?|jjm\b|har\s+ghar\s+jal|nal\s+se\s+jal|"
+    r"ayushman(\s+bharat)?|pm[\s-]?jay|pmjay|"
+    r"mhis\b|cmhis\b|megha\s+health|"
+    r"nsap\b|ignoaps|old[\s-]?age\s+pension|widow\s+pension|disability\s+pension|"
+    r"nrlm\b|day[\s-]?nrlm|aajeevika|ajeevika|livelihoods?\s+mission|"
+    r"swachh\s+bharat|sbm\b|nirmal\s+bharat|"
+    r"mid[\s-]?day\s+meal|pm[\s-]?poshan|"
+    r"icds\b|anganwadi|poshan\s+abhiyaan?|"
+    r"kanyashree|ladli|sukanya|"
+    r"atal\s+pension|apy\b|"
+    r"mudra|pmmy\b|stand[\s-]?up\s+india|"
+    r"kisan\s+credit\s+card|kcc\b|"
+    r"fasal\s+bima|pmfby|crop\s+insurance|"
+    r"e[\s-]?shram|"
+    r"nfsa\b|one\s+nation\s+one\s+ration|public\s+distribution|ration\s+card"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def _unsupported_scheme_named(question: str) -> "str | None":
+    """The name of a scheme the user asked about that we don't hold — or None.
+    Only fires when NO supported scheme is also named, so mixed questions
+    ("compare CM Elevate with MGNREGA") still route normally. The unsupported
+    match is blanked out before the supported-scheme check so a near-miss like
+    "PMAY-U" isn't swallowed by the PMAY-G pattern."""
+    m = _UNSUPPORTED_SCHEME.search(question or "")
+    if not m:
+        return None
+    without = (question[:m.start()] + " " + question[m.end():])
+    if any(p.search(without) for p in _SCHEME_NAME_PATTERN.values()):
+        return None
+    return m.group(0)
+
+
+def _unsupported_scheme_clarification(question: str, name: str) -> "ClarificationNeeded":
+    # Drop the unsupported scheme name (plus any preposition left dangling by
+    # its removal, e.g. "... years in pm-kisan?" -> "... years") so the
+    # resumed one-tap question reads cleanly.
+    stem = re.sub(re.escape(name), " ", question, flags=re.IGNORECASE)
+    stem = re.sub(r"\s+", " ", stem).strip().rstrip(" ?.")
+    stem = re.sub(r"\s+(?:in|for|of|under|from|about|on)$", "", stem, flags=re.IGNORECASE).strip()
+    stem = stem or question.strip().rstrip(" ?.")
+    options = [
+        {"label": "MGNREGA (rural employment)",
+         "question": _scheme_option_question(stem, "MGNREGA")},
+        {"label": "PMAY-G (rural housing)",
+         "question": _scheme_option_question(stem, "PMAY-G")},
+        {"label": "Focus Plus (farmer cash benefit)",
+         "question": _scheme_option_question(stem, "Focus Plus")},
+        {"label": "CM Elevate (livelihood / enterprise schemes)",
+         "question": _scheme_option_question(stem, "CM Elevate")},
+        {"label": "Compare across schemes",
+         "question": f"{stem} across MGNREGA, PMAY-G, Focus Plus and CM Elevate"},
+    ]
+    return ClarificationNeeded(
+        f'I don\'t have any data for "{name.strip()}". Right now I only hold '
+        "four schemes — MGNREGA, PMAY-G, Focus Plus and CM Elevate. Pick one of those "
+        "and I'll answer.",
+        options=options,
+        rule="scheme-not-available",
+    )
+
+
+# ── Bank / financial-channel details — not held for any loaded scheme ───────
+# Focus Plus withholds bank_name_raw from its queryable view for privacy; PMAY-G,
+# CM Elevate and MGNREGA never captured a bank field at ingest at all. Without
+# this check the question reaches SQL generation, which correctly finds no
+# column to use but can only hand back a bare "not available in this data" —
+# true, but it doesn't say *why*, so route it to a real explanation up front.
+_BANK_REQUESTED = re.compile(
+    r"\bbanks?\b|\bbanking\b|\bifsc\b|\bbank[\s-]?account|\baccount[\s-]?number|"
+    r"\bbank[\s-]?wise\b|\bbank[\s-]?transfer|\bdbt\b|\blifcom\b",
+    re.IGNORECASE,
+)
+_BANK_NOT_HELD_TEXT = {
+    "Focus Plus": (
+        "Bank details for Focus Plus are withheld from the approved query surface "
+        "for privacy, so bank-wise figures cannot be produced. Shall I answer by "
+        "district, block or village instead?"
+    ),
+    "CM Elevate": (
+        "There is no loan-channel field for CM Elevate — Bank and LIFCOM are not "
+        "recorded, and no payment of any kind is held for this scheme. Shall I "
+        "answer on applications by scheme or district instead?"
+    ),
+    "PMAY-G": (
+        "Bank transfer status, DBT outcomes and account details are not held for "
+        "PMAY-G — only the amount released and the number of installments are. "
+        "Shall I use those instead?"
+    ),
+    "MGNREGA": (
+        "Bank details are not held for MGNREGA — only wages, person-days, job "
+        "cards and expenditure are. Shall I answer using one of those instead?"
+    ),
+}
+_BANK_GENERIC_TEXT = (
+    "Bank details aren't available for querying in any of the schemes I cover — "
+    "MGNREGA, PMAY-G, Focus Plus or CM Elevate — either because the field was "
+    "never captured at ingest or, for Focus Plus, because it is withheld from "
+    "the query surface for privacy. Shall I answer by scheme, district, block "
+    "or village instead?"
+)
+
+
+def _named_or_inferred_schemes(question: str) -> list[str]:
+    named = [s for s, rx in _SCHEME_NAME_PATTERN.items() if rx.search(question)]
+    return named or _infer_scheme_from_terms(question) or []
+
+
+def _bank_clarification(question: str) -> "ClarificationNeeded":
+    schemes = _named_or_inferred_schemes(question)
+    text = _BANK_NOT_HELD_TEXT[schemes[0]] if len(schemes) == 1 else _BANK_GENERIC_TEXT
+    return ClarificationNeeded(text, rule="column-not-held")
+
+
+# ── Administrative expenditure — deliberately excluded from reporting ──────
+# The raw source has adm_exp_rec / adm_exp_non_rec / adm_exp_total (MGNREGA) and
+# an equivalent programme-expenditure figure (PMAY-G), but both are intentionally
+# left out of the curated views/facts (data/mgnrega/README.md marks them
+# **excluded**; mgnrega_classification_rules.yaml and pmay_classification_rules.yaml
+# both define a dedicated "administrative_expenditure_requested" condition for
+# exactly this). That YAML condition was never wired into the live pipeline
+# (see the "deliberately NOT loaded here yet" note in annotations.py), so without
+# this check the question reached SQL generation, which has no such column to
+# read and either errors or returns a wrong/empty figure instead of explaining
+# the exclusion.
+_ADMIN_EXPENDITURE_REQUESTED = re.compile(
+    r"\badministrative\s+(?:expenditure|expense|cost|spend(?:ing)?)\b|"
+    r"\badmin\s+(?:expenditure|expense|cost)\b|\boverhead\s+(?:expenditure|cost)s?\b|"
+    r"\bprogramme\s+expenditure\b|\bprogram\s+expenditure\b",
+    re.IGNORECASE,
+)
+_ADMIN_EXPENDITURE_NOT_HELD_TEXT = {
+    "MGNREGA": (
+        "Administrative expenditure is deliberately excluded from MGNREGA reporting "
+        "here — only unskilled wage, semi-skilled wage, material and total expenditure "
+        "are held. Did you mean total expenditure instead?"
+    ),
+    "PMAY-G": (
+        "Administrative and programme expenditure are not held for PMAY-G — only the "
+        "per-house sanctioned and released amounts are. Did you mean amount released "
+        "instead?"
+    ),
+}
+_ADMIN_EXPENDITURE_GENERIC_TEXT = (
+    "Administrative expenditure isn't held for querying in any of the schemes I "
+    "cover — MGNREGA reports only wage/material/total expenditure, and PMAY-G only "
+    "sanctioned and released amounts. Shall I answer using one of those instead?"
+)
+
+
+def _admin_expenditure_clarification(question: str) -> "ClarificationNeeded":
+    schemes = _named_or_inferred_schemes(question)
+    if len(schemes) == 1 and schemes[0] in _ADMIN_EXPENDITURE_NOT_HELD_TEXT:
+        text = _ADMIN_EXPENDITURE_NOT_HELD_TEXT[schemes[0]]
+    else:
+        text = _ADMIN_EXPENDITURE_GENERIC_TEXT
+    return ClarificationNeeded(text, rule="column-not-held")
+
+
+# ── "What % were women?" — women_employment_provided has no confirmed ratio ──
+# schema_context.py's MGNREGA rule 6: women_employment_provided may be reported
+# as a raw count, but NEVER as a computed ratio/percentage/share — its
+# definition (persons vs households, and against which denominator) is
+# unconfirmed, so a computed percentage risks a confidently wrong number. The
+# SQL-gen prompt already carries this as a text rule, but a question that
+# explicitly demands the percentage can still make the model try (and fail
+# oddly) rather than explain why — so intercept it here, before SQL
+# generation, the same way the bank / admin-expenditure checks do.
+# PMAY-G's analogous "share of houses allotted to women" IS a well-defined,
+# supported computation (house_alloted_to has an explicit Woman* value set) —
+# excluded here via _WOMEN_SHARE_PMAYG_CONTEXT so this doesn't also block that.
+_WOMEN_SHARE_REQUESTED = re.compile(
+    r"\b(percentage|percent|%|share|ratio|proportion)\b[^?.!]{0,40}\bwomen\b|"
+    r"\bwomen\b[^?.!]{0,40}\b(percentage|percent|%|share|ratio|proportion)\b",
+    re.IGNORECASE,
+)
+_WOMEN_SHARE_PMAYG_CONTEXT = re.compile(
+    r"\bhouses?\b|\bdwelling\b|\ballot\w*\b", re.IGNORECASE,
+)
+_WOMEN_SHARE_NOT_COMPUTABLE_TEXT = (
+    "A reliable percentage or share can't be computed for women's employment — "
+    "women_employment_provided's exact definition (which denominator it's a "
+    "share of) isn't confirmed in the source data, so publishing a ratio risks "
+    "a misleading number. I can give you the raw count of women provided "
+    "employment instead — would that help?"
+)
+
+
+def _women_share_clarification(question: str) -> "ClarificationNeeded":
+    return ClarificationNeeded(_WOMEN_SHARE_NOT_COMPUTABLE_TEXT, rule="column-not-held")
 
 
 def _needs_scheme_clarification(question: str) -> bool:
@@ -397,6 +900,13 @@ _HAS_BREAKDOWN = re.compile(
     r"\bcorrelat\w*|\brelationship between\b|\blinked (?:to|with)\b|"
     r"\b(?:districts?|blocks?|villages?|panchayats?|gps?)\s+"
     r"(?:with|where|that|having|which)\b|"
+    # A rank window over a geography dimension — "top 5 districts", "bottom
+    # blocks", "10 largest villages". It inherently spans every area in that
+    # dimension, so geography is already scoped; only the year is still open.
+    r"\b(?:top|bottom|leading|largest|biggest|smallest|highest|lowest)\s+"
+    r"(?:\d+\s+)?(?:districts?|blocks?|villages?|panchayats?|gps?)\b|"
+    r"\b\d+\s+(?:largest|biggest|smallest|highest|lowest)\s+"
+    r"(?:districts?|blocks?|villages?|panchayats?|gps?)\b|"
     r"\bacross (?:the )?(?:districts?|blocks?|villages?|panchayats?|state|years?)\b",
     re.IGNORECASE,
 )
@@ -456,7 +966,8 @@ def _needs_scope_clarification(question: str, resolved: dict) -> bool:
         return False
     if _CROSS_SCHEME_SET_QUESTION.search(q):
         return False
-    if any(resolved.get(k) for k in ("district", "block", "village_code", "year_key")):
+    if any(resolved.get(k) for k in
+           ("district", "district_list", "block", "village_code", "year_key")):
         return False
     return True
 
@@ -481,13 +992,61 @@ def _reply_abandons_scope_pause(reply: str) -> bool:
     return bool(_REPLY_IS_NEW_QUESTION.search(r) or _KNOWLEDGE_HINTS.search(r))
 
 
-def _scope_clarification(question: str) -> "ClarificationNeeded":
+# ── "Which district in this region?" clarification ─────────────────────────
+# "Garo Hills" / "Khasi Hills" / "Jaintia Hills" name a hill RANGE, not a district —
+# each covers several districts (region_groupings in the *_entity_resolver.yaml). When
+# a question names one and no specific district, offer its districts as one-tap chips
+# instead of the generic "which area?" free-text pause. Applies to every scheme.
+def _swap_region_phrase(question: str, aliases: list[str], repl: str) -> str:
+    """Replace the first hill-range phrase in `question` with `repl`. Longest alias
+    first so 'South West Garo Hills' isn't half-matched by 'Garo Hills'."""
+    forms = sorted({a for a in aliases if a}, key=len, reverse=True)
+    pat = re.compile(r"\b(" + "|".join(re.escape(a) for a in forms) + r")\b", re.IGNORECASE)
+    new, n = pat.subn(repl, question, count=1)
+    return new if n else f"{question.rstrip(' ?.')} for {repl}"
+
+
+def _region_clarification(question: str, region: dict) -> "ClarificationNeeded":
+    canon = region["canonical"]
+    dists = region["districts"]
+    aliases = [canon, *region.get("aliases", [])]
+    all_list = ", ".join(dists[:-1]) + " and " + dists[-1]
+    options = [{"label": d, "question": _swap_region_phrase(question, aliases, d)}
+               for d in dists]
+    options.append({
+        "label": f"All of {canon} combined",
+        "question": _swap_region_phrase(question, aliases, f"all of {canon}"),
+    })
+    return ClarificationNeeded(
+        f"“{canon}” is a region covering {len(dists)} districts "
+        f"— {all_list}. Which district, or all of {canon} combined?",
+        options=options,
+        rule="region-needs-district",
+    )
+
+
+def _scope_clarification(question: str, schemes: list[str]) -> "ClarificationNeeded":
+    stem = question.strip().rstrip(" ?.")
+    # District chips first (picking one still leaves the year open, so it falls
+    # straight into `_year_clarification` on the next turn — a second round of
+    # buttons rather than free text), then the one-tap statewide/all-years
+    # shortcut, mirroring how `_year_clarification` appends its own "combined"
+    # option last.
+    seen: dict[str, None] = {}
+    for s in schemes or []:
+        for d in all_districts(s):
+            seen.setdefault(d, None)
+    options = [{"label": d, "question": f"{stem} for {d}"} for d in seen]
+    options.append({
+        "label": "All of Meghalaya, all years",
+        "question": f"{stem} for all of Meghalaya, all years",
+    })
     return ClarificationNeeded(
         "Which area and time period should the answer cover — a specific district, "
-        "block, or village, and which financial year? Please reply with the "
-        "location and the financial year (for example, \"West Garo Hills, "
-        "2023-24\"), or reply \"all of Meghalaya, all years\" if the statewide "
-        "total is required.",
+        "block, or village, and which financial year? Pick a district below, or "
+        "choose the statewide, all-years total; you can also just type a block or "
+        "village name (for example, \"West Garo Hills, 2023-24\").",
+        options=options,
         rule="scope-not-specified",
     )
 
@@ -508,9 +1067,22 @@ def _scope_clarification(question: str) -> "ClarificationNeeded":
 # Values below were verified against curated.v_employment / v_expenditure
 # (MGNREGA) and curated.v_pmay (PMAY-G) on 2026-08-30 — MGNREGA covers FY
 # 2022-23..2025-26; PMAY-G covers FY 2017-18..2023-24 (NOT 2024-25 / 2025-26).
+# Focus Plus holds only FY 2022-23 (Tranch 1) and FY 2025-26 (Tranches 2-4) — the two
+# middle years are empty for it (focusplus_schema_partitions.yaml). A three-year gap is
+# expected, and asking a Focus Plus question for FY 2023-24 / 2024-25 correctly triggers
+# the "that year isn't in the data" guard.
+# CM Elevate is DIFFERENT IN KIND, not just sparser: it holds an empty list on
+# purpose. There is no year_key, no FK to dim_year, no date column of any kind
+# anywhere in fact_cm_elevate_application (cmelevate_schema_partitions.yaml
+# semantic_rules.time_rule) — refresh_scheme_years() below does not even probe
+# it. _needs_year_clarification and _year_out_of_range_clarification both treat
+# an empty list here as "no time dimension exists" and refuse a time filter
+# outright instead of offering year chips.
 _SCHEME_DATA_YEARS: dict[str, list[str]] = {
     "MGNREGA": ["2022-23", "2023-24", "2024-25", "2025-26"],
     "PMAY-G":  ["2017-18", "2018-19", "2019-20", "2020-21", "2021-22", "2022-23", "2023-24"],
+    "Focus Plus": ["2022-23", "2025-26"],
+    "CM Elevate": [],
 }
 
 
@@ -536,6 +1108,12 @@ async def refresh_scheme_years() -> None:
             "SELECT DISTINCT year_key FROM curated.v_expenditure WHERE year_key IS NOT NULL"
         ),
         "PMAY-G": "SELECT DISTINCT year_key FROM curated.v_pmay WHERE year_key IS NOT NULL",
+        "Focus Plus": (
+            "SELECT DISTINCT year_key FROM curated.v_focus_plus WHERE year_key IS NOT NULL"
+        ),
+        # CM Elevate deliberately has no entry here — curated.v_cm_elevate has no
+        # year_key column at all (not merely NULL), so there is nothing to probe.
+        # Its default of [] in _SCHEME_DATA_YEARS above is the permanent value.
     }
     for scheme, sql in sql_by_scheme.items():
         try:
@@ -599,6 +1177,24 @@ def _needs_year_clarification(question: str, schemes: list[str], resolved: dict)
     if not settings.YEAR_CLARIFY_ENABLED:
         return False
     q = question or ""
+    # Schemes with NO time dimension at all (CM Elevate has no year_key, no date
+    # column of any kind) can never be asked "which year" — there is nothing to
+    # choose. Skip the whole gate when every scheme in play is one of these, so
+    # _year_clarification never runs on an empty _SCHEME_DATA_YEARS[scheme] list
+    # (which would otherwise crash indexing years[-1]).
+    live = [s for s in (schemes or []) if s in _SCHEME_DATA_YEARS]
+    if live and all(not _SCHEME_DATA_YEARS[s] for s in live):
+        return False
+    # PMAY-G figures (beneficiary counts, sanctioned/released amounts, house
+    # status) are cumulative-to-date by nature — a beneficiary's status doesn't
+    # reset each financial year the way MGNREGA's annual employment cycle does.
+    # Pausing to ask "which year?" on a plain PMAY-G question is an unnecessary
+    # interruption QA flagged repeatedly; default to "all years to date"
+    # instead, the same outcome _ALL_YEARS_CUE gives MGNREGA when the user
+    # types "cumulative". A question naming an explicit year is still caught
+    # above via resolved["year_key"]/_parse_year_key before this runs.
+    if live == ["PMAY-G"]:
+        return False
     if resolved.get("year_key") or _parse_year_key(q) is not None:
         return False
     if _ALL_YEARS_CUE.search(q) or _TIME_SERIES_CUE.search(q):
@@ -624,7 +1220,12 @@ def _year_clarification(question: str, schemes: list[str]) -> "ClarificationNeed
         "label": "All financial years combined",
         "question": f"{stem} across all financial years",
     })
-    scope_word = live[0] if len(live) == 1 else "MGNREGA and PMAY-G"
+    if len(live) == 1:
+        scope_word = live[0]
+    elif len(live) == 2:
+        scope_word = " and ".join(live)
+    else:
+        scope_word = ", ".join(live[:-1]) + " and " + live[-1]
     year_list = ", ".join(f"FY {y}" for y in years[:-1]) + f" and FY {years[-1]}"
     return ClarificationNeeded(
         f"{scope_word} data is available for {year_list}. "
@@ -723,6 +1324,19 @@ def _year_out_of_range_clarification(question: str, raw_year: str,
     ).strip().rstrip(",").strip() or question.strip().rstrip(" ?.")
 
     years, live = _available_years_for(schemes)
+    if not years:
+        # Every scheme in play has NO time dimension at all (CM Elevate: no
+        # year_key, no date column of any kind) — there is no "these years are
+        # available" chip list to offer. Refuse the time filter outright rather
+        # than showing an out-of-range message with zero year options.
+        scheme_word = live[0] if len(live) == 1 else (" and ".join(live) if live else "This scheme")
+        return ClarificationNeeded(
+            f"{scheme_word} has no date field in this data, so records cannot be "
+            f"placed in a financial year or any other time period. I can answer "
+            "without a time filter instead.",
+            options=[{"label": "Answer without a time filter", "question": stem}],
+            rule="no-time-dimension",
+        )
     if len(live) == 1:
         coverage = (f"For {live[0]}, data is available only for the financial "
                     f"years {', '.join(years)}.")
@@ -751,8 +1365,15 @@ def _year_out_of_range_clarification(question: str, raw_year: str,
 
 
 def _named_schemes(question: str) -> list[str]:
-    """Schemes named outright in the question text, in catalog order."""
-    return [s for s, pattern in _SCHEME_NAME_PATTERN.items() if pattern.search(question)]
+    """Schemes named outright in the question text, in catalog order. Falls
+    back to fuzzy matching (_fuzzy_named_schemes) when the exact regex finds
+    nothing — otherwise a misspelled scheme name ("manrega", "pamay") reads as
+    "no scheme named" and forces an unnecessary clarification prompt instead
+    of being understood."""
+    exact = [s for s, pattern in _SCHEME_NAME_PATTERN.items() if pattern.search(question)]
+    if exact:
+        return exact
+    return _fuzzy_named_schemes(question)
 
 
 def _shortcut_scheme(question: str) -> list[str] | None:
@@ -763,7 +1384,16 @@ def _shortcut_scheme(question: str) -> list[str] | None:
         them; "compare MGNREGA and PMAY" needs no classification), or
       * an explicit cross-scheme phrase ("both schemes", "across schemes")
         is present  -> the whole catalog, or
-      * exactly one scheme is named    -> that one.
+      * exactly one scheme is named    -> that one, or
+      * no scheme is named but the vocabulary pins exactly one (same check
+        _needs_scheme_clarification uses to skip its own pause) -> that one.
+    Without this last case, a vocabulary-only question ("sanctioned amount",
+    "person-days") skipped the "which scheme?" pause (correctly inferring
+    MGNREGA/PMAY-G) but then still went to the LLM classifier here, which
+    doesn't apply the same vocabulary rule and can return every scheme "to be
+    safe" — inconsistent with the pause having just been skipped, and it broke
+    the PMAY-G year-gate exemption (which only applies when the scheme set is
+    exactly ["PMAY-G"]).
     Returns None only when nothing in the text pins it, so the classifier still
     handles the genuinely unnamed/ambiguous case."""
     named = _named_schemes(question)
@@ -771,7 +1401,9 @@ def _shortcut_scheme(question: str) -> list[str] | None:
         return named
     if _EXPLICIT_BOTH.search(question):
         return list(SCHEME_CATALOG)
-    return named if len(named) == 1 else None
+    if named:
+        return named
+    return _infer_scheme_from_terms(question)
 
 
 async def classify_scheme(question: str) -> list[str]:
@@ -782,11 +1414,13 @@ async def classify_scheme(question: str) -> list[str]:
         return shortcut
 
     catalog = "\n".join(f'  - "{name}": {desc}' for name, desc in SCHEME_CATALOG.items())
+    scheme_options = " | ".join(f'"{name}"' for name in SCHEME_CATALOG)
     prompt = f"""Classify which scheme(s) this question needs. Available schemes:
 {catalog}
 
-Return ONLY JSON: {{"schemes": ["MGNREGA"|"PMAY-G", ...]}}
-Use both if the question compares or combines the two schemes, or names neither specifically.
+Return ONLY JSON: {{"schemes": [{scheme_options}, ...]}}
+Use several if the question compares or combines schemes. If it names none specifically
+and gives no scheme-specific vocabulary, return every scheme.
 
 Question: "{question}"
 JSON:"""
@@ -834,16 +1468,24 @@ def _clean_mention(value: str) -> str | None:
 
 
 async def extract_entity_mentions(question: str) -> dict:
-    """Which spans of the question name a district, block, village or year?
-    Span-finding only — resolving each span to a canonical DB value is a
-    separate, deterministic step (entity_resolver), not this LLM call."""
+    """Which spans of the question name a district, block, village, year or
+    assembly constituency? Span-finding only — resolving each span to a
+    canonical DB value is a separate, deterministic step (entity_resolver),
+    not this LLM call."""
     prompt = f"""Extract place/time names from this question, verbatim as the user typed
 them. Do not correct spelling or guess the canonical form.
 
-Return ONLY JSON with keys from: "district", "block", "village", "year".
-Include a key ONLY when the question NAMES a specific one. A bare word like
-"village", "villages", "district", "block", "year", or the state name
-"Meghalaya" is NOT a name — omit it. If the question names none, return {{}}.
+Return ONLY JSON with keys from: "district", "block", "village", "year",
+"assembly_constituency". Include a key ONLY when the question NAMES a specific
+one. A bare word like "village", "villages", "district", "block", "year", or
+the state name "Meghalaya" is NOT a name — omit it. If the question names
+none, return {{}}.
+
+Block, assembly-constituency and village names overlap heavily in Meghalaya —
+a bare name (e.g. "Mawlai") could be any of the three. Use "assembly_constituency"
+ONLY when the question itself signals a constituency: it says "constituency",
+"AC", "assembly", "MLA", or gives a number before the name (e.g. "15 Mawlai",
+"AC 9"). Otherwise tag an ambiguous bare name as "block".
 
 Question: "{question}"
 JSON:"""
@@ -853,7 +1495,8 @@ JSON:"""
         return {}
     out: dict[str, str] = {}
     for k, v in payload.items():
-        if k in ("district", "block", "village", "year") and isinstance(v, str) and v.strip():
+        if k in ("district", "block", "village", "year", "assembly_constituency") \
+                and isinstance(v, str) and v.strip():
             cleaned = _clean_mention(v)
             if cleaned:
                 out[k] = cleaned
@@ -875,12 +1518,33 @@ def _parse_year_key(text: str) -> "int | None":
     return None
 
 
-async def resolve_entities(question: str, schemes: list[str]) -> dict:
+async def resolve_entities(question: str, schemes: list[str],
+                            prior_resolved: "dict | None" = None,
+                            village_hint: "str | None" = None) -> dict:
     """Resolve every extracted mention to a canonical DB value. Ambiguous ->
     raise ClarificationNeeded (ask, per the resolver's own hard rule — never
     guess). Not-found is not an error: it means the value genuinely is not in
     this data, which the response composer should say plainly, not silently
-    drop the filter."""
+    drop the filter.
+
+    `prior_resolved` (optional): the previous turn's resolved entities, passed
+    only when this question is a rewritten follow-up. Used purely as a
+    fallback — for any dimension (district/block/village_code/year_key) the
+    CURRENT question names nothing for at all, carry the prior turn's value
+    forward instead of leaving it unset. This covers a village/year the
+    follow-up rewrite paraphrased away in its wording (the rewrite works from
+    prev.question/answer TEXT, so an entity can silently vanish if it doesn't
+    literally reappear). A dimension the current question DOES name something
+    for (even something that fails to resolve) is left alone — the user is
+    talking about something new for that slot, not carrying the old one over.
+
+    `village_hint` (optional): the exact village-name text from a just-resumed
+    village-ambiguity pause (ClarificationNeeded.village_hint / Session.
+    pending_village_hint). Used ONLY when this question's own mention
+    extraction finds no village at all — the merged resume text ("...the one
+    in Betasing block") does not reliably make the LLM re-tag the original
+    village name, and without it SQL generation has no village_code to filter
+    on and can invent one instead of using the now-resolved block/district."""
     # Out-of-range financial year — checked FIRST, before the LLM mention call
     # and any geography resolution. Works purely off the raw question text, so it
     # still fires when the extractor is unavailable or drops the year slot (a
@@ -913,33 +1577,148 @@ async def resolve_entities(question: str, schemes: list[str]) -> dict:
             display["district"] = backstop.display or str(backstop.canonical).title()
             logger.info("resolve_entities: district backstop matched %r in question text",
                         backstop.canonical)
-    if mentions.get("district"):
-        r = resolve_dimension(mentions["district"], schemes[0], "district")
+    # A hill-range name ("Garo Hills", "Khasi region") the extractor tagged as a
+    # district isn't one — leave it unresolved so _answer_data's region handler can
+    # offer the range's districts as chips (or expand it). Don't raise the generic
+    # "which district?" here.
+    _mdist = mentions.get("district")
+    if _mdist and detect_region(_mdist, schemes[0] if schemes else "") is not None:
+        _mdist = None
+    if _mdist:
+        r = resolve_dimension(_mdist, schemes[0], "district")
         if r.status == "ambiguous":
-            raise ClarificationNeeded(f"Which district is being referred to by “{mentions['district']}”?")
+            raise ClarificationNeeded(f"Which district is being referred to by “{_mdist}”?",
+                                       rule="entity-ambiguous")
         if r.status == "resolved":
             district_canon = r.canonical
             resolved["district"] = r.canonical
             display["district"] = r.display or str(r.canonical).title()
-        elif settings.OUT_OF_SCOPE_GUARD_ENABLED:
-            # A named district that isn't one of Meghalaya's 12 — almost always a
-            # place in another state ("districts in Guwahati"). Don't silently
-            # drop the filter and count 0; say plainly this is out of scope.
-            raise OutOfScope(f"district '{mentions['district']}' is not in Meghalaya")
         else:
-            notes.append(f"'{mentions['district']}' is not a known district — say so, do not filter on it.")
+            # Not a known district — it may be a VILLAGE the extractor
+            # mistagged as "district" (a bare place name after "in" gives the
+            # model no reliable signal for which admin level it is). Try
+            # village resolution before concluding this is out of scope.
+            _vr = await resolve_village(_mdist)
+            if _vr.status == "ambiguous":
+                stem = question.strip().rstrip(" ?.")
+                listed = ", ".join(
+                    f"{c['name']} in {c['block']} block ({c['district']})" for c in _vr.candidates[:5])
+                options = [
+                    {"label": f"{c['name']} — {c['block']} block, {c['district']}",
+                     "question": f"{stem}, {c['block']} block, {c['district']}"}
+                    for c in _vr.candidates[:5]
+                ]
+                raise ClarificationNeeded(
+                    f"“{_mdist}” corresponds to more than one village: {listed}. "
+                    "Which of these is intended?",
+                    options=options, rule="entity-ambiguous", village_hint=_mdist)
+            if _vr.status == "resolved":
+                resolved["village_code"] = _vr.canonical
+                display["village"] = _vr.display or str(_mdist).title()
+            elif settings.OUT_OF_SCOPE_GUARD_ENABLED:
+                # Genuinely not a district, block, or village of ours — almost
+                # always a place in another state ("districts in Guwahati").
+                # Don't silently drop the filter and count 0; say plainly
+                # this is out of scope.
+                raise OutOfScope(f"district '{_mdist}' is not in Meghalaya")
+            else:
+                notes.append(f"'{_mdist}' is not a known district — say so, do not filter on it.")
 
     if mentions.get("block"):
         r = resolve_dimension(mentions["block"], schemes[0], "block")
         if r.status == "ambiguous":
-            raise ClarificationNeeded(f"Which block is being referred to by “{mentions['block']}”?")
+            raise ClarificationNeeded(f"Which block is being referred to by “{mentions['block']}”?",
+                                       rule="entity-ambiguous")
         if r.status == "resolved":
+            # Block and village names collide constantly in Meghalaya (26 of 56
+            # block names are also village names, per the resolver YAML) — a bare
+            # name the user didn't explicitly call a "block" is genuinely
+            # ambiguous. Silently answering at the block level here is exactly
+            # the bug QA reported (bot picks village data for a block question,
+            # or vice versa, without ever asking).
+            if not re.search(r"\bblock\b", question, re.IGNORECASE):
+                _vcheck = await resolve_village(mentions["block"])
+                if _vcheck.status in ("resolved", "ambiguous"):
+                    stem = question.strip().rstrip(" ?.")
+                    raise ClarificationNeeded(
+                        f"“{mentions['block']}” could mean either the block or a village with "
+                        "that name. Which did you mean?",
+                        options=[
+                            {"label": f"The {mentions['block']} block", "question": f"{stem}, the block, not the village"},
+                            {"label": f"The {mentions['block']} village", "question": f"{stem}, the village, not the block"},
+                        ],
+                        rule="entity-ambiguous")
             resolved["block"] = r.canonical
             display["block"] = r.display or str(r.canonical).title()
-        elif settings.OUT_OF_SCOPE_GUARD_ENABLED:
-            raise OutOfScope(f"block '{mentions['block']}' is not in Meghalaya")
         else:
-            notes.append(f"'{mentions['block']}' is not a known block — say so, do not filter on it.")
+            # The mention-extractor sometimes tags a full DISTRICT name as the
+            # "block" when the question itself says "by block" right next to it
+            # ("compare ... by block in West Garo Hills") — it reads the phrase
+            # "by block in X" as naming X as the block. Before treating this as
+            # not-a-known-block (or, worse, OutOfScope — a real district getting
+            # rejected as "not in Meghalaya" is a confusing wrong answer), check
+            # whether the same text is actually a district and use it as one.
+            _as_district = resolve_dimension(mentions["block"], schemes[0], "district")
+            if _as_district.status == "resolved":
+                # Either newly discovered here, or (commonly) the SAME text was
+                # already captured as the district via the raw-text backstop
+                # scan above (mentions.get("district") was empty, so that scan
+                # ran on the full question text and found "West Garo Hills"
+                # there too) — in that case district_canon is already set and
+                # this "block" mention is just a duplicate tag for it. Either
+                # way, there's nothing wrong here: don't overwrite an existing
+                # district_canon, and don't fall through to "not a known block".
+                if not district_canon:
+                    district_canon = _as_district.canonical
+                    resolved["district"] = _as_district.canonical
+                    display["district"] = _as_district.display or str(_as_district.canonical).title()
+            else:
+                # Also not a district — it may be a VILLAGE the extractor
+                # mistagged as "block" (villages far outnumber blocks, and a
+                # bare name after "in" gives the model no reliable signal for
+                # which admin level it is — e.g. "PMAY beneficiaries in
+                # Abagre", a real West Garo Hills village). Try village
+                # resolution before concluding this is out of scope.
+                _vr = await resolve_village(mentions["block"])
+                if _vr.status == "ambiguous":
+                    stem = question.strip().rstrip(" ?.")
+                    listed = ", ".join(
+                        f"{c['name']} in {c['block']} block ({c['district']})" for c in _vr.candidates[:5])
+                    options = [
+                        {"label": f"{c['name']} — {c['block']} block, {c['district']}",
+                         "question": f"{stem}, {c['block']} block, {c['district']}"}
+                        for c in _vr.candidates[:5]
+                    ]
+                    raise ClarificationNeeded(
+                        f"“{mentions['block']}” corresponds to more than one village: {listed}. "
+                        "Which of these is intended?",
+                        options=options, rule="entity-ambiguous", village_hint=mentions["block"])
+                if _vr.status == "resolved":
+                    resolved["village_code"] = _vr.canonical
+                    display["village"] = _vr.display or str(mentions["block"]).title()
+                elif settings.OUT_OF_SCOPE_GUARD_ENABLED:
+                    raise OutOfScope(f"block '{mentions['block']}' is not in Meghalaya")
+                else:
+                    notes.append(f"'{mentions['block']}' is not a known block — say so, do not filter on it.")
+
+    if mentions.get("assembly_constituency"):
+        r = resolve_dimension(mentions["assembly_constituency"], schemes[0], "assembly_constituency")
+        if r.status == "ambiguous":
+            raise ClarificationNeeded(
+                f"Which assembly constituency is being referred to by "
+                f"“{mentions['assembly_constituency']}”?", rule="entity-ambiguous")
+        if r.status == "resolved":
+            resolved["assembly_constituency"] = r.canonical
+            display["assembly_constituency"] = r.display or str(r.canonical).title()
+        else:
+            # assembly_constituency data exists ONLY in mgnrega_employment (no
+            # catalogue loaded for other schemes, or the name genuinely isn't
+            # one) — say so instead of silently falling back to a block/
+            # district filter, which would answer a different, unintended level.
+            notes.append(
+                f"'{mentions['assembly_constituency']}' is not a known assembly constituency "
+                f"for {schemes[0] if schemes else 'this scheme'} — say so, do not silently "
+                "filter on a block or district instead.")
 
     if mentions.get("year"):
         raw_year = mentions["year"]
@@ -976,16 +1755,55 @@ async def resolve_entities(question: str, schemes: list[str]) -> dict:
             resolved["year_key"] = year_key
             display["year"] = f"FY {year_key}-{(year_key + 1) % 100:02d}"
 
-    if mentions.get("village"):
-        r = await resolve_village(mentions["village"], district=district_canon)
+    # Prefer the current question's own village mention; fall back to the
+    # remembered hint from a just-resumed village-ambiguity pause only when
+    # this turn's extraction found no village at all (see the docstring above).
+    _village_text = mentions.get("village") or village_hint
+    if _village_text:
+        r = await resolve_village(_village_text, district=district_canon,
+                                   block=resolved.get("block"))
         if r.status == "ambiguous":
-            options = ", ".join(f"{c['name']} ({c['district']})" for c in r.candidates[:5])
-            raise ClarificationNeeded(f"“{mentions['village']}” corresponds to more than one village: {options}. Which of these is intended?")
+            # Two candidates can share the same (name, district) while being
+            # genuinely different villages in different blocks with their own
+            # data (e.g. two "Adugre"s in SOUTH WEST GARO HILLS — one in
+            # Betasing block, one in Rerapara) — block is the distinguishing
+            # feature, so it MUST be in both the message and the chip label, or
+            # they read as duplicates and the user can't tell them apart.
+            stem = question.strip().rstrip(" ?.")
+            listed = ", ".join(
+                f"{c['name']} in {c['block']} block ({c['district']})" for c in r.candidates[:5])
+            options = [
+                {"label": f"{c['name']} — {c['block']} block, {c['district']}",
+                 "question": f"{stem}, {c['block']} block, {c['district']}"}
+                for c in r.candidates[:5]
+            ]
+            raise ClarificationNeeded(
+                f"“{_village_text}” corresponds to more than one village: {listed}. "
+                "Which of these is intended?",
+                options=options,
+                rule="entity-ambiguous",
+                village_hint=_village_text)
         if r.status == "resolved":
+            # Symmetric check to the block branch above: this name might also be
+            # a block name. Only worth asking when the district/block scope
+            # didn't already pin it down (a village resolved WITH a district
+            # scope is unambiguous) and the user didn't already say "village".
+            if not district_canon and not re.search(r"\bvillage\b", question, re.IGNORECASE):
+                _bcheck = resolve_dimension(_village_text, schemes[0], "block")
+                if _bcheck.status == "resolved":
+                    stem = question.strip().rstrip(" ?.")
+                    raise ClarificationNeeded(
+                        f"“{_village_text}” could mean either the village or a block "
+                        "with that name. Which did you mean?",
+                        options=[
+                            {"label": f"The {_village_text} village", "question": f"{stem}, the village, not the block"},
+                            {"label": f"The {_village_text} block", "question": f"{stem}, the block, not the village"},
+                        ],
+                        rule="entity-ambiguous")
             resolved["village_code"] = r.canonical
-            display["village"] = r.display or str(mentions["village"]).title()
+            display["village"] = r.display or str(_village_text).title()
         else:
-            notes.append(f"'{mentions['village']}' is not a known village — say so, do not filter on it.")
+            notes.append(f"'{_village_text}' is not a known village — say so, do not filter on it.")
 
     # PMAY house-construction-stage ("Proposed Site", "Existing site(Old House)",
     # "plinth stage", "not started", …). A closed set the LLM mention-extractor
@@ -997,6 +1815,16 @@ async def resolve_entities(question: str, schemes: list[str]) -> dict:
         if hs and hs.values:
             resolved["house_status"] = hs.values if len(hs.values) > 1 else hs.values[0]
             display["house_status"] = hs.display or " and ".join(hs.values)
+
+    if prior_resolved:
+        if not mentions.get("district") and "district" not in resolved and prior_resolved.get("district"):
+            resolved["district"] = prior_resolved["district"]
+        if not mentions.get("block") and "block" not in resolved and prior_resolved.get("block"):
+            resolved["block"] = prior_resolved["block"]
+        if not mentions.get("year") and "year_key" not in resolved and prior_resolved.get("year_key"):
+            resolved["year_key"] = prior_resolved["year_key"]
+        if not mentions.get("village") and "village_code" not in resolved and prior_resolved.get("village_code"):
+            resolved["village_code"] = prior_resolved["village_code"]
 
     return {"resolved": resolved, "notes": notes, "display": display}
 
@@ -1047,12 +1875,13 @@ def _uppercase_geo_literals(sql: str) -> str:
 _MISSING_COL_RE = re.compile(r'column "([\w.]+)" does not exist', re.IGNORECASE)
 _COL_HOMES = {
     "lgd_district": "curated.v_pmay, curated.v_employment, curated.v_expenditure, "
-                    "curated.v_district_year_summary, "
+                    "curated.v_district_year_summary, curated.v_focus_plus, "
+                    "curated.v_cm_elevate, "
                     "curated.v_cross_scheme_money_district_year, curated.dim_geography",
     "lgd_block": "curated.v_pmay, curated.v_employment, curated.v_expenditure, "
-                 "curated.dim_geography",
+                 "curated.v_focus_plus, curated.v_cm_elevate, curated.dim_geography",
     "lgd_village_name": "curated.v_pmay, curated.v_employment, curated.v_expenditure, "
-                        "curated.dim_geography",
+                        "curated.v_focus_plus, curated.v_cm_elevate, curated.dim_geography",
 }
 
 
@@ -1071,12 +1900,14 @@ def _missing_column_hint(error: str) -> "str | None":
         # dim_scheme at all.
         return (f'"{col}" does not exist on the object the previous query selected from. '
                 "It lives ONLY on curated.dim_scheme and "
-                "curated.v_cross_scheme_money_district_year. The PMAY-G and MGNREGA "
-                "fact tables and views (curated.v_pmay, curated.v_expenditure, "
-                "curated.v_employment, curated.fact_pmay_house, curated.fact_mgnrega_*) "
-                "are each already a single scheme — DELETE the scheme filter and any "
-                "JOIN to curated.dim_scheme entirely, and keep every other clause "
-                "(year_key, geography, NOT is_placeholder, aggregation) exactly as it was.")
+                "curated.v_cross_scheme_money_district_year. The per-scheme fact tables "
+                "and views (curated.v_pmay, curated.v_expenditure, curated.v_employment, "
+                "curated.v_focus_plus, curated.v_cm_elevate, curated.fact_pmay_house, "
+                "curated.fact_mgnrega_*, curated.fact_focus_plus_disbursement, "
+                "curated.fact_cm_elevate_application) are each already a single scheme — "
+                "DELETE the scheme filter and any JOIN to curated.dim_scheme entirely, and "
+                "keep every other clause (year_key, geography, NOT is_placeholder, "
+                "aggregation) exactly as it was.")
     homes = _COL_HOMES.get(col)
     if not homes:
         return (f'The previous query used a column "{col}" that its source object does not '
@@ -1483,7 +2314,7 @@ async def compose_response(question: str, sql: str, rows: list[dict],
         metrics_block = (
             "\nMetrics the data DOES carry — if the question asked for something "
             "that is not in this list, say plainly it isn't tracked in the "
-            "MGNREGA / PMAY-G data available, then name what is:\n"
+            "available scheme data, then name what is:\n"
             + available_metrics_text(schemes or []) + "\n"
         )
     # A metric the schema simply doesn't carry comes back as no rows, or as a
@@ -1502,7 +2333,14 @@ async def compose_response(question: str, sql: str, rows: list[dict],
         "(adding thousands separators is fine). If a Context note below says the "
         "question assumed a figure the data contradicts, correct that figure in "
         "your first sentence and answer from the real value — never echo the "
-        "user's assumed number as if it were right. If the result is a list of "
+        "user's assumed number as if it were right. Make that first sentence ONE "
+        "clean clause naming the real figure (e.g. 'Tranche 1 shows 0 beneficiaries, "
+        "not the 4 the question assumes.') — never a reasoning trail like 'contradicting "
+        "the assumed figure of X, so Y cannot be calculated because Z is empty'. Put "
+        "the supporting figures in a separate, plainly listed second sentence (e.g. "
+        "'Tranches 2, 3 and 4 each had 93,286 beneficiaries, out of 373,144 total.') "
+        "rather than chaining them onto the correction with 'The available figures "
+        "are...'. If the result is a list of "
         "names or rows and carries no numeric column, that list IS the answer — "
         "it is the exact set the query already selected as matching the question "
         "(e.g. 'which districts have both schemes'). Name those values as the "
@@ -1537,7 +2375,10 @@ async def compose_response(question: str, sql: str, rows: list[dict],
     names_block = _entity_names_block(entities)
     prompt = f"""Answer the user's question in one to three plain sentences, using ONLY the
 numbers in the result and the whole-result summary below — do not invent or round
-differently than shown.
+differently than shown. Write like a direct briefing: lead with the fact or figure
+itself, not with "The data shows..." or a description of what the query returned.
+Keep each sentence to one idea — short and declarative, not a chain of clauses
+joined by "so" / "as" / "which means".
 {guidance}
 {metrics_block}{names_block}{summary_block}{notes_block}
 Question: "{question}"
@@ -1663,7 +2504,15 @@ def _out_of_scope_result(question: str, raw_question: str) -> dict:
 
 
 async def _answer_data(question: str, scope: "auth.UserScope | None" = None,
-                       skip_scope_clarify: bool = False) -> dict:
+                       skip_scope_clarify: bool = False,
+                       prior_resolved: "dict | None" = None,
+                       village_hint: "str | None" = None) -> dict:
+    # Named a scheme we don't hold ("CM Elevate", "PM-KISAN", …) — say so plainly
+    # instead of the generic "which scheme?" prompt, then offer the three we have.
+    _unsupported = _unsupported_scheme_named(question)
+    if _unsupported:
+        raise _unsupported_scheme_clarification(question, _unsupported)
+
     # Ask which scheme before doing anything expensive, when the question could
     # honestly mean either one. Guessing here is worse than a one-tap follow-up.
     if _needs_scheme_clarification(question):
@@ -1675,13 +2524,31 @@ async def _answer_data(question: str, scope: "auth.UserScope | None" = None,
         raise _topn_clarification(question)
 
     schemes = await classify_scheme(question)
-    entity_result = await resolve_entities(question, schemes)  # raises ClarificationNeeded if ambiguous
+    # raises ClarificationNeeded if ambiguous
+    entity_result = await resolve_entities(question, schemes, prior_resolved=prior_resolved,
+                                            village_hint=village_hint)
+
+    # "Garo Hills" / "Khasi Hills" name a hill RANGE, not a district. When one is
+    # named and no specific district resolved, either offer its districts as one-tap
+    # chips ("which Garo Hills district?") or, if the question already says "all of
+    # Garo Hills" or asks for a per-district breakdown, expand it to every district in
+    # the range and carry that forward for SQL generation.
+    if not entity_result["resolved"].get("district"):
+        _scheme0 = schemes[0] if schemes else ""
+        region = detect_region(question, _scheme0)
+        if region:
+            _want_all = region["expand"] or bool(_HAS_BREAKDOWN.search(question))
+            if not _want_all and not skip_scope_clarify:
+                raise _region_clarification(question, region)
+            entity_result["resolved"]["district_list"] = [d.upper() for d in region["districts"]]
+            entity_result["resolved"]["district_list_region"] = region["canonical"]
+            entity_result["display"]["district"] = region["canonical"]
 
     # Ask which district / block / village / year when an aggregate question
     # pins none of them — unless we're already resuming that very clarification
     # (a reply that still names no scope must not loop us back here).
     if not skip_scope_clarify and _needs_scope_clarification(question, entity_result["resolved"]):
-        raise _scope_clarification(question)
+        raise _scope_clarification(question, schemes)
 
     # Geography is settled but the year isn't: ask which financial year (one-tap
     # chips) rather than silently answering across every year. The chips resume
@@ -1842,7 +2709,14 @@ def _attach_followups(result: dict, question: str) -> None:
 async def _run_pipeline(question: str, session: "Session | None" = None,
                         scope: "auth.UserScope | None" = None) -> dict:
     raw_question = question
+    question = _correct_scheme_spelling(question)
     scope_resumed = False
+
+    # Computed early (moved ahead of the original follow-up step) so the step-0
+    # edge check below can relax its whitelist gate for a plausible follow-up —
+    # see edge.detect_edge_case's has_context param.
+    prev = session.last_turn if session is not None else None
+    has_antecedent = prev is not None and prev.route in _ANTECEDENT_ROUTES
 
     # 0a. Resuming a "which area / year?" pause — fold the user's free-text reply
     #     ("West Garo Hills 2023-24", "all of Meghalaya, all years") back into the
@@ -1850,8 +2724,10 @@ async def _run_pipeline(question: str, session: "Session | None" = None,
     #     question, or an edge case like "thanks", is left alone; either way the
     #     pending state is consumed so it never leaks into a later turn.
     pending = getattr(session, "pending_scope_q", None) if session is not None else None
+    _village_hint = getattr(session, "pending_village_hint", None) if session is not None else None
     if pending:
         session.pending_scope_q = None
+        session.pending_village_hint = None
         # A scope-pause reply is normally a bare fragment ("Ri Bhoi, 2023-24",
         # "wgh, 1999-20") with no scheme vocabulary of its own, so the edge
         # whitelist would tag it "off_topic" every time — do NOT use that as the
@@ -1889,6 +2765,18 @@ async def _run_pipeline(question: str, session: "Session | None" = None,
                 geo_def["rewritten_question"] = question
             return geo_def
 
+    # 0-a. "What schemes are available?" / "what's the difference between the
+    #      schemes?" — answered directly (see _scheme_listing_answer /
+    #      _scheme_comparison_answer) rather than falling through to RAG, which
+    #      has no single document covering either and either over-elaborates on
+    #      one scheme or says "not covered". Same scope-pause carve-out as above.
+    if not scope_resumed:
+        direct = _scheme_listing_answer(question) or _scheme_comparison_answer(question)
+        if direct:
+            if question != raw_question:
+                direct["rewritten_question"] = question
+            return direct
+
     # 0. Edge — greetings, identity, thanks, off-topic, abuse. Checked on the RAW
     #    text first: the follow-up heuristic treats any short anchorless phrase as
     #    a fragment, which would otherwise turn "hello" into a bogus follow-up.
@@ -1896,7 +2784,7 @@ async def _run_pipeline(question: str, session: "Session | None" = None,
     #    bare "<question>, <place>, <year>" fragment that the whitelist gate
     #    would wrongly flag as off-topic, and the conversational-reply case was
     #    already handled at the merge above.
-    hit = None if scope_resumed else edge.detect_edge_case(question)
+    hit = None if scope_resumed else edge.detect_edge_case(question, has_context=has_antecedent)
     if hit:
         return {"route": "edge", "intent": "EDGE", "confidence": "high",
                 "answer": hit["response"], "edge_type": hit["type"],
@@ -1906,25 +2794,27 @@ async def _run_pipeline(question: str, session: "Session | None" = None,
     # 1. Follow-up — rewrite a fragment ("what about EGH?") to a standalone
     #    question using the previous turn, before routing. Only when the previous
     #    turn was an actual scheme answer; otherwise the fragment has nothing
-    #    coherent to attach to.
-    prev = session.last_turn if session is not None else None
-    has_antecedent = prev is not None and prev.route in _ANTECEDENT_ROUTES
+    #    coherent to attach to. (prev / has_antecedent computed above, ahead of
+    #    the step-0 edge check.)
+    is_followup_rewrite = False
     if looks_like_followup(question):
         if has_antecedent:
             question = await rewrite_followup(question, prev)
+            is_followup_rewrite = True
         elif _CONTEXTLESS_REF.search(question) and not _mentions_scheme(question):
             # "how launched it?" with no prior scheme answer — don't guess.
             return {"route": "edge", "intent": "EDGE", "confidence": "high",
                     "edge_type": "confused",
                     "answer": ("I don't have an earlier answer to build on, so I'm not "
-                               "sure what that refers to. Tell me the scheme (MGNREGA or "
-                               "PMAY-G) and what you'd like to know."),
+                               "sure what that refers to. Tell me the scheme — MGNREGA, "
+                               "PMAY-G, Focus Plus, or CM Elevate — and what you'd like to "
+                               "know."),
                     "suggestions": list(edge.STARTERS),
                     **_empty_data_fields()}
 
     # 1b. Re-check edge on the rewrite (cheap, and the rewrite can surface one).
     #     Same scope-resume carve-out as step 0.
-    hit = None if scope_resumed else edge.detect_edge_case(question)
+    hit = None if scope_resumed else edge.detect_edge_case(question, has_context=has_antecedent)
     if hit:
         return {"route": "edge", "intent": "EDGE", "confidence": "high",
                 "answer": hit["response"], "edge_type": hit["type"],
@@ -1932,23 +2822,78 @@ async def _run_pipeline(question: str, session: "Session | None" = None,
                 "rewritten_question": question if question != raw_question else None,
                 **_empty_data_fields()}
 
+    # 1c. Bank / financial-channel details are not held for any loaded scheme —
+    #     say so, with the reason, before routing. Checked ahead of the DATA/
+    #     KNOWLEDGE split: phrasing like "what is the bank-wise disbursement…"
+    #     trips _KNOWLEDGE_HINTS on "what is" and would otherwise dead-end in
+    #     RAG ("not covered in the reference material") instead of explaining
+    #     that the column itself isn't queryable.
+    if _BANK_REQUESTED.search(question):
+        raise _bank_clarification(question)
+
+    # 1d. Administrative expenditure is deliberately excluded from reporting for
+    #     every scheme that has it (see _ADMIN_EXPENDITURE_REQUESTED above) —
+    #     same reasoning and same place as the bank check just above.
+    if _ADMIN_EXPENDITURE_REQUESTED.search(question):
+        raise _admin_expenditure_clarification(question)
+
+    # 1e. "What percentage were women?" — no confirmed denominator to compute
+    #     one from (see _WOMEN_SHARE_REQUESTED above). Same place, same reasoning.
+    #     PMAY-G's house-allotment women's share is a different, well-defined
+    #     computation — left alone.
+    if _WOMEN_SHARE_REQUESTED.search(question) and not _WOMEN_SHARE_PMAYG_CONTEXT.search(question):
+        raise _women_share_clarification(question)
+
     # 2. Route: number question or scheme-rules question?
     intent = await classify_intent(question)
 
     # 3. KNOWLEDGE -> RAG over the scheme reference docs.
     if intent == "KNOWLEDGE":
-        kb = await rag.answer_from_kb(question)
-        base = {"rewritten_question": question if question != raw_question else None}
+        # Scope retrieval to a single scheme when we're confident which one this
+        # is about — named outright, or (for a follow-up with nothing named of
+        # its own) the scheme the previous turn was about. Without this, vector
+        # search has no scheme filter at all and can blend in another scheme's
+        # content (e.g. PMAY-Urban passages into a PMAY-G-scoped answer).
+        _kb_scheme = None
+        _named = _named_schemes(question)
+        if len(_named) == 1:
+            _kb_scheme = _named[0]
+        elif prev is not None and len(prev.schemes or []) == 1:
+            _kb_scheme = prev.schemes[0]
+
+        # Genuinely scheme-agnostic ("tell me about the scheme", "how do I
+        # apply", "what are the benefits") — no scheme named, no follow-up
+        # antecedent, and no vocabulary that pins it to one. Guessing here (or
+        # letting bare vector search pick whichever doc scores highest) is how
+        # a vague question came back "not covered" while quietly assuming
+        # MGNREGA. Ask which of the four schemes instead, same one-tap chips
+        # the DATA path already uses (see _needs_scheme_clarification).
+        if _kb_scheme is None and _needs_scheme_clarification(question):
+            raise _scheme_clarification(question)
+
+        kb = await rag.answer_from_kb(question, scheme=_kb_scheme)
+        base = {"rewritten_question": question if question != raw_question else None,
+                "schemes": [_kb_scheme] if _kb_scheme else []}
         if kb:
             return {"route": "knowledge", "intent": "RAG", "confidence": kb["confidence"],
-                    "answer": kb["answer"], "sources": kb["sources"], **base, **_empty_data_fields()}
+                    "answer": kb["answer"], "sources": kb["sources"],
+                    **_empty_data_fields(), **base}
         return {"route": "knowledge", "intent": "RAG", "confidence": "low", "sources": [],
-                "answer": "That isn't covered in the MGNREGA / PMAY-G reference material I have.",
-                **base, **_empty_data_fields()}
+                "answer": "That isn't covered in the MGNREGA, PMAY-G, Focus Plus or "
+                          "CM Elevate reference material I have.",
+                **_empty_data_fields(), **base}
 
     # 4. DATA -> NL->SQL. On a hard failure, try the KB once before giving up.
+    # A rewritten follow-up's entities are seeded with the previous turn's
+    # resolved district/block/village/year as a fallback (see resolve_entities'
+    # `prior_resolved` param) — the LLM rewrite works from prev.question/answer
+    # TEXT, so an entity can silently drop if it doesn't literally reappear in
+    # the rewritten wording (e.g. a village name the rewrite paraphrases away).
+    _prior_resolved = prev.resolved_entities if (is_followup_rewrite and prev is not None) else None
     try:
-        result = await _answer_data(question, scope=scope, skip_scope_clarify=scope_resumed)
+        result = await _answer_data(question, scope=scope, skip_scope_clarify=scope_resumed,
+                                     prior_resolved=_prior_resolved,
+                                     village_hint=_village_hint if scope_resumed else None)
         if question != raw_question:
             result["rewritten_question"] = question
         return result

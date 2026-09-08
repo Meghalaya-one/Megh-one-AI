@@ -37,14 +37,20 @@ _DATA_PART = Path(__file__).resolve().parents[1] / "data"
 _SCHEME_DIRS = {
     "MGNREGA": _DATA_PART / "mgnrega",
     "PMAY-G": _DATA_PART / "pmay",
+    "Focus Plus": _DATA_PART / "focus_plus",
+    "CM Elevate": _DATA_PART / "cm_elevate",
 }
 _FEW_SHOT_FILE = {
     "MGNREGA": "few_shot.yaml",
     "PMAY-G": "pmay_few_shot.yaml",
+    "Focus Plus": "focusplus_few_shot.yaml",
+    "CM Elevate": "cmelevate_few_shot.yaml",
 }
 _FK_FILE = {
     "MGNREGA": "foreign_key_augmentation.yaml",
     "PMAY-G": "pmay_foreign_key_augmentation.yaml",
+    "Focus Plus": "focusplus_foreign_key_augmentation.yaml",
+    "CM Elevate": "cmelevate_foreign_key_augmentation.yaml",
 }
 
 _few_shot_cache: dict[str, list[dict]] = {}
@@ -98,6 +104,9 @@ _FEWSHOT_SYNONYMS = {
     "jobcard": "jobcards",
     "hh": "households", "household": "households",
     "house": "houses", "dwelling": "houses", "dwellings": "houses", "unit": "houses",
+    "disbursement": "disbursements", "disbursal": "disbursements", "disbursals": "disbursements",
+    "payout": "disbursements", "payouts": "disbursements",
+    "tranch": "tranche", "cohort": "batch",
     "districts": "district", "blocks": "block", "villages": "village",
     "panchayat": "village", "gp": "village",
 }

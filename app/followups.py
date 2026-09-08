@@ -35,6 +35,8 @@ _MAX = 3
 _SCHEME_RX = {
     "MGNREGA": re.compile(r"\bmgnrega\b|\bmnrega\b|\bnrega\b", re.IGNORECASE),
     "PMAY-G": re.compile(r"\bpmay[\s-]?g?\b|\bawa+s?\b", re.IGNORECASE),
+    "Focus Plus": re.compile(r"\bfocus[\s-]?plus\b|\bfocus\s*\+|\bfocusplus\b", re.IGNORECASE),
+    "CM Elevate": re.compile(r"\bcm[\s-]?elevate\b|\bcmelevate\b", re.IGNORECASE),
 }
 
 
@@ -54,7 +56,7 @@ def _primary_schemes(schemes: list[str], question: str) -> list[str]:
     if schemes:
         return schemes
     named = [s for s, rx in _SCHEME_RX.items() if rx.search(question or "")]
-    return named or ["MGNREGA", "PMAY-G"]
+    return named or ["MGNREGA", "PMAY-G", "Focus Plus", "CM Elevate"]
 
 
 # ── answer grain (read off the generated SQL's GROUP BY) ────────────────────
@@ -288,24 +290,101 @@ def _mgnrega_data(question: str, ents: dict, grain: str | None = None,
     return [{"label": q, "question": q} for q in out]
 
 
-def _cross_scheme_data(question: str, ents: dict, grain: str | None = None,
-                       rows: list | None = None) -> list[dict]:
+def _focusplus_data(question: str, ents: dict, grain: str | None = None,
+                    rows: list | None = None) -> list[dict]:
     scope = _scope_phrase(ents)
     gsuf = _grain_suffix(ents, grain)
+    out: list[str] = []
+
+    # 1. The complementary Focus Plus metric to the one just asked.
+    if _asked(question, "amount", "disburs", "money", "paid", "spend", "spent"):
+        out.append(f"How many Focus Plus payments were made{scope}{gsuf}?")
+    elif _asked(question, "batch", "cohort", "93k", "12.5k", "legacy", "registration"):
+        out.append(f"How much has been disbursed under Focus Plus{scope}{gsuf}?")
+    elif _asked(question, "gender", "women", "female", "occupation", "farmer"):
+        out.append(f"How many Focus Plus registrations are still pending{scope}?")
+    else:
+        out.append(f"How many Focus Plus payments were made in each batch{scope}?")
+
+    # 2. Drill one level finer than what the user is looking at.
+    d = _drill_down(ents, grain, rows)
+    if d:
+        out.append(d["question"])
+
+    # 3. Another Focus Plus metric — keep the whole set metric-driven.
+    _fill_metric(out, question, [
+        f"How much has been disbursed under Focus Plus{scope}{gsuf}?",
+        f"How many Focus Plus payments were made in each batch{scope}?",
+        f"How many distinct villages have Focus Plus payments{scope}?",
+        f"Show Focus Plus payments by tranche{scope}.",
+    ])
+    return [{"label": q, "question": q} for q in out]
+
+
+def _cmelevate_data(question: str, ents: dict, grain: str | None = None,
+                    rows: list | None = None) -> list[dict]:
+    scope = _scope_phrase(ents)
+    gsuf = _grain_suffix(ents, grain)
+    out: list[str] = []
+
+    # 1. The complementary CM Elevate metric to the one just asked.
+    if _asked(question, "on hold", "verified", "verification", "valid", "invalid", "wrong"):
+        out.append(f"Show CM Elevate applications by scheme{scope}?")
+    elif _asked(question, "scheme", "piggery", "poultry", "warehouse"):
+        out.append(f"How many CM Elevate applications are on hold{scope}?")
+    elif _asked(question, "gender", "women", "female", "male"):
+        out.append(f"What is the applicant type mix for CM Elevate{scope}?")
+    else:
+        out.append(f"How many CM Elevate applications are there, by scheme{scope}?")
+
+    # 2. Drill one level finer than what the user is looking at.
+    d = _drill_down(ents, grain, rows)
+    if d:
+        out.append(d["question"])
+
+    # 3. Another CM Elevate metric — keep the whole set metric-driven. No money
+    # or time chip here on purpose — CM Elevate has neither in this data.
+    _fill_metric(out, question, [
+        f"Show the verification status breakdown for CM Elevate{scope}{gsuf}?",
+        f"What is the gender split of CM Elevate applicants{scope}?",
+        f"How many distinct villages have CM Elevate applications{scope}?",
+        f"List CM Elevate schemes by application count{scope}.",
+    ])
+    return [{"label": q, "question": q} for q in out]
+
+
+def _cross_scheme_data(question: str, ents: dict, grain: str | None = None,
+                       rows: list | None = None, schemes: list[str] | None = None) -> list[dict]:
+    scope = _scope_phrase(ents)
+    gsuf = _grain_suffix(ents, grain)
+    has_fp = "Focus Plus" in (schemes or [])
+    has_cme = "CM Elevate" in (schemes or [])
+    # The cross-scheme VIEWS (spend, village coverage) cover MGNREGA and PMAY-G only —
+    # Focus Plus and CM Elevate are each compared per-scheme, so their cross-scheme
+    # chips are single-scheme questions, not a shared cross-scheme view lookup.
     out: list[str] = []
     # Only offer the spend comparison if that's not what was just asked.
     if not _asked(question, "spend", "spent", "expenditure", "money", "cost", "compare"):
         out.append(f"Compare MGNREGA and PMAY-G spending{scope}{gsuf}.")
     out.append(f"Which villages have both MGNREGA and PMAY-G activity{scope}?")
+    if has_fp and not _asked(question, "focus plus", "disburs", "focus+"):
+        out.append(f"How much has been disbursed under Focus Plus{scope}{gsuf}?")
+    if has_cme and not _asked(question, "cm elevate", "cmelevate"):
+        out.append(f"How many CM Elevate applications are there{scope}{gsuf}?")
     d = _drill_down(ents, grain, rows)
     if d:
         out.append(d["question"])
     # Keep the whole set metric-driven — no eligibility chip under a number.
-    _fill_metric(out, question, [
+    fills = [
         f"Compare MGNREGA and PMAY-G spending{scope}{gsuf}.",
         f"Which villages have both MGNREGA and PMAY-G activity{scope}?",
         f"How many households have benefited from MGNREGA and PMAY-G combined{scope}?",
-    ])
+    ]
+    if has_fp:
+        fills.insert(1, f"How many Focus Plus payments were made{scope}{gsuf}?")
+    if has_cme:
+        fills.insert(1, f"How many CM Elevate applications are there{scope}{gsuf}?")
+    _fill_metric(out, question, fills)
     return [{"label": q, "question": q} for q in out]
 
 
@@ -314,6 +393,15 @@ def _cross_scheme_data(question: str, ents: dict, grain: str | None = None,
 # asked, skip it", the question text). A general answer only ever offers more
 # general questions — nothing from the data side is mixed in.
 _KNOWLEDGE_LADDER = {
+    "Focus Plus": [
+        (("what is", "about focus", "overview"), "What is FOCUS+ (Focus Plus)?"),
+        (("eligib", "who can", "who qualifies"), "Who is eligible for FOCUS+?"),
+        (("producer group", "pg"), "What is a Producer Group under FOCUS+?"),
+        (("apply", "registration", "how do i", "meghalayaone"), "How does someone apply for FOCUS+?"),
+        (("how much", "amount", "benefit", "dbt", "installment", "instalment"),
+         "How much does FOCUS+ pay, and how is it disbursed?"),
+        (("implement", "mbda", "who runs"), "Who implements FOCUS+?"),
+    ],
     "PMAY-G": [
         (("eligib", "who can", "who qualifies"), "Who is eligible for PMAY-G?"),
         (("document", "paper", "proof"), "What documents are required to apply for PMAY-G?"),
@@ -329,6 +417,15 @@ _KNOWLEDGE_LADDER = {
         (("wage rate", "how much paid", "daily wage", "payment"), "What is the MGNREGA wage rate?"),
         (("what work", "type of work", "permissible", "allowed work"), "What kinds of work are allowed under MGNREGA?"),
         (("100 day", "hundred day", "guarantee"), "What is the 100-day guarantee under MGNREGA?"),
+    ],
+    "CM Elevate": [
+        (("what is", "about cm elevate", "overview"), "What is CM-ELEVATE?"),
+        (("eligib", "who can", "who qualifies"), "Who is eligible for CM-ELEVATE?"),
+        (("apply", "registration", "how do i", "meghalayaone"), "How does someone apply for CM-ELEVATE?"),
+        (("how many scheme", "sub-scheme", "sectors covered"), "How many individual schemes does CM-ELEVATE cover?"),
+        (("how much", "subsidy", "financial support", "project cost"),
+         "How much financial support does CM-ELEVATE provide?"),
+        (("implement", "prime", "who runs"), "Who implements CM-ELEVATE?"),
     ],
 }
 def _knowledge(question: str, schemes: list[str]) -> list[dict]:
@@ -365,9 +462,13 @@ def build_followups(route: str, question: str, schemes: list[str],
         opts = _knowledge(q, primary)
     elif route == "data":
         if len(primary) >= 2:
-            opts = _cross_scheme_data(q, ents, grain, rows)
+            opts = _cross_scheme_data(q, ents, grain, rows, primary)
         elif primary[0] == "PMAY-G":
             opts = _pmay_data(q, ents, grain, rows)
+        elif primary[0] == "Focus Plus":
+            opts = _focusplus_data(q, ents, grain, rows)
+        elif primary[0] == "CM Elevate":
+            opts = _cmelevate_data(q, ents, grain, rows)
         else:
             opts = _mgnrega_data(q, ents, grain, rows)
     else:

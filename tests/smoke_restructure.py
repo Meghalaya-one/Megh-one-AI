@@ -46,3 +46,43 @@ st, res = call("POST", "/api/query", tok, {"question": "who is eligible for PMAY
 print(f"   POST /api/query -> {st}  route={res.get('route')}")
 print(f"   answer: {(res.get('answer') or '')[:90]}")
 print(f"   {ok(st==200 and res.get('answer'))}")
+
+print("7. FOCUS PLUS DATA QUERY (third scheme, curated.v_focus_plus)")
+st, res = call("POST", "/api/query", tok, {"question": "how many Focus Plus payments were made in each batch"})
+ans = (res.get("answer") or "")[:90]
+print(f"   POST /api/query -> {st}  route={res.get('route')}  rows={res.get('row_count')}")
+print(f"   answer: {ans}")
+print(f"   {ok(st==200 and res.get('answer'))}")
+
+print("8. FOCUS PLUS RAG QUERY (knowledge path)")
+st, res = call("POST", "/api/query", tok, {"question": "what is Focus Plus and who is eligible?"})
+print(f"   POST /api/query -> {st}  route={res.get('route')}")
+print(f"   answer: {(res.get('answer') or '')[:90]}")
+print(f"   {ok(st==200 and res.get('answer'))}")
+
+print("9. CM ELEVATE DATA QUERY (fourth scheme, curated.v_cm_elevate)")
+st, res = call("POST", "/api/query", tok, {"question": "how many CM Elevate applications are on hold"})
+ans = (res.get("answer") or "")[:90]
+print(f"   POST /api/query -> {st}  route={res.get('route')}  rows={res.get('row_count')}")
+print(f"   answer: {ans}")
+print(f"   {ok(st==200 and res.get('answer'))}")
+
+print("10. CM ELEVATE RAG QUERY (knowledge path)")
+st, res = call("POST", "/api/query", tok, {"question": "what is CM Elevate and who is eligible?"})
+print(f"   POST /api/query -> {st}  route={res.get('route')}")
+print(f"   answer: {(res.get('answer') or '')[:90]}")
+print(f"   {ok(st==200 and res.get('answer'))}")
+
+print("11. CM ELEVATE MONEY REFUSAL (no money column exists — must refuse, not answer)")
+st, res = call("POST", "/api/query", tok, {"question": "what is the total amount disbursed under CM Elevate"})
+ans = (res.get("answer") or "")[:160]
+print(f"   POST /api/query -> {st}  route={res.get('route')}")
+print(f"   answer: {ans}")
+print(f"   {ok(st==200 and res.get('answer'))}  (manually confirm this REFUSES, not a fabricated figure)")
+
+print("12. CM ELEVATE TIME REFUSAL (no date column exists — must refuse, not answer)")
+st, res = call("POST", "/api/query", tok, {"question": "show CM Elevate applications by month"})
+ans = (res.get("answer") or "")[:160]
+print(f"   POST /api/query -> {st}  route={res.get('route')}")
+print(f"   answer: {ans}")
+print(f"   {ok(st==200 and res.get('answer'))}  (manually confirm this REFUSES, not a fabricated trend)")

@@ -117,7 +117,11 @@ _HARD_OFF_TOPIC = [
     r"\b(cricket|ipl|football|match\s+score|movie|film|song\s+lyrics)\b",
 ]
 # ...unless the text also names a scheme outright, in which case route it.
-_SCHEME_NAMED = re.compile(r"\b(mgnrega|mnrega|nrega|pmay[\s-]?g?|awaas|awas)\b", re.IGNORECASE)
+_SCHEME_NAMED = re.compile(
+    r"\b(mgnrega|mnrega|nrega|pmay[\s-]?g?|awaas|awas|focus[\s-]?plus|focusplus|"
+    r"cm[\s-]?elevate|cmelevate)\b|focus\s*\+",
+    re.IGNORECASE,
+)
 
 # ── Out-of-area — a place that is not in Meghalaya ─────────────────────────
 # The assistant holds Meghalaya data only. A question anchored on another
@@ -158,10 +162,15 @@ _MEGHALAYA_PLACE = re.compile(
     re.IGNORECASE,
 )
 
-# ── Strong MGNREGA / PMAY-G intent — skip every edge check below ────────────
+# ── Strong scheme intent (any of the four) — skip every edge check below ───
 _SCHEME_STRONG = [
     r"\bmgnrega\b", r"\bmnrega\b", r"\bnrega\b", r"\bmgnregs\b",
     r"\bpmay\b", r"\bpmayg\b", r"\bpmay[\s-]?g\b", r"\bawaas\b", r"\bawas\b",
+    r"\bfocus[\s-]?plus\b", r"\bfocusplus\b", r"focus\s*\+", r"\bproducer group",
+    r"\bcm[\s-]?elevate\b", r"\bcmelevate\b", r"\bpiggery\b", r"\bpoultry\b",
+    r"\bprime small enterprise\b", r"\bprime tourism vehicle\b", r"\bwarehouse scheme\b",
+    r"\bsericulture\b", r"\bmotorcaravan\b", r"\bapplicant_?category\b", r"\bdata_?verified\b",
+    r"\bmeghalayaone\b", r"\bmbda\b", r"\bdisbursement", r"\btranche\b", r"\bbatch_label\b",
     r"\bindira\s+awaas\b", r"\brural\s+hous", r"\bgramin\b",
     r"\bperson[\s-]?days?\b", r"\bmandays?\b", r"\bjob\s*card", r"\bmuster\b",
     r"\bwage", r"\bexpenditure\b", r"\bunskilled\b", r"\bsemi[\s-]?skilled\b",
@@ -209,7 +218,7 @@ _FOLLOWUP = [
     r"^(now\s+)?(show|give|tell|calculate|compute|find|sort|order|rank|list)\s+(me\s+)?(both|them|the\s+total|the\s+sum|the\s+combined|by\s+\w+|for\s+\w+)\b",
     r"^(add|sum|combine|total)\s+(them|both|those|these)\s*(up)?[\s?]*$",
     r"^(and|but|so)\s+(the|what|for|in|by|about)\b.{0,45}$",
-    r"^(how|why|when|where|what|who)\b.{0,45}\b(it|its|that|those|these|them|they|this\s+one|the\s+same)\b.{0,15}[\s?]*$",
+    r"^(how|why|when|where|what|who)\b.{0,45}\b(it|its|that|those|these|them|they|this(?:\s+one)?|the\s+same)\b.{0,15}[\s?]*$",
     r"^(explain|why|reason|elaborate|expand|clarify|correct|right|wrong|is\s+this|is\s+that|you\s+gave|you\s+said)\b",
     r"\b(is\s+this|is\s+that|is\s+it)\s+(correct|right|wrong|true|false|accurate|sure)\b",
     r"\b(you\s+gave|you\s+said|you\s+told|you\s+mentioned|you\s+showed)\b",
@@ -221,6 +230,12 @@ _DOMAIN_WORDS = [
     # scheme names + synonyms
     "mgnrega", "mnrega", "nrega", "pmay", "pmayg", "pmay-g", "awaas", "awas",
     "indira awaas", "employment guarantee", "rural housing", "rural employment",
+    "focus plus", "focus+", "focusplus", "focus-plus", "producer group",
+    "cm elevate", "cmelevate", "cm-elevate", "piggery", "poultry", "warehouse scheme",
+    "sericulture", "motorcaravan", "prime small enterprise", "prime tourism vehicle",
+    "any business venture", "cinema theatre", "sports and wellness", "green taxi",
+    "meghalayaone", "mbda", "meghalaya basin development", "farmer cash benefit",
+    "benefit",
     # work / employment
     "beneficiar", "job card", "muster", "person day", "personday", "person-day",
     "manday", "man-day", "wage", "unskilled", "semi-skilled", "material cost",
@@ -268,8 +283,9 @@ _DOMAIN_WORDS = [
 STARTERS = [
     "Total MGNREGA person-days in Meghalaya in 2023-24",
     "PMAY-G houses completed by district",
+    "Focus Plus payments by batch",
+    "How many CM Elevate applications are on hold?",
     "Who is eligible for PMAY-G?",
-    "Compare MGNREGA and PMAY-G spending in West Khasi Hills",
 ]
 
 # Which edge replies carry the starter chips (a plain "thanks" / "bye" should not).
@@ -279,36 +295,39 @@ _STARTER_KINDS = {"greeting", "identity", "profanity", "silly", "off_topic", "co
 # topic, a general-knowledge question, or a place outside Meghalaya. Callers past
 # the edge layer (the pipeline's OutOfScope handler) reuse it via out_of_scope().
 _OUT_OF_SCOPE_REPLY = (
-    "I'm Megh One AI, the assistant for Meghalaya's MGNREGA and PMAY-G schemes. "
-    "I can only answer questions about those two schemes and their data in "
-    "Meghalaya — not other topics, other states, or places outside Meghalaya."
+    "I'm Megh One AI, the assistant for Meghalaya's MGNREGA, PMAY-G, Focus Plus and "
+    "CM Elevate schemes. I can only answer questions about those schemes and their "
+    "data in Meghalaya — not other topics, other states, or places outside Meghalaya."
 )
 
 _RESPONSES = {
     "greeting": (
-        "Hello! I answer questions about Meghalaya's MGNREGA and PMAY-G data — "
-        "person-days, expenditure, houses sanctioned and completed, district and "
-        "block breakdowns — and general questions about how the two schemes work."
+        "Hello! I answer questions about Meghalaya's MGNREGA, PMAY-G, Focus Plus and "
+        "CM Elevate data — person-days, expenditure, houses sanctioned and completed, "
+        "Focus Plus disbursements, CM Elevate applications by scheme, district and "
+        "block breakdowns — and general questions about how the schemes work."
     ),
     "identity": (
-        "I'm a data assistant for Meghalaya's MGNREGA and PMAY-G schemes. I turn "
-        "plain-language questions into read-only queries against the curated "
-        "`megh_db` database for numbers, and answer scheme-rules questions from "
-        "the official reference material. I'm not a general-purpose chatbot."
+        "I'm a data assistant for Meghalaya's MGNREGA, PMAY-G, Focus Plus and CM "
+        "Elevate schemes. I turn plain-language questions into read-only queries "
+        "against the curated `megh_db` database for numbers, and answer scheme-rules "
+        "questions from the official reference material. I'm not a general-purpose "
+        "chatbot."
     ),
-    "thanks": "You're welcome. Ask me anything else about MGNREGA or PMAY-G in Meghalaya.",
+    "thanks": "You're welcome. Ask me anything else about MGNREGA, PMAY-G, Focus Plus or CM Elevate in Meghalaya.",
     "goodbye": "Thanks for using the Meghalaya scheme assistant. Come back any time.",
     "profanity": (
-        "I'm here to help. I can answer MGNREGA and PMAY-G questions for Meghalaya — "
-        "for example \"MGNREGA expenditure by district in 2024-25\" or "
-        "\"documents needed to apply for PMAY-G\"."
+        "I'm here to help. I can answer MGNREGA, PMAY-G, Focus Plus and CM Elevate "
+        "questions for Meghalaya — for example \"MGNREGA expenditure by district in "
+        "2024-25\" or \"documents needed to apply for PMAY-G\"."
     ),
     "silly": _OUT_OF_SCOPE_REPLY,
     "off_topic": _OUT_OF_SCOPE_REPLY,
     "confused": (
         "No problem. I can answer things like the count of PMAY-G houses completed "
-        "in a district, total MGNREGA wage expenditure for a year, or the "
-        "eligibility criteria for either scheme."
+        "in a district, total MGNREGA wage expenditure for a year, Focus Plus payments "
+        "by batch, how many CM Elevate applications are on hold, or the eligibility "
+        "criteria for a scheme."
     ),
 }
 
@@ -327,7 +346,18 @@ def out_of_scope() -> dict:
     return _edge("off_topic")
 
 
-def detect_edge_case(question: str) -> dict | None:
+def detect_edge_case(question: str, has_context: bool = False) -> dict | None:
+    """`has_context`: True when there's a live prior scheme answer this turn
+    could plausibly be a follow-up to (see pipeline._run_pipeline's
+    `has_antecedent`). Only relaxes step 6, the blanket "no domain vocabulary
+    anywhere -> off-topic" whitelist gate — every explicit block above it
+    (hard off-topic, out-of-area, greeting/silly/profanity/etc.) still fires
+    regardless of context. Without this, a short, legitimate follow-up that
+    happens to use no scheme-specific word of its own ("What are the
+    benefits?", right after discussing MGNREGA) gets blocked here, before the
+    pipeline's own follow-up rewrite ever runs — which also breaks the
+    antecedent chain for the NEXT turn, since this turn's route becomes
+    "edge" instead of "knowledge"/"data"."""
     q = (question or "").strip()
     if len(q) < 2:
         return _edge("confused")
@@ -379,7 +409,9 @@ def detect_edge_case(question: str) -> dict | None:
 
     # 6. Whitelist gate: no MGNREGA / PMAY-G vocabulary anywhere → off-topic.
     #    This is what stops "what is elon musk?" from ever reaching a model.
-    if not any(re.search(w, ql) for w in _DOMAIN_WORDS):
+    #    Skipped when there's a live prior scheme answer to be a follow-up to —
+    #    see the has_context note in the docstring above.
+    if not has_context and not any(re.search(w, ql) for w in _DOMAIN_WORDS):
         return _edge("off_topic")
 
     return None

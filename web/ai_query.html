@@ -23,6 +23,7 @@
     --green:#15803D; --green-bg:#DCFCE7;
     --red:#B91C1C; --red-bg:#FEE2E2;
     --pink:#9D174D; --pink-bg:#FCE7F3;
+    --blue:#1D4ED8; --blue-bg:#DBEAFE;
   }
   * { box-sizing: border-box; }
   html, body { margin: 0; padding: 0; height: 100%; }
@@ -352,6 +353,12 @@
     background: linear-gradient(180deg, var(--bg) 0%, var(--p-50) 100%);
   }
   .chat-inner { max-width: 920px; margin: 0 auto; padding: 32px 24px 200px; }
+  /* Empty welcome state doesn't need the full 200px a real conversation's last
+     bubble reserves, but it still needs enough to clear the fixed composer bar
+     (~140px tall) — anything less and the last "Try a question" chip renders
+     underneath it, unclickable, on ordinary laptop screen heights.
+     Restored the instant a message lands (hideWelcome() removes this class). */
+  .chat-inner.is-welcome { padding-top: 16px; padding-bottom: 160px; }
 
   /* HERO */
   .hero { text-align: center; padding: 32px 0 24px; }
@@ -374,7 +381,6 @@
     grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
     gap: 14px; margin: 28px 0;
   }
-  @media (max-width: 980px) { .scheme-cards { grid-template-columns: 1fr; } }
   .scheme-card {
     background: var(--surface); border: 1px solid var(--line); border-radius: 14px;
     padding: 18px; transition: all .2s; cursor: pointer;
@@ -390,6 +396,7 @@
   .scheme-card.focus-card  { background: linear-gradient(135deg, #FBF7FF 0%, #F4EBFC 100%); }
   .scheme-card.unified-card { background: linear-gradient(135deg, #F0FDFA 0%, #D6F0EC 100%); }
   .scheme-card.elevate-card { background: linear-gradient(135deg, #FFFBEB 0%, #FBF0DE 100%); }
+  .scheme-card.cmelevate-card { background: linear-gradient(135deg, #EFF6FF 0%, #DBEAFE 100%); }
   .scheme-card-head { display: flex; align-items: center; gap: 10px; margin-bottom: 6px; }
   .scheme-card .ico {
     width: 36px; height: 36px; border-radius: 10px; display: flex;
@@ -398,6 +405,7 @@
   .focus-card .ico   { background: var(--p-200); color: var(--p-700); }
   .unified-card .ico { background: var(--teal-bg); color: var(--teal); }
   .elevate-card .ico { background: var(--amber-bg); color: var(--amber); }
+  .cmelevate-card .ico { background: var(--blue-bg); color: var(--blue); }
   .scheme-card h3 { margin: 0; font-size: 15px; font-weight: 700; color: var(--ink); }
   .scheme-card .meta {
     font-size: 11.5px; color: var(--ink-3); font-weight: 500; line-height: 1.45;
@@ -439,6 +447,7 @@
   .focus-card .stat-val   { color: var(--p-700); }
   .unified-card .stat-val { color: var(--teal); }
   .elevate-card .stat-val { color: var(--amber); }
+  .cmelevate-card .stat-val { color: var(--blue); }
 
   /* PROMPT CHIPS */
   .prompts-section { margin: 22px 0 12px; }
@@ -1195,10 +1204,10 @@
   <div class="login-wrap">
     <div class="login-head">
       <div class="login-mark">
-        <!-- State emblem if it is served alongside the page; initials otherwise. -->
-        <img src="megh-logo.png" alt="Government of Meghalaya"
-             onerror="this.remove(); document.getElementById('loginMarkFallback').style.display='block';">
-        <span class="fallback" id="loginMarkFallback" style="display:none;">M</span>
+        <!-- Initials mark. For the state emblem, drop a PNG at web/megh-logo.png and
+             replace this <span> with:
+             <img src="/static/megh-logo.png" alt="Government of Meghalaya"> -->
+        <span class="fallback" id="loginMarkFallback">M</span>
       </div>
       <div class="login-title">Megh One AI</div>
       <div class="login-tagline">NLP to SQL Assistant</div>
@@ -1391,13 +1400,13 @@
     </div>
 
     <div class="chat-area" id="chatArea">
-      <div class="chat-inner" id="chatInner">
+      <div class="chat-inner is-welcome" id="chatInner">
         <!-- HERO / welcome -->
         <div class="welcome-card" id="welcomeCard">
           <div class="hero" id="hero">
             <div class="hero-eyebrow" id="heroEyebrow" style="display:none"></div>
             <h1 data-i18n="heroTitle">What would you like to know?</h1>
-            <p data-i18n="heroSub">Ask about Meghalaya's MGNREGA and PMAY-G — data questions and how the schemes work.</p>
+            <p data-i18n="heroSub">Ask about Meghalaya's MGNREGA, PMAY-G, FOCUS+ and CM Elevate — data questions and how the schemes work.</p>
           </div>
 
           <!-- SCHEME OVERVIEW (informational only — questions auto-route to the right scheme) -->
@@ -1431,6 +1440,36 @@
                 <div><div class="stat-val">₹2,185.26 Cr</div><div class="stat-lbl">Funds released</div></div>
               </div>
             </div>
+
+            <div class="scheme-card elevate-card">
+              <div class="scheme-card-head">
+                <div class="ico">🌾</div>
+                <div>
+                  <h3>FOCUS+</h3>
+                  <div class="meta">Meghalaya farmer cash benefit (DBT) · one row per disbursement · FY 2022-23 &amp; 2025-26 · figures provisional</div>
+                </div>
+              </div>
+              <div class="stats">
+                <div><div class="stat-val">3,85,671</div><div class="stat-lbl">Disbursements</div></div>
+                <div><div class="stat-val">₹119.74 Cr*</div><div class="stat-lbl">Amount disbursed*</div></div>
+                <div><div class="stat-val">12</div><div class="stat-lbl">Districts covered</div></div>
+              </div>
+            </div>
+
+            <div class="scheme-card cmelevate-card">
+              <div class="scheme-card-head">
+                <div class="ico">🚀</div>
+                <div>
+                  <h3>CM Elevate</h3>
+                  <div class="meta">Entrepreneurship &amp; livelihood programme · one row per application across 15 schemes · no date/amount data</div>
+                </div>
+              </div>
+              <div class="stats">
+                <div><div class="stat-val">8,543</div><div class="stat-lbl">Applications</div></div>
+                <div><div class="stat-val">15</div><div class="stat-lbl">Schemes</div></div>
+                <div><div class="stat-val">12</div><div class="stat-lbl">Districts covered</div></div>
+              </div>
+            </div>
           </div>
 
           <div class="prompts-section">
@@ -1452,7 +1491,7 @@
     <div class="composer-wrap">
       <div class="composer-inner">
         <div class="composer">
-          <textarea class="composer-input" id="queryInput" rows="1" placeholder="Ask about MGNREGA or PMAY-G — person-days, expenditure, houses, eligibility…" data-i18n-ph="composerPh"></textarea>
+          <textarea class="composer-input" id="queryInput" rows="1" placeholder="Ask about MGNREGA, PMAY-G, FOCUS+ or CM Elevate — person-days, houses, disbursements, eligibility…" data-i18n-ph="composerPh"></textarea>
           <div class="composer-bar">
             <button class="pill-btn mic-pill" id="micBtn" type="button" onclick="toggleMic()"
                     title="Speak your question" aria-label="Speak your question">
@@ -1620,14 +1659,16 @@ const PRODUCTS = {
   unified_auto: {
     label: 'Megh One AI',
     get base() { return API_BASE; },
-    greeting: "Khublei! Ask me anything about Meghalaya's MGNREGA and PMAY-G data — person-days, wages and expenditure, houses sanctioned and completed, by district, block or year.<br><br>I work out which scheme it's about (or compare both) and answer with text and tables. I can also explain how the schemes work — eligibility, documents, components.",
+    greeting: "Khublei! Ask me anything about Meghalaya's MGNREGA, PMAY-G, FOCUS+ and CM Elevate data — person-days, wages and expenditure, houses sanctioned and completed, FOCUS+ disbursements, CM Elevate applications by scheme, by district, block or year.<br><br>I work out which scheme it's about (or compare across schemes) and answer with text and tables. I can also explain how the schemes work — eligibility, documents, components.",
     samples: [
       { ico:'📅', text:'Total MGNREGA person-days in 2023-24' },
-      { ico:'💰', text:'MGNREGA wage expenditure by district in 2024-25' },
+      { ico:'💳', text:'Job cards issued in 2025-26' },
       { ico:'🏠', text:'PMAY-G houses completed by district' },
-      { ico:'📊', text:'Compare MGNREGA vs PMAY-G spend in West Khasi Hills' },
-      { ico:'📖', text:'Who is eligible for PMAY-G?' },
-      { ico:'📝', text:'What documents are required to apply for PMAY-G?' }
+      { ico:'💰', text:'Total PMAY-G amount released in 2024-25' },
+      { ico:'🌾', text:'How many FOCUS+ payments were made in each batch' },
+      { ico:'📍', text:'FOCUS+ payments by district' },
+      { ico:'🚀', text:'How many CM Elevate applications are on hold?' },
+      { ico:'📊', text:'Top 5 CM Elevate schemes by applications' }
     ]
   }
 };
@@ -1671,9 +1712,9 @@ let currentLang = 'en';
 const UI_STRINGS = {
   en: {
     heroTitle:   "What would you like to know?",
-    heroSub:     "Ask about Meghalaya's MGNREGA and PMAY-G — data questions and how the schemes work.",
+    heroSub:     "Ask about Meghalaya's MGNREGA, PMAY-G, FOCUS+ and CM Elevate — data questions and how the schemes work.",
     promptsTitle:"Try a question",
-    composerPh:  "Ask about MGNREGA or PMAY-G — person-days, expenditure, houses, eligibility…",
+    composerPh:  "Ask about MGNREGA, PMAY-G, FOCUS+ or CM Elevate — person-days, houses, disbursements, eligibility…",
     sendBtn:     "Send",
     micBtn:      "Speak",
     greeting:    null   // null → keep the product's own English greeting
@@ -1681,9 +1722,9 @@ const UI_STRINGS = {
   kha: {
     // TODO(translation): replace with Khasi copy.
     heroTitle:   "What would you like to know?",
-    heroSub:     "Ask about Meghalaya's MGNREGA and PMAY-G — data questions and how the schemes work.",
+    heroSub:     "Ask about Meghalaya's MGNREGA, PMAY-G, FOCUS+ and CM Elevate — data questions and how the schemes work.",
     promptsTitle:"Try a question",
-    composerPh:  "Ask about MGNREGA or PMAY-G — person-days, expenditure, houses, eligibility…",
+    composerPh:  "Ask about MGNREGA, PMAY-G, FOCUS+ or CM Elevate — person-days, houses, disbursements, eligibility…",
     sendBtn:     "Send",
     micBtn:      "Speak",
     greeting:    null
@@ -1691,9 +1732,9 @@ const UI_STRINGS = {
   gar: {
     // TODO(translation): replace with Garo copy.
     heroTitle:   "What would you like to know?",
-    heroSub:     "Ask about Meghalaya's MGNREGA and PMAY-G — data questions and how the schemes work.",
+    heroSub:     "Ask about Meghalaya's MGNREGA, PMAY-G, FOCUS+ and CM Elevate — data questions and how the schemes work.",
     promptsTitle:"Try a question",
-    composerPh:  "Ask about MGNREGA or PMAY-G — person-days, expenditure, houses, eligibility…",
+    composerPh:  "Ask about MGNREGA, PMAY-G, FOCUS+ or CM Elevate — person-days, houses, disbursements, eligibility…",
     sendBtn:     "Send",
     micBtn:      "Speak",
     greeting:    null
@@ -1790,7 +1831,14 @@ function nowTime() { return new Date().toLocaleTimeString('en-IN', { hour: '2-di
 function escapeHTML(s) { return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
 
 function hideWelcome() {
-  if (!welcomeRemoved && welcome) { welcome.style.display = 'none'; welcomeRemoved = true; }
+  if (!welcomeRemoved && welcome) {
+    welcome.style.display = 'none';
+    welcomeRemoved = true;
+    // Restore the normal bottom clearance now that a real message needs room
+    // above the fixed composer — see .chat-inner.is-welcome in the stylesheet.
+    const chatInner = document.getElementById('chatInner');
+    if (chatInner) chatInner.classList.remove('is-welcome');
+  }
 }
 
 function addMessage(role, text, isHTML = false) {
@@ -2116,6 +2164,9 @@ function prettyName(s) {
     .replace(/^curated\./i, '')
     .replace(/fact_mgnrega_/gi, 'MGNREGA ')
     .replace(/fact_pmay_/gi, 'PMAY-G ')
+    .replace(/fact_focus_plus_/gi, 'FOCUS+ ')
+    .replace(/v_focus_plus/gi, 'FOCUS+ disbursements')
+    .replace(/focus_plus/gi, 'FOCUS+')
     .replace(/^v_/i, '')
     .replace(/mgnrega/gi, 'MGNREGA')
     .replace(/pmay/gi, 'PMAY-G')
@@ -2459,6 +2510,12 @@ const SAMPLE_CATEGORIES = {
     'PMAY-G houses sanctioned vs completed in East Garo Hills',
     'Total PMAY-G amount released in 2024-25',
   ],
+  'FOCUS+ — farmer cash benefit': [
+    'How many FOCUS+ payments were made in each batch',
+    'FOCUS+ payments by district',
+    'How much has been disbursed under FOCUS+',
+    'Top 5 blocks by FOCUS+ payments',
+  ],
   'Cross-scheme': [
     'Compare MGNREGA vs PMAY-G spend in West Khasi Hills',
     'Which villages have both MGNREGA activity and PMAY-G houses?',
@@ -2467,6 +2524,7 @@ const SAMPLE_CATEGORIES = {
     'Who is eligible for PMAY-G?',
     'What documents are required to apply for PMAY-G?',
     'What is MGNREGA and what does it guarantee?',
+    'What is FOCUS+ and who is eligible?',
   ],
 };
 
@@ -2907,6 +2965,13 @@ const GLOSSARY = {
     { term: 'Amount released', def: 'Money actually disbursed against the sanction, in RUPEES — the figure that varies.' },
     { term: 'Completed / in progress', def: 'Construction stage — read from the is_completed / is_in_progress flags.' },
     { term: 'Placeholder row', def: 'Not a real house — excluded from every count and sum unless the question is about data completeness.' }
+  ],
+  'FOCUS+': [
+    { term: 'Disbursement', def: 'One row = one payment to one member in one tranche. COUNT(*) is a payment count, not a person count.' },
+    { term: 'Batch (93K / 12.5K)', def: 'Two cohorts stacked in one table: 93K legacy paid (4 rows/person, no personal fields) and 12.5K newer registrations (1 row/person, gender/occupation/status populated).' },
+    { term: 'Beneficiaries', def: 'Three different numbers — payments, members with an id (12.5K only, ~12,527), and the legacy count (~93,286, not derivable from the database). Always shown side by side, labelled.' },
+    { term: 'Amount disbursed', def: 'The only money measure. Unit is UNVERIFIED — read from dim_scheme, never assumed. Only two values exist: 5,000 and 2,500.' },
+    { term: 'Tranche', def: 'A payment round label (Tranch 1..4) — categorical, never a time series. There is no date column.' }
   ]
 };
 function openGlossary() {
@@ -2935,6 +3000,12 @@ const USE_CASES = {
     'PMAY-G houses sanctioned vs completed in East Garo Hills',
     'Total PMAY-G amount released in 2024-25',
     'Who is eligible for PMAY-G?'
+  ],
+  'FOCUS+': [
+    'How many FOCUS+ payments were made in each batch',
+    'FOCUS+ payments by district',
+    'How much has been disbursed under FOCUS+',
+    'What is FOCUS+ and who is eligible?'
   ],
   'Cross-scheme': [
     'Compare MGNREGA vs PMAY-G spend in West Khasi Hills',
@@ -3014,11 +3085,11 @@ const CARD_QUESTIONS = {
     title: 'Try a CM Elevate question',
     items: [
       { ico:'📝', text:'How many CM Elevate applications are there?' },
-      { ico:'💰', text:'Total sanctioned amount under CM Elevate' },
+      { ico:'⏸️', text:'How many CM Elevate applications are on hold?' },
       { ico:'📊', text:'Top 5 CM Elevate schemes by applications' },
-      { ico:'🏦', text:'Bank vs LIFCOM split in CM Elevate' },
-      { ico:'📍', text:'CM Elevate disbursement by district' },
-      { ico:'📈', text:'CM Elevate disbursement trend by year' }
+      { ico:'🚻', text:'What is the gender split of CM Elevate applicants?' },
+      { ico:'📍', text:'CM Elevate applications by district' },
+      { ico:'✅', text:'Show the verification status breakdown for CM Elevate' }
     ]
   },
   cross_scheme: {

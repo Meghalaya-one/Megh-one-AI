@@ -185,6 +185,37 @@ sql_generation_examples:
       LIMIT 10;
     tables: [curated.v_employment]
 
+  - question: "Which block generated the highest person-days in 2025-26?"
+    sql: |
+      SELECT lgd_district, lgd_block, SUM(person_days) AS person_days
+      FROM curated.v_employment
+      WHERE year_key = 2025
+      GROUP BY lgd_district, lgd_block
+      ORDER BY person_days DESC
+      LIMIT 1;
+    tables: [curated.v_employment]
+
+  - question: "Which village generated the highest person-days in 2025-26?"
+    sql: |
+      SELECT village_code, lgd_village_name, lgd_district, lgd_block,
+             SUM(person_days) AS person_days
+      FROM curated.v_employment
+      WHERE year_key = 2025
+      GROUP BY village_code, lgd_village_name, lgd_district, lgd_block
+      ORDER BY person_days DESC
+      LIMIT 1;
+    tables: [curated.v_employment]
+
+  - question: "Which district had the highest women employment in 2025-26?"
+    sql: |
+      SELECT lgd_district, SUM(women_employment_provided) AS women_employment_provided
+      FROM curated.v_employment
+      WHERE year_key = 2025
+      GROUP BY lgd_district
+      ORDER BY women_employment_provided DESC
+      LIMIT 1;
+    tables: [curated.v_employment]
+
   - question: "How many persons and households were provided employment in 2025-26?"
     sql: |
       SELECT SUM(persons_employed)    AS persons_employed,
@@ -219,6 +250,19 @@ sql_generation_examples:
       GROUP BY lgd_district
       ORDER BY households_completed_100_days DESC
       LIMIT 12;
+    tables: [curated.v_employment]
+
+  - question: "What percentage of employment households completed 100 days of work, by block, in West Garo Hills for 2025-26?"
+    sql: |
+      SELECT lgd_block,
+             ROUND(100.0 * SUM(households_completed_100_days)
+                   / NULLIF(SUM(households_employed), 0), 2) AS completion_100_day_pct
+      FROM curated.v_employment
+      WHERE year_key = 2025
+        AND lgd_district = 'WEST GARO HILLS'
+      GROUP BY lgd_block
+      ORDER BY completion_100_day_pct DESC
+      LIMIT 20;
     tables: [curated.v_employment]
 
   - question: "100-day completions by year"
@@ -299,6 +343,52 @@ sql_generation_examples:
       ORDER BY total_expenditure_crore DESC
       LIMIT 2;
     tables: [curated.v_expenditure]
+
+  # curated.v_district_year_summary (rule 1) only exists at DISTRICT x YEAR grain —
+  # it does not cover a village or block question. At those grains, aggregate each
+  # fact separately (never join the raw facts, per rule 1) and combine the two
+  # already-aggregated, single-row results with a plain join — no shared key needed
+  # when each subquery is already scoped to one village/block and one year.
+  - question: "How much was spent and how many person-days were generated in Uming village in 2023-24?"
+    sql: |
+      WITH exp AS (
+        SELECT ROUND(SUM(total_exp) / 100, 2) AS total_expenditure_crore
+        FROM curated.v_expenditure
+        WHERE year_key = 2023 AND village_code = 277001
+      ),
+      emp AS (
+        SELECT SUM(person_days) AS person_days
+        FROM curated.v_employment
+        WHERE year_key = 2023 AND village_code = 277001
+      )
+      SELECT exp.total_expenditure_crore, emp.person_days
+      FROM exp CROSS JOIN emp;
+    tables: [curated.v_expenditure, curated.v_employment]
+
+  # Same principle at block grain, but comparing every block in a district — so the
+  # two subqueries are aggregated per block and combined with a FULL OUTER JOIN on
+  # the shared lgd_block key (a block with rows in one fact but not the other must
+  # still appear, with NULL for the missing metric, not silently disappear).
+  - question: "Compare expenditure and person-days by block in West Garo Hills for 2025-26"
+    sql: |
+      WITH exp AS (
+        SELECT lgd_block, ROUND(SUM(total_exp) / 100, 2) AS total_expenditure_crore
+        FROM curated.v_expenditure
+        WHERE year_key = 2025 AND lgd_district = 'WEST GARO HILLS'
+        GROUP BY lgd_block
+      ),
+      emp AS (
+        SELECT lgd_block, SUM(person_days) AS person_days
+        FROM curated.v_employment
+        WHERE year_key = 2025 AND lgd_district = 'WEST GARO HILLS'
+        GROUP BY lgd_block
+      )
+      SELECT COALESCE(exp.lgd_block, emp.lgd_block) AS lgd_block,
+             exp.total_expenditure_crore, emp.person_days
+      FROM exp
+      FULL OUTER JOIN emp USING (lgd_block)
+      ORDER BY lgd_block;
+    tables: [curated.v_expenditure, curated.v_employment]
 
   # cost_per_person_day_rupees: total_exp is LAKH, person_days is a raw count.
   # The rupee rate is SUM(total_exp) * 100000 / SUM(person_days). Dividing the
@@ -431,4 +521,12 @@ sql_generation_examples:
       GROUP BY f.assembly_constituency_name
       ORDER BY person_days DESC
       LIMIT 10;
+    tables: [curated.fact_mgnrega_employment]
+
+  - question: "How many persons received employment in Nongpoh assembly constituency in 2025-26?"
+    sql: |
+      SELECT SUM(f.persons_employed) AS persons_employed
+      FROM curated.fact_mgnrega_employment f
+      WHERE f.year_key = 2025
+        AND UPPER(f.assembly_constituency_name) = UPPER('NONGPOH');
     tables: [curated.fact_mgnrega_employment]

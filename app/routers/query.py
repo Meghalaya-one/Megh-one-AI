@@ -109,12 +109,15 @@ async def query(req: QueryRequest, request: Request,
                 timeout=settings.REQUEST_TIMEOUT_SECONDS,
             )
         except ClarificationNeeded as e:
-            # A scope pause ("which area / year?") or a year pause ("which FY?")
-            # carries one-tap options, but the user may still type the answer as
-            # free text ("West Garo Hills 2023-24", "2023-24"). Remember the
-            # question so the pipeline merges that reply back into it next turn.
-            if e.rule in ("scope-not-specified", "year-not-specified"):
+            # A scope pause ("which area / year?"), a year pause ("which FY?"), or
+            # an entity-ambiguity pause ("which of these villages/districts/blocks?")
+            # carries one-tap options where they exist, but the user may still type
+            # the answer as free text ("West Garo Hills 2023-24", "East Khasi
+            # Hills"). Remember the question so the pipeline merges that reply back
+            # into it next turn instead of treating it as a brand-new question.
+            if e.rule in ("scope-not-specified", "year-not-specified", "entity-ambiguous"):
                 session.pending_scope_q = req.question
+                session.pending_village_hint = e.village_hint
             # Shape it for the frontend clarification renderer (intent CLARIFY +
             # clarification.options), and keep the flat keys older callers read.
             out = {

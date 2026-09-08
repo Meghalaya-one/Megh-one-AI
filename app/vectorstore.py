@@ -67,13 +67,23 @@ async def upsert(points: list[models.PointStruct]) -> None:
     await client.upsert(collection_name=settings.QDRANT_COLLECTION, points=points, wait=True)
 
 
-async def search(vector: list[float], top_k: int) -> list[dict]:
-    """Returns [{score, text, doc, heading, scheme}, ...] best score first."""
+async def search(vector: list[float], top_k: int, scheme: str | None = None) -> list[dict]:
+    """Returns [{score, text, doc, heading, scheme}, ...] best score first.
+    `scheme`, when given, restricts the search to chunks payload-tagged with
+    that exact scheme — every chunk carries a `scheme` tag at ingest time
+    (kb_ingest.py), but without this filter search runs unscoped across the
+    whole collection and can blend another scheme's content into the answer."""
     client = get_client()
+    query_filter = None
+    if scheme:
+        query_filter = models.Filter(
+            must=[models.FieldCondition(key="scheme", match=models.MatchValue(value=scheme))]
+        )
     # qdrant-client >= 1.10 replaced .search() with .query_points().
     response = await client.query_points(
         collection_name=settings.QDRANT_COLLECTION,
         query=vector,
+        query_filter=query_filter,
         limit=top_k,
         with_payload=True,
     )

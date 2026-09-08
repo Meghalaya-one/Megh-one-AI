@@ -36,6 +36,10 @@ _SOURCES = [
     ("reference/mgnrega_general_faq.md", "MGNREGA"),
     ("reference/pmay_complete_reference.md", "PMAY-G"),
     ("reference/pmay_general_faq.md", "PMAY-G"),
+    ("reference/focusplus_complete_reference.md", "Focus Plus"),
+    ("reference/focusplus_general_faq.md", "Focus Plus"),
+    ("reference/cmelevate_complete_reference.md", "CM Elevate"),
+    ("reference/cmelevate_general_faq.md", "CM Elevate"),
 ]
 
 # Scraped encyclopedic / official background, dropped into data/web/*.md by
@@ -67,6 +71,10 @@ def _web_sources() -> list[tuple[str, str]]:
                 scheme = "PMAY-G"
             elif "MGNREGA" in p.name.upper() or "NREGA" in p.name.upper():
                 scheme = "MGNREGA"
+            elif "FOCUS" in p.name.upper():
+                scheme = "Focus Plus"
+            elif "ELEVATE" in p.name.upper() or "CMELEVATE" in p.name.upper():
+                scheme = "CM Elevate"
         except OSError:
             pass
         out.append((f"{_WEB_DIR}/{p.name}", scheme))
@@ -100,6 +108,25 @@ def _chunk(content: str) -> list[tuple[str, str]]:
             continue
         # Too big — break at H3 boundaries.
         subs = re.split(r"\n(?=### )", text)
+
+        if heading == "(intro)":
+            # No real H2 in this doc — the general_faq.md files are flat
+            # "### Question?" lists with no H2 at all, so the whole file lands
+            # here as one oversized "(intro)" section. Packing several
+            # unrelated Q&As into one chunk buried specific answers (e.g.
+            # PMAY-G's "what documents are required" answer ended up inside a
+            # chunk labeled after a different, unrelated question, and the
+            # compose LLM skimmed past it). Each "###" is a self-contained
+            # unit here, so give it its own chunk instead of packing.
+            for sub in subs:
+                sub = sub.strip()
+                if not sub:
+                    continue
+                m = re.match(r"### (.+)", sub)
+                label = m.group(1).strip() if m else heading
+                chunks.append((label, f"[{label}]\n{sub}"))
+            continue
+
         cur_label, cur = heading, ""
         for sub in subs:
             m = re.match(r"### (.+)", sub)
@@ -117,6 +144,25 @@ def _chunk(content: str) -> list[tuple[str, str]]:
     return [(h, t) for h, t in chunks if len(t.strip()) > 50]
 
 
+# A PMAY-G-tagged chunk whose OWN heading doesn't say "Urban" can still carry a
+# nested subsection that does — e.g. pmay_complete_reference.md's H2 "## 7.
+# Application and Registration Process" is short enough to survive as ONE
+# chunk (heading "7. Application and Registration Process", no "Urban" in it)
+# while its body has both "### 7.1 PMAY-Urban" and "### 7.2 PMAY-Gramin" as
+# sub-headings. The heading-only check below can't see that. Strip any such
+# Urban sub-heading's block (through the next heading of any level, or end of
+# text) out of a PMAY-G chunk's body before it's embedded — the Gramin content
+# in the rest of the chunk is unaffected and still answers the question.
+_URBAN_SUBSECTION = re.compile(
+    r"\n#{2,6}[ \t]*[^\n]*\burban\b[^\n]*\n.*?(?=\n#{2,6}[ \t]|\Z)",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _strip_urban_subsections(text: str) -> str:
+    return _URBAN_SUBSECTION.sub("\n", text)
+
+
 def _collect_chunks() -> list[dict]:
     out: list[dict] = []
     sources = [(f, s, "sme") for f, s in _SOURCES] + \
@@ -129,7 +175,18 @@ def _collect_chunks() -> list[dict]:
             logger.warning("kb_ingest: source not found, skipping — %s", path)
             continue
         for heading, chunk_text in _chunk(text):
-            out.append({"scheme": scheme, "doc": fname, "heading": heading,
+            # A PMAY doc can carry both Gramin and Urban sections under one
+            # filename-derived "PMAY-G" tag (e.g. data/web/PMAY_Wikipedia.md's
+            # "Income Categories (Urban)", "Eligibility Conditions (Urban
+            # CLSS)"). Re-tag those sections "PMAY-U" — a scheme this bot
+            # doesn't hold — so a PMAY-G-scoped retrieval (vectorstore.search's
+            # scheme filter) can never surface Urban content in a PMAY-G answer.
+            section_scheme = scheme
+            if scheme == "PMAY-G" and re.search(r"\burban\b", heading, re.IGNORECASE):
+                section_scheme = "PMAY-U"
+            elif scheme == "PMAY-G":
+                chunk_text = _strip_urban_subsections(chunk_text)
+            out.append({"scheme": section_scheme, "doc": fname, "heading": heading,
                         "text": chunk_text, "source_type": source_type})
     return out
 

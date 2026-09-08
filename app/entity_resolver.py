@@ -29,10 +29,17 @@ _DATA_PART = Path(__file__).resolve().parents[1] / "data"
 _RESOLVER_FILE = {
     "MGNREGA": _DATA_PART / "mgnrega" / "mgnrega_entity_resolver.yaml",
     "PMAY-G": _DATA_PART / "pmay" / "pmay_entity_resolver.yaml",
+    "Focus Plus": _DATA_PART / "focus_plus" / "focusplus_entity_resolver.yaml",
+    "CM Elevate": _DATA_PART / "cm_elevate" / "cmelevate_entity_resolver.yaml",
 }
 
 # scheme -> dimension ("district" | "block" | "year") -> list of value dicts
 _catalog: dict[str, dict[str, list[dict]]] = {}
+# scheme -> [{canonical, districts, aliases}] — the hill-range groupings a user names
+# instead of a district ("Garo Hills" = 5 districts). Loaded from the resolver YAML's
+# region_groupings.groups; single-district groups (Ri Bhoi) are skipped since they
+# resolve straight to the district with nothing to ask.
+_regions: dict[str, list[dict]] = {}
 # scheme -> set of (folded_a, folded_b) pairs fuzzy must never resolve across
 _blocked: dict[str, set[tuple[str, str]]] = {}
 # scheme -> [{canonical, tokens, stage_order}] for the house_status closed set,
@@ -111,11 +118,12 @@ def load_all() -> None:
             _blocked[scheme] = set()
             _house_status[scheme] = []
             _house_status_groups[scheme] = []
+            _regions[scheme] = []
             continue
 
         dims = data.get("dimensions", {})
         _catalog[scheme] = {}
-        for dim_name in ("district", "block", "year"):
+        for dim_name in ("district", "block", "year", "assembly_constituency"):
             values = dims.get(dim_name, {}).get("values", [])
             if values:
                 _catalog[scheme][dim_name] = values
@@ -131,10 +139,22 @@ def load_all() -> None:
                     pairs.add((fold(v["canonical"]), fold(other)))
         _blocked[scheme] = pairs
 
+        regs: list[dict] = []
+        for canon, g in (data.get("region_groupings", {}) or {}).get("groups", {}).items():
+            dists = [str(d).strip() for d in (g.get("districts") or []) if str(d).strip()]
+            if len(dists) < 2:            # Ri Bhoi etc. — a single district, nothing to ask
+                continue
+            regs.append({
+                "canonical": str(canon).strip(),
+                "districts": dists,
+                "aliases": [str(a).strip() for a in (g.get("aliases") or []) if str(a).strip()],
+            })
+        _regions[scheme] = regs
+
         logger.info(
-            "entity_resolver: %s loaded — %s, %d blocked pairs, %d house_status phrases",
+            "entity_resolver: %s loaded — %s, %d blocked pairs, %d house_status phrases, %d regions",
             scheme, {k: len(v) for k, v in _catalog[scheme].items()}, len(pairs),
-            len(_house_status.get(scheme, [])),
+            len(_house_status.get(scheme, [])), len(regs),
         )
 
 
@@ -415,6 +435,67 @@ def scan_dimension(question: str, scheme: str, dimension: str) -> "Resolved | No
                     display=_display_form(best[1], dimension))
 
 
+# Words next to a region name that mean "give me the whole region", i.e. expand it to
+# every district rather than pausing to ask which one.
+_REGION_ALL_CUE = re.compile(
+    r"\ball\b|\bwhole\b|\bentire\b|\bcombined\b|\beach\b|\bevery\b|\bacross\b|"
+    r"\bfull\b|\btotal\b|\boverall\b|\bput together\b",
+    re.IGNORECASE,
+)
+
+
+def detect_region(question: str, scheme: str) -> "dict | None":
+    """A hill-range name the user typed instead of a district — "Garo Hills",
+    "Khasi region", "GH". Returns {canonical, districts, aliases, expand} when the
+    question names a multi-district region AND names no specific district, else None.
+
+    `expand` is True when the phrasing already says "all of <region>" / "every district
+    in <region>" — the caller should then filter on every district in the group and say
+    so, rather than asking which one. When False the caller should raise a one-tap
+    "which district?" clarification."""
+    regs = _regions.get(scheme) or next((v for v in _regions.values() if v), [])
+    if not regs:
+        return None
+    padded = f" {fold(question)} "
+
+    # A full district name present anywhere ⇒ the district wins; do not treat the
+    # embedded range word ("Garo Hills" inside "West Garo Hills") as a region.
+    for v in _catalog.get(scheme, {}).get("district", []):
+        ff = fold(v["canonical"])
+        if re.search(rf"(?<![A-Z0-9]){re.escape(ff)}(?![A-Z0-9])", padded):
+            return None
+
+    best: tuple[str, dict] | None = None
+    for r in regs:
+        for form in [r["canonical"], *r.get("aliases", [])]:
+            ff = fold(form)
+            if len(ff) < 3:                       # skip bare "GH" / "KH" — too collision-prone
+                continue
+            if re.search(rf"(?<![A-Z0-9]){re.escape(ff)}(?![A-Z0-9])", padded):
+                if best is None or len(ff) > len(best[0]):
+                    best = (ff, r)
+    if best is None:
+        return None
+
+    ff, r = best
+    m = re.search(re.escape(ff), padded)
+    around = padded[max(0, m.start() - 26): m.end() + 10] if m else padded
+    return {
+        "canonical": r["canonical"],
+        "districts": list(r["districts"]),
+        "aliases": list(r.get("aliases", [])),
+        "expand": bool(_REGION_ALL_CUE.search(around)),
+    }
+
+
+def all_districts(scheme: str) -> list[str]:
+    """Every district `scheme`'s resolver catalog knows, canonical Title Case,
+    in the YAML's declared order — the same names `detect_region` matches
+    against. Used to build one-tap district chips; empty if the scheme has no
+    resolver file loaded (`load_all` was not run) or no district dimension."""
+    return [v["canonical"] for v in _catalog.get(scheme, {}).get("district", [])]
+
+
 async def resolve_village(text: str, district: str | None = None, block: str | None = None) -> Resolved:
     """Village — live DB query against curated.dim_geography / dim_geography_alias.
     Resolves to village_code, per the YAML's hard rule (name alone is never a key)."""
@@ -440,11 +521,15 @@ async def resolve_village(text: str, district: str | None = None, block: str | N
 
     if not rows:
         # Trigram fuzzy fallback (uses the GIN trigram index already on dim_geography).
+        # Both sides are UPPER()'d to match the exact-match stage's normalization
+        # above — pg_trgm's similarity() is case-sensitive, so a misspelled village
+        # typed in the "wrong" case (e.g. lowercase) would otherwise score lower
+        # than the same typo in matching case and fall below the 0.4 cutoff.
         sql = f"""
             SELECT DISTINCT g.village_code, g.lgd_village_name, g.lgd_district, g.lgd_block,
-                   similarity(g.lgd_village_name, $1) AS score
+                   similarity(UPPER(g.lgd_village_name), UPPER($1)) AS score
             FROM curated.dim_geography g
-            WHERE similarity(g.lgd_village_name, $1) > 0.4
+            WHERE similarity(UPPER(g.lgd_village_name), UPPER($1)) > 0.4
             {scope_sql}
             ORDER BY score DESC
             LIMIT 5
@@ -453,6 +538,14 @@ async def resolve_village(text: str, district: str | None = None, block: str | N
         if not rows:
             return Resolved("not_found", "village", text, message=f"'{text}' is not a known village")
 
+    # NOTE: two rows can share the same (name, district) — e.g. two villages
+    # both named "Adugre" in SOUTH WEST GARO HILLS, one in BETASING block with
+    # real expenditure data and one in RERAPARA block with none — while being
+    # genuinely different villages with their own data. Collapsing them by
+    # (name, district) alone would silently pick one village_code's data over
+    # the other's and misreport the total, so they are deliberately NOT merged
+    # here. What DOES need fixing is the ambiguity message below: it must show
+    # the block too, or two distinct villages read as if they were duplicates.
     codes = {r["village_code"] for r in rows}
     if len(codes) == 1:
         r = rows[0]

@@ -18,7 +18,11 @@ logger = logging.getLogger(__name__)
 
 # subject_area token in semantic.* -> our scheme label
 _SUBJECT_TO_SCHEME = {"mgnrega": "MGNREGA", "pmay": "PMAY-G", "pmayg": "PMAY-G",
-                      "pmay-g": "PMAY-G", "housing": "PMAY-G", "employment": "MGNREGA"}
+                      "pmay-g": "PMAY-G", "housing": "PMAY-G", "employment": "MGNREGA",
+                      "focus_plus": "Focus Plus", "focusplus": "Focus Plus",
+                      "focus plus": "Focus Plus", "focus+": "Focus Plus",
+                      "cm_elevate": "CM Elevate", "cmelevate": "CM Elevate",
+                      "cm elevate": "CM Elevate", "cm-elevate": "CM Elevate"}
 
 _cache: dict = {
     "loaded": False, "tables": [], "glossary": [], "metrics": [], "joins": [],

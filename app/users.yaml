@@ -10,7 +10,7 @@
 #         district_officer | block_officer | analyst | public
 #   districts / blocks : UPPERCASE names; required for geographically-scoped
 #                        *_officer roles
-#   schemes            : optional subset of [MGNREGA, PMAY-G]
+#   schemes            : optional subset of [MGNREGA, PMAY-G, Focus Plus, CM Elevate]
 
 users:
   - user_id: superadmin

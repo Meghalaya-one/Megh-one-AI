@@ -39,15 +39,22 @@ from app.schema_context import build_schema_context
 _SHARED_PREFIXES = ("dim_scheme", "dim_year", "dim_geography")
 _CROSS_PREFIXES = ("v_cross_scheme",)
 _MGNREGA_EXACT = {"v_employment", "v_expenditure", "v_district_year_summary"}
+_FOCUSPLUS_EXACT = {"v_focus_plus"}
+_CMELEVATE_EXACT = {"v_cm_elevate", "dim_cm_elevate_scheme"}
 
 
 def _scheme_of(table: str) -> str:
-    """'MGNREGA' | 'PMAY-G' | 'shared' | 'cross' for a bare (unqualified) table name."""
+    """'MGNREGA' | 'PMAY-G' | 'Focus Plus' | 'CM Elevate' | 'shared' | 'cross' for
+    a bare (unqualified) table name."""
     t = table.lower()
     if t.startswith(_SHARED_PREFIXES):
         return "shared"
     if t.startswith(_CROSS_PREFIXES):
         return "cross"
+    if "focus_plus" in t or "focusplus" in t or t in _FOCUSPLUS_EXACT:
+        return "Focus Plus"
+    if "cm_elevate" in t or "cmelevate" in t or t in _CMELEVATE_EXACT:
+        return "CM Elevate"
     if "mgnrega" in t or t in _MGNREGA_EXACT:
         return "MGNREGA"
     if "pmay" in t:
@@ -74,7 +81,7 @@ def _live_schema_block(schemes: list[str]) -> str:
         owner = _scheme_of(bare)
         if owner == "cross" and not multi:
             continue
-        if owner in ("MGNREGA", "PMAY-G") and owner not in want:
+        if owner in ("MGNREGA", "PMAY-G", "Focus Plus", "CM Elevate") and owner not in want:
             continue
         lines.append(f"  {qualified}({', '.join(c['column'] for c in cols)})")
 
@@ -110,12 +117,28 @@ def _entities_block(entity_result: dict) -> str:
             "resolved against the database (correct case, correct code, correct year_key):"
         )
         for k, v in resolved.items():
+            if k == "district_list_region":
+                continue  # rendered alongside district_list
             if k == "village_code":
                 lines.append(f"  village_code = {v!r}   -- do NOT filter on lgd_village_name instead")
             elif k == "district":
                 lines.append(f"  lgd_district = {v!r}   -- already uppercase, matches storage exactly")
+            elif k == "district_list":
+                vals = v if isinstance(v, list) else [v]
+                quoted = ", ".join(f"'{s}'" for s in vals)
+                region = resolved.get("district_list_region", "this region")
+                lines.append(
+                    f"  lgd_district IN ({quoted})   -- the {len(vals)} districts that make up "
+                    f"\"{region}\" (a hill range, not a single district). Filter on ALL of them "
+                    f"with IN, and state in the answer which districts \"{region}\" covers.")
             elif k == "block":
                 lines.append(f"  lgd_block = {v!r}   -- already uppercase, matches storage exactly")
+            elif k == "assembly_constituency":
+                lines.append(
+                    f"  UPPER(assembly_constituency_name) = UPPER({v!r})   -- this column "
+                    "exists ONLY in mgnrega_employment. If the question also needs "
+                    "expenditure, say that level isn't available there instead of silently "
+                    "switching to a block/district filter.")
             elif k == "year_key":
                 lines.append(f"  year_key = {v!r}")
             elif k == "house_status":

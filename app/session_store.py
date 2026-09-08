@@ -41,6 +41,15 @@ class Session:
     # Holds the original question so the next turn's free-text reply can be merged
     # back into it. Cleared as soon as it's consumed. Not persisted, per-worker.
     pending_scope_q: str | None = None
+    # Set alongside pending_scope_q when the pause was a village-name ambiguity
+    # ("entity-ambiguous"). Holds the exact text the user typed for the village
+    # (e.g. "Adugre") so the resume can re-run resolve_village on it directly —
+    # the merged reply text ("...the one in Betasing block") does NOT reliably
+    # make the LLM mention-extractor re-tag the village on the merged sentence,
+    # which otherwise leaves village_code unresolved and lets SQL generation
+    # invent one instead of asking again or using the block. Cleared with
+    # pending_scope_q.
+    pending_village_hint: str | None = None
 
     @property
     def last_turn(self) -> Turn | None:

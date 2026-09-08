@@ -2,7 +2,7 @@ from pydantic_settings import BaseSettings
 
 
 class Settings(BaseSettings):
-    APP_NAME: str = "NLP Service - MGNREGA / PMAY-G"
+    APP_NAME: str = "NLP Service - MGNREGA / PMAY-G / Focus Plus / CM Elevate"
     PORT: int = 8300
     LOG_LEVEL: str = "INFO"
     REQUEST_TIMEOUT_SECONDS: int = 60  # hard ceiling on one /api/query, enforced in the router
@@ -30,12 +30,17 @@ class Settings(BaseSettings):
     # high-value directives that do NOT need a UI rewrite (frame-ancestors,
     # base-uri, object-src, form-action) are enforced. Tighten once the inline
     # JS is externalised — track via CSP_REPORT_ONLY below.
+    # Google Fonts (fonts.googleapis.com stylesheet + fonts.gstatic.com font files)
+    # are allowed so the served UI's <link> to Inter / JetBrains Mono isn't blocked.
+    # The CSS already carries full system-font fallback stacks, so for an offline /
+    # locked-down deployment you can instead drop the <link> tags from web/*.html and
+    # remove these two hosts again.
     CSP_ENFORCE: str = (
         "default-src 'self'; "
         "script-src 'self' 'unsafe-inline'; "
-        "style-src 'self' 'unsafe-inline'; "
+        "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
         "img-src 'self' data:; "
-        "font-src 'self' data:; "
+        "font-src 'self' data: https://fonts.gstatic.com; "
         "connect-src 'self'; "
         "object-src 'none'; "
         "base-uri 'self'; "
