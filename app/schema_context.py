@@ -288,17 +288,17 @@ _FOCUSPLUS_TABLES = """
 FOCUS PLUS TABLES
   curated.v_focus_plus  -- THE query surface, and for this scheme that is a PRIVACY
       boundary, not a convenience. One row = one disbursement (one payment, to one
-      member, in one tranche) — the finest grain in megh_db. 23 columns:
+      member, in one tranche) — the finest grain in megh_db. 24 columns:
         focus_plus_fact_id, source_row_id, source_sl_no, year_key, financial_year,
         financial_year_short, geography_key, village_code, lgd_village_name, lgd_block,
         lgd_district, on_roster, has_geo_conflict, batch_label, tranche_label,
         amount_disbursed, gender, occupation, focus_status, verification_status,
-        member_id, pincode, entity_type
+        member_id, pincode, entity_type, bank_name_raw
       dim_year and dim_geography are PRE-JOINED — lgd_district / lgd_block /
       lgd_village_name and financial_year / financial_year_short are on the row, so no
       join is needed for any statewide, district-, block- or village-level number.
-      NEVER query curated.fact_focus_plus_disbursement directly: the view deliberately
-      withholds bank_name_raw.
+      Prefer this view over curated.fact_focus_plus_disbursement directly — it carries
+      the same bank_name_raw plus the geography/time joins already done.
   curated.dim_scheme  -- read ON ITS OWN (never joined per row) ONLY to look up
       money_unit for the Focus Plus row. amount_disbursed's unit is UNVERIFIED and
       v_focus_plus does not expose scheme_key.
@@ -306,9 +306,9 @@ FOCUS PLUS TABLES
 
 _FOCUSPLUS_RULES = """
 FOCUS PLUS RULES (breaking these produces a wrong number, not just an ugly query):
-  1. Query curated.v_focus_plus, NEVER curated.fact_focus_plus_disbursement — the fact
-     carries bank_name_raw, which the view withholds on purpose. Reaching past the view
-     is a privacy violation, not an optimisation.
+  1. Query curated.v_focus_plus, NEVER curated.fact_focus_plus_disbursement directly —
+     the view pre-joins financial_year and district/block/village names and adds the
+     has_geo_conflict flag; the fact table alone lacks those.
   2. THERE IS NO MANDATORY PREDICATE. Do NOT copy PMAY's `WHERE NOT is_placeholder`.
      is_placeholder / is_completed / is_in_progress / mapping_category / sanction_date /
      installments_paid DO NOT EXIST on this partition — a query that references one errors.
@@ -363,10 +363,14 @@ FOCUS PLUS RULES (breaking these produces a wrong number, not just an ugly query
      a "top villages" ranking.
  10. NOT HELD — return "not available in this data", never borrow a column from PMAY or
      MGNREGA: producer groups / PG counts, EPIC-id lookups, beneficiary names, mobile
-     numbers, bank name (bank_name_raw is withheld from the view — every bank-wise
-     question is unanswerable through the approved surface), account numbers / IFSC,
-     eligible-population denominators (so no coverage %, density or per-capita),
-     constituency / MLA, budget / target / forecast, any other scheme's data.
+     numbers, account numbers / IFSC / bank-transfer or DBT status, eligible-population
+     denominators (so no coverage %, density or per-capita), constituency / MLA,
+     budget / target / forecast, any other scheme's data. bank_name_raw IS held and
+     queryable (bank name only — no account/IFSC) but is dirty free-text: alongside real
+     bank names it has a batch of rows where the raw value is a bare numeric code (e.g.
+     '1', '6', '33') instead of a name — do not treat those as a distinct "bank"; if a
+     ranking or breakdown surfaces one, flag it as an unresolved/raw code rather than
+     presenting it as a bank.
  11. NEVER row-join v_focus_plus / fact_focus_plus_disbursement to a PMAY or MGNREGA
      fact or view — every such pair is prohibited (grain mismatch). For cross-scheme
      money use curated.v_cross_scheme_money_district_year (Focus Plus presence

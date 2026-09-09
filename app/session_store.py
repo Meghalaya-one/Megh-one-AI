@@ -30,6 +30,62 @@ class Turn:
 
 
 @dataclass
+class ConversationState:
+    """Structured multi-turn state — the "what are we talking about" the
+    context layer maintains alongside the raw turn list, so a follow-up like
+    "what about 2023-24?" doesn't have to be re-derived from prose every time.
+
+    Deliberately a plain, JSON-round-trippable bag of scalars/lists (see
+    to_dict/from_dict) so it can be persisted on app.conversations.context_state
+    (see conversation_store.save_context_state) and survive a worker restart —
+    the in-process Session is L1, that JSONB column is L2, same split as the
+    turn list vs app.conversation_turns.
+
+    Nothing here is ever used for authorization — every SQL query is still
+    re-authorized from scratch against the live scope (see auth.authorize);
+    this only feeds question rewriting / entity hints.
+    """
+    scheme: str | None = None                    # single active scheme, if pinned
+    district: str | None = None
+    block: str | None = None
+    village: str | None = None
+    year: int | None = None                       # year_key, e.g. 2024 for FY2024-25
+    previous_year: int | None = None
+    metric: str | None = None                     # last metric keyword the user asked about
+    comparison_entities: list[str] = field(default_factory=list)  # for "the former/latter/other one"
+    comparison_kind: str | None = None            # "district" | "block" | "scheme" | "year"
+    last_intent: str | None = None                # "DATA" | "KNOWLEDGE" | "EDGE" | "CLARIFY"
+    last_route: str | None = None
+    last_question: str | None = None              # raw text as typed
+    last_standalone_question: str | None = None   # fully resolved/rewritten form
+    turn_count: int = 0
+
+    def to_dict(self) -> dict:
+        return {
+            "scheme": self.scheme, "district": self.district, "block": self.block,
+            "village": self.village, "year": self.year, "previous_year": self.previous_year,
+            "metric": self.metric, "comparison_entities": list(self.comparison_entities),
+            "comparison_kind": self.comparison_kind, "last_intent": self.last_intent,
+            "last_route": self.last_route, "last_question": self.last_question,
+            "last_standalone_question": self.last_standalone_question,
+            "turn_count": self.turn_count,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict | None) -> "ConversationState":
+        d = d or {}
+        return cls(
+            scheme=d.get("scheme"), district=d.get("district"), block=d.get("block"),
+            village=d.get("village"), year=d.get("year"), previous_year=d.get("previous_year"),
+            metric=d.get("metric"), comparison_entities=list(d.get("comparison_entities") or []),
+            comparison_kind=d.get("comparison_kind"), last_intent=d.get("last_intent"),
+            last_route=d.get("last_route"), last_question=d.get("last_question"),
+            last_standalone_question=d.get("last_standalone_question"),
+            turn_count=int(d.get("turn_count") or 0),
+        )
+
+
+@dataclass
 class Session:
     session_id: str
     user_id: str | None
@@ -50,6 +106,15 @@ class Session:
     # invent one instead of asking again or using the block. Cleared with
     # pending_scope_q.
     pending_village_hint: str | None = None
+    # Structured conversation state (app/context_manager.py) — the L1 copy,
+    # mirrored to app.conversations.context_state (L2) on each turn.
+    state: ConversationState = field(default_factory=ConversationState)
+    # Compact rolling summary of the conversation so far (schemes/locations/
+    # years/metrics/comparisons/unresolved references) — see
+    # context_manager.maybe_update_summary. None until the turn count first
+    # crosses CONTEXT_SUMMARY_EVERY_N_TURNS.
+    summary: str | None = None
+    summary_turn_count: int = 0   # turn_count as of the last summary update
 
     @property
     def last_turn(self) -> Turn | None:

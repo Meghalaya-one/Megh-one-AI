@@ -575,6 +575,19 @@ sql_generation_examples:
     LIMIT 2;
   tables:
   - curated.v_pmay
+- question: Compare the sanctioned amounts of Dambo Rongjeng and Samanda, the block, not the village, across all financial years
+  sql: |
+    SELECT lgd_block,
+           SUM(sanctioned_amount) AS sanctioned_amount_total
+    FROM curated.v_pmay
+    WHERE NOT is_placeholder
+      AND lgd_block IN ('DAMBO RONGJENG', 'SAMANDA')
+    GROUP BY lgd_block
+    ORDER BY sanctioned_amount_total DESC
+    LIMIT 2;
+  tables:
+  - curated.v_pmay
+  note: 'Two or more named blocks to compare -> IN-list + GROUP BY lgd_block, one row per block. Never collapse them into a single filter/total — that silently drops every block but one.'
 - question: Compare completed houses between FY 2021-22 and FY 2022-23 by district
   sql: |
     SELECT lgd_district,
@@ -668,50 +681,30 @@ sql_generation_examples:
     LIMIT 5;
   tables:
   - curated.v_pmay
+# FIXED 2026-09-08: the two examples below used to share the same GROUP BY
+# breakdown SQL for both questions (bucket values were unknown at v2.0 time,
+# so a precise filtered COUNT couldn't be written). mapping_category values are
+# now confirmed against live data — 'Fully Mapped' / 'Fuzzy Mapped', 136,141 /
+# 34,966 rows, same values used by "Mapping quality by district" below — so
+# each question now gets its own filtered count instead of a breakdown that
+# doesn't actually answer either one.
 - question: How many records are fully mapped?
   sql: |
-    SELECT mapping_category, COUNT(*) AS houses
-    FROM curated.v_pmay
-    WHERE NOT is_placeholder
-    GROUP BY mapping_category
-    ORDER BY houses DESC;
-  tables:
-  - curated.v_pmay
-  v1_sql: |
     SELECT COUNT(*) AS fully_mapped_records
     FROM curated.v_pmay
     WHERE NOT is_placeholder
-      AND mapping_status = 'Fully Mapped (100%)';
-  status: NEEDS_BUCKET_VALUES_v2.0
-  note: 'v2.0: the 44 composite mapping labels were split at ingest. curated.v_pmay exposes mapping_category (a bucket) and
-    mapping_confidence_pct (a number); the raw label survives only on fact_pmay_house.mapping_status_raw, which the view does
-    not expose. The bucket VALUES are not known from the information_schema extract - run SELECT DISTINCT mapping_category
-    before filling in the placeholder below.'
-- question: How many records are fuzzy mapped?
-  sql: |
-    SELECT mapping_category, COUNT(*) AS houses
-    FROM curated.v_pmay
-    WHERE NOT is_placeholder
-    GROUP BY mapping_category
-    ORDER BY houses DESC;
+      AND mapping_category = 'Fully Mapped';
   tables:
   - curated.v_pmay
-  v1_sql: |
+- question: How many records are fuzzy mapped?
+  sql: |
     SELECT COUNT(*) AS fuzzy_mapped_records,
-           ROUND(100.0 * COUNT(*) / (SELECT COUNT(*) FROM curated.v_pmay), 2)
-             AS share_pct
+           ROUND(100.0 * COUNT(*) FILTER (WHERE mapping_category = 'Fuzzy Mapped')
+                 / NULLIF(COUNT(*), 0), 2) AS share_pct
     FROM curated.v_pmay
-    WHERE NOT is_placeholder
-      AND mapping_status LIKE 'Fuzzy Mapped%';
-  status: NEEDS_BUCKET_VALUES_v2.0
-  note: 'v2.0: the 44 composite mapping labels were split at ingest. curated.v_pmay exposes mapping_category (a bucket) and
-    mapping_confidence_pct (a number); the raw label survives only on fact_pmay_house.mapping_status_raw, which the view does
-    not expose. The bucket VALUES are not known from the information_schema extract - run SELECT DISTINCT mapping_category
-    before filling in the placeholder below.'
-# FIXED 2026-08-28: v_pmay has no mapping_status column — the real column is
-# mapping_category, with values 'Fully Mapped' / 'Fuzzy Mapped' (no percentage
-# suffix, confirmed against live data: 136,141 / 34,966 rows). Was previously
-# unexecuted.
+    WHERE NOT is_placeholder;
+  tables:
+  - curated.v_pmay
 - question: Mapping quality by district
   sql: |
     SELECT lgd_district,

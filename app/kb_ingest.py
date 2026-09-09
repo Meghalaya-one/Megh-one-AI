@@ -34,8 +34,8 @@ _DATA_PART = Path(__file__).resolve().parents[1] / "data"
 _SOURCES = [
     ("reference/mgnrega_complete_reference.md", "MGNREGA"),
     ("reference/mgnrega_general_faq.md", "MGNREGA"),
-    ("reference/pmay_complete_reference.md", "PMAY-G"),
-    ("reference/pmay_general_faq.md", "PMAY-G"),
+    ("reference/pmay_gramin_complete_reference.md", "PMAY-G"),
+    ("reference/pmay_gramin_general_faq.md", "PMAY-G"),
     ("reference/focusplus_complete_reference.md", "Focus Plus"),
     ("reference/focusplus_general_faq.md", "Focus Plus"),
     ("reference/cmelevate_complete_reference.md", "CM Elevate"),

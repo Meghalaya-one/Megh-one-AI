@@ -34,6 +34,16 @@ _IDENTITY = [
     r"which\s+(ai|model|llm|technology|company)\s+(are|is|do|made|built)\s+you\b",
     r"(powered|built|made|developed|created|trained)\s+by\b",
     r"how\s+(do|does)\s+you\s+work\b",
+    # conversational "how can you help me" / "can you help me" openers — these
+    # carry no scheme keyword, so without a pattern here they fall all the way
+    # through to the off-topic whitelist gate and get the blunt "I can only
+    # answer..." reply instead of the friendly capabilities rundown. A message
+    # that also names a scheme/domain term exits earlier at the _SCHEME_STRONG
+    # check (step 1), so these stay safe to match loosely.
+    r"^\W*(hi|hello|hey|hii+)?\W*,?\s*how\s+(can|could|do|would)\s+(you|u)\s+(help|assist)\b",
+    r"^\W*(hi|hello|hey|hii+)?\W*,?\s*(can|could|would)\s+(you|u)\s+(help|assist)\s+me\b",
+    r"what\s+can\s+(you|u)\s+help\s+(me\s+)?with\b",
+    r"what\s+all\s+can\s+(you|u)\s+do\b",
 ]
 
 _THANKS = [
@@ -146,6 +156,34 @@ _OUT_OF_AREA = re.compile(
     r"kohima|imphal|aizawl|agartala|itanagar|gangtok|dimapur|siliguri|"
     r"all[\s-]?india|pan[\s-]?india|nation[\s-]?wide|india|"
     r"across\s+the\s+country|whole\s+country|entire\s+country"
+    r")\b",
+    re.IGNORECASE,
+)
+# Any country/continent outside India — "how many beneficiaries in Madagascar"
+# is exactly as out-of-scope as "... in Assam", but names no Indian place at
+# all, so it needs its own list rather than living in _OUT_OF_AREA above.
+# Not exhaustive (no regex list of world place names can be), but covers the
+# countries/continents/generic phrasing QA and users actually ask about.
+_FOREIGN_PLACE = re.compile(
+    r"\b("
+    r"madagasca\w*|nigeria|kenya|ethiopia|egypt|south\s+africa|morocco|ghana|"
+    r"uganda|tanzania|zimbabwe|sudan|algeria|tunisia|libya|senegal|cameroon|"
+    r"angola|mozambique|zambia|botswana|namibia|rwanda|"
+    r"pakistan|bangladesh|nepal|bhutan|sri\s*lanka|myanmar|burma|"
+    r"china|japan|north\s+korea|south\s+korea|vietnam|thailand|cambodia|laos|"
+    r"malaysia|singapore|indonesia|philippines|mongolia|kazakhstan|uzbekistan|"
+    r"afghanistan|iran|iraq|saudi\s+arabia|u\.?a\.?e\.?|dubai|abu\s+dhabi|qatar|"
+    r"kuwait|oman|bahrain|israel|turkey|syria|yemen|lebanon|"
+    r"united\s+kingdom|\buk\b|england|scotland|wales|ireland|france|germany|"
+    r"italy|spain|portugal|netherlands|belgium|switzerland|austria|sweden|"
+    r"norway|denmark|finland|poland|russia|ukraine|greece|hungary|romania|"
+    r"czech(\s+republic)?|iceland|"
+    r"united\s+states(\s+of\s+america)?|\busa\b|\bu\.s\.a?\.?\b|america|canada|"
+    r"mexico|brazil|argentina|chile|peru|colombia|venezuela|cuba|"
+    r"australia|new\s+zealand|\bfiji\b|"
+    r"africa|europe|south\s+america|north\s+america|antarctica|"
+    r"abroad|overseas|foreign\s+countr\w*|another\s+country|other\s+countr\w*|"
+    r"outside\s+india"
     r")\b",
     re.IGNORECASE,
 )
@@ -308,11 +346,11 @@ _RESPONSES = {
         "block breakdowns — and general questions about how the schemes work."
     ),
     "identity": (
-        "I'm a data assistant for Meghalaya's MGNREGA, PMAY-G, Focus Plus and CM "
-        "Elevate schemes. I turn plain-language questions into read-only queries "
-        "against the curated `megh_db` database for numbers, and answer scheme-rules "
-        "questions from the official reference material. I'm not a general-purpose "
-        "chatbot."
+        "I can help you with Meghalaya's MGNREGA, PMAY-G, Focus Plus and CM Elevate "
+        "schemes — things like person-days and wage expenditure, houses sanctioned "
+        "and completed, Focus Plus disbursements, CM Elevate applications, district "
+        "and block breakdowns, and eligibility or how-to-apply questions for any of "
+        "these schemes. Just ask in plain language."
     ),
     "thanks": "You're welcome. Ask me anything else about MGNREGA, PMAY-G, Focus Plus or CM Elevate in Meghalaya.",
     "goodbye": "Thanks for using the Meghalaya scheme assistant. Come back any time.",
@@ -370,9 +408,10 @@ def detect_edge_case(question: str, has_context: bool = False) -> dict | None:
         return _edge("off_topic")
 
     # 0b. Out-of-area — anchored on a place outside Meghalaya (another state, a
-    #     neighbouring city, "all-India"). Beats the scheme-intent early exit,
-    #     unless a Meghalaya place is named too ("Meghalaya vs Assam").
-    if _OUT_OF_AREA.search(ql) and not _MEGHALAYA_PLACE.search(ql):
+    #     neighbouring city, "all-India", or a foreign country/continent).
+    #     Beats the scheme-intent early exit, unless a Meghalaya place is named
+    #     too ("Meghalaya vs Assam").
+    if (_OUT_OF_AREA.search(ql) or _FOREIGN_PLACE.search(ql)) and not _MEGHALAYA_PLACE.search(ql):
         return _edge("off_topic")
 
     # 1. Clear scheme intent → straight to the pipeline, skip every check.

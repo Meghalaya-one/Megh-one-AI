@@ -156,3 +156,68 @@ Answer:"""
 
     logger.info("rag.answer_from_kb: top score %.3f below medium floor — no answer", top_score)
     return None
+
+
+async def answer_from_kb_multi(question: str, schemes: list[str]) -> dict | None:
+    """A KNOWLEDGE question that names two or more schemes outright ("how do I
+    apply across MGNREGA, PMAY-G, Focus Plus and CM Elevate"). A single
+    unscoped `retrieve()` pulls RAG_TOP_K candidates from the whole KB in one
+    shot, so whichever scheme's passages happen to embed closest to the
+    question crowd out the others — a named scheme with real reference
+    material can come back "not covered" simply because its chunks never made
+    the cut. Retrieve each named scheme separately instead, then compose one
+    answer that addresses every scheme that had material."""
+    per_scheme: dict[str, list[dict]] = {}
+    for s in schemes:
+        chunks = await retrieve(question, scheme=s)
+        if chunks:
+            per_scheme[s] = chunks[:4]  # cap per scheme so the composer isn't flooded
+
+    if not per_scheme:
+        return None
+
+    sections = []
+    sources = []
+    for s, chunks in per_scheme.items():
+        body = "\n\n".join(_strip_heading(c["text"]) for c in chunks)
+        sections.append(f"=== {s} ===\n{body}")
+        sources.extend({"doc": c["doc"], "heading": c["heading"],
+                         "source_type": c.get("source_type", "sme")} for c in chunks)
+    context = "\n\n---\n\n".join(sections)
+
+    prompt = f"""Answer the question using ONLY the reference passages below, which are
+grouped by scheme under "=== SchemeName ===" headers. Answer separately for EVERY
+scheme that has a section below — do not skip one, and do not invent an answer
+for a scheme that has no section. Do not invent numbers, dates, or amounts.
+No Markdown headings ("#", "##", "###").
+
+Formatting — one short bullet per scheme, formatted exactly as
+"- **SchemeName** — one or two sentence answer", one bullet per line.
+
+Question: "{question}"
+
+Reference passages:
+{context}
+
+Answer:"""
+    answer = await llm.call_response_composer(prompt)
+    cleaned = _REFUSAL_SENTENCE.sub("", answer).strip()
+    if not cleaned:
+        # Same one-retry tolerance as answer_from_kb — a non-zero-temperature
+        # outright refusal on passages that do answer the question is
+        # sometimes just a bad sample.
+        answer = await llm.call_response_composer(prompt)
+        cleaned = _REFUSAL_SENTENCE.sub("", answer).strip()
+        if not cleaned:
+            return None
+
+    missing = [s for s in schemes if s not in per_scheme]
+    if missing:
+        cleaned += ("\n\nI don't have reference material covering this for "
+                    f"{', '.join(missing)}.")
+
+    return {
+        "answer": _clean_for_display(cleaned),
+        "confidence": "medium",
+        "sources": sources,
+    }

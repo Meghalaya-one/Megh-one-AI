@@ -29,11 +29,11 @@
 #
 # TWO THINGS SET THIS SCHEME APART FROM PMAY:
 #
-#   1. THE VIEW IS A PRIVACY BOUNDARY, NOT A CONVENIENCE. PMAY's node notes
-#      say "reach for the fact when you need a column the view does not
-#      expose". THAT ADVICE IS INVERTED HERE. fact_focus_plus_disbursement
-#      carries bank_name_raw, which v_focus_plus deliberately withholds.
-#      Reaching past the view is a boundary violation, not an optimisation.
+#   1. QUERY THE VIEW, NOT THE FACT. PMAY's node notes say "reach for the
+#      fact when you need a column the view does not expose" - that does not
+#      apply here: v_focus_plus carries every fact column, including
+#      bank_name_raw, plus pre-joined year/geography, so the fact never has
+#      anything the view lacks.
 #
 #   2. THERE IS NO PRE-AGGREGATE. PMAY has v_pmay_monthly_sanctions and a
 #      prohibition against joining detail to its own rollup. Focus Plus has
@@ -104,12 +104,11 @@ foreign_key_augmentation:
         critical: true
         text: >
           DO NOT QUERY THIS TABLE. This is the opposite of the advice PMAY's file gives
-          for fact_pmay_house. The only columns the view withholds are bank_name_raw and
-          the audit columns, and bank_name_raw is withheld ON PURPOSE - it is the only
-          column any view in megh_db holds back for a reason other than audit noise.
-          Reaching past the view to get it is a privacy-boundary violation. Rule 7 of
-          SCHEMA_FOR_DEVELOPERS.md. The only legitimate reason to name this table is
-          lineage, and lineage is a DBA task.
+          for fact_pmay_house: there, the fact has columns the view lacks; here,
+          curated.v_focus_plus carries everything the fact does, including
+          bank_name_raw, plus pre-joined year/geography, so the fact table adds
+          nothing. The only legitimate reason to name this table is lineage, and
+          lineage is a DBA task.
 
     curated.dim_scheme:
       role: dimension

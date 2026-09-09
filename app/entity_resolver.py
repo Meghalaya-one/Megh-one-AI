@@ -123,7 +123,7 @@ def load_all() -> None:
 
         dims = data.get("dimensions", {})
         _catalog[scheme] = {}
-        for dim_name in ("district", "block", "year", "assembly_constituency"):
+        for dim_name in ("district", "block", "year", "assembly_constituency", "tranche_label"):
             values = dims.get(dim_name, {}).get("values", [])
             if values:
                 _catalog[scheme][dim_name] = values
@@ -245,6 +245,76 @@ def resolve_house_status(question: str, scheme: str = "PMAY-G") -> "Resolved | N
         values=ordered, confidence=1.0,
         display=" and ".join(ordered),
     )
+
+
+# The stored tranche_label is spelled "Tranch", not "Tranche", and carries a
+# trailing month word ("Tranch 2 - August") — a user typing the ordinary
+# spelling ("tranche 2") or dropping the space ("tranche2") produces a string
+# that matches neither the canonical value nor its close aliases by exact or
+# squashed containment, so the generated SQL's WHERE clause silently matches
+# zero rows (a null total, not an error). Cheap guard first (most questions
+# don't mention a tranche at all; "tranc" rather than "tranch" so the common
+# mishearing "trance" still gets through), then exact/squash containment for
+# the common cases, then a RapidFuzz partial-ratio pass so a genuine
+# misspelling ("tranch2", "3rd trance") still resolves instead of falling
+# through to the SQL generator's own guess.
+_TRANCHE_GUARD_RE = re.compile(r"tranc", re.IGNORECASE)
+
+# The fuzzy stage below must NOT fire on a bare "tranche" mention with no
+# number ("break it down by tranche", "how many tranches") — partial-ratio
+# naturally scores that high against every alias (the bare word is a prefix
+# of all of them), which would silently pin a "which tranche" question to
+# whichever canonical happens to sort first. Require an actual number/ordinal
+# in the question before trusting the fuzzy match.
+_TRANCHE_NUMBER_RE = re.compile(
+    r"\b(?:[1-4]|one|two|three|four|first|second|third|fourth|1st|2nd|3rd|4th)\b",
+    re.IGNORECASE,
+)
+
+
+def resolve_tranche_label(question: str, scheme: str = "Focus Plus") -> "Resolved | None":
+    """Focus Plus tranche_label ("Tranch 1" .. "Tranch 4 - Feb-March") — a closed
+    set of 4 the LLM mention-extractor doesn't cover (see resolve_house_status).
+    Scans the whole question and returns the exact stored label, fuzzy-matched
+    so a misspelling or missing space still resolves."""
+    values = _catalog.get(scheme, {}).get("tranche_label", [])
+    if not values or not _TRANCHE_GUARD_RE.search(question):
+        return None
+
+    folded_q = fold(question)
+    squashed_q = _squash(folded_q)
+
+    # Stage 1/2: exact canonical/alias phrase present verbatim in the question.
+    for v in values:
+        for c in [v["canonical"]] + v.get("aliases", []):
+            if fold(c) in folded_q:
+                return Resolved("resolved", "tranche_label", question,
+                                canonical=v["canonical"], confidence=1.0, display=v["canonical"])
+
+    # Stage 3: squashed containment — "tranch-2" / "Tranch 2" against alias "tranch2".
+    for v in values:
+        for c in [v["canonical"]] + v.get("aliases", []):
+            squashed_c = _squash(fold(c))
+            if squashed_c and squashed_c in squashed_q:
+                return Resolved("resolved", "tranche_label", question,
+                                canonical=v["canonical"], confidence=0.95, display=v["canonical"])
+
+    if not _TRANCHE_NUMBER_RE.search(question):
+        return None
+
+    # Stage 6: RapidFuzz partial-ratio over the whole question — catches a
+    # genuine misspelling of both the word and the number ("3rd trance").
+    best_canon, best_score = None, 0.0
+    for v in values:
+        for c in [v["canonical"]] + v.get("aliases", []):
+            score = fuzz.partial_ratio(fold(c), folded_q)
+            if score > best_score:
+                best_score, best_canon = score, v["canonical"]
+    if best_canon and best_score >= _FUZZY_ACCEPT:
+        return Resolved("resolved", "tranche_label", question,
+                        canonical=best_canon, confidence=best_score / 100, display=best_canon)
+
+    return None
 
 
 def _year_key(canonical: str) -> int:
@@ -496,6 +566,27 @@ def all_districts(scheme: str) -> list[str]:
     return [v["canonical"] for v in _catalog.get(scheme, {}).get("district", [])]
 
 
+_ACTIVITY_VIEWS = (
+    "curated.v_employment", "curated.v_expenditure", "curated.v_pmay",
+    "curated.v_focus_plus", "curated.v_cm_elevate",
+)
+
+
+async def _activity_counts(codes: list[int]) -> dict[int, int]:
+    """Row count per village_code across every scheme's data view. Used only to
+    break ties between duplicate dim_geography rows (same name, block AND
+    district, different village_code) that a user has no way to tell apart
+    through the chat UI — never surfaced to the user directly."""
+    if not codes:
+        return {}
+    union = " UNION ALL ".join(
+        f"SELECT village_code FROM {t} WHERE village_code = ANY($1)" for t in _ACTIVITY_VIEWS
+    )
+    rows = await fetch_rows(f"SELECT village_code, COUNT(*) AS n FROM ({union}) x GROUP BY village_code",
+                             [codes])
+    return {r["village_code"]: r["n"] for r in rows}
+
+
 async def resolve_village(text: str, district: str | None = None, block: str | None = None) -> Resolved:
     """Village — live DB query against curated.dim_geography / dim_geography_alias.
     Resolves to village_code, per the YAML's hard rule (name alone is never a key)."""
@@ -554,6 +645,39 @@ async def resolve_village(text: str, district: str | None = None, block: str | N
             confidence=0.9, message=f"{r['lgd_village_name']} ({r['lgd_district']})",
             display=str(r["lgd_village_name"]).title(),
         )
+
+    # Duplicate dim_geography rows for the same real-world village are common
+    # (57 (name, block, district) groups statewide as of 2026-09) — almost
+    # always an ingestion artifact where one row never got any scheme data
+    # attached (e.g. "Asimgre", DALU block, WEST GARO HILLS: village_code
+    # 274383 has zero rows anywhere, 274259 has MGNREGA + PMAY-G data). When
+    # candidates share name AND block AND district, the ambiguity chips built
+    # below are IDENTICAL text — clicking either just re-asks the same
+    # question forever, since there is nothing left for the user to say that
+    # would tell them apart (2026-09-09 bug report: this looped). A district
+    # or block DIFFERENCE (the Adugre case above) is still left for the user
+    # to answer, since that's something they can actually specify.
+    groups: dict[tuple[str, str, str], list[dict]] = {}
+    for r in rows:
+        groups.setdefault((fold(r["lgd_village_name"]), r["lgd_block"], r["lgd_district"]), []).append(r)
+    if len(groups) < len(rows):
+        counts = await _activity_counts([r["village_code"] for r in rows])
+        rows = [
+            max(group, key=lambda r: (counts.get(r["village_code"], 0), -r["village_code"]))
+            for group in groups.values()
+        ]
+        codes = {r["village_code"] for r in rows}
+        if len(codes) == 1:
+            r = rows[0]
+            logger.info(
+                "resolve_village: collapsed same-name/block/district duplicate dim_geography "
+                "rows for %r to village_code=%s by data volume", text, r["village_code"])
+            return Resolved(
+                "resolved", "village", text, canonical=r["village_code"],
+                confidence=0.75, message=f"{r['lgd_village_name']} ({r['lgd_district']})",
+                display=str(r["lgd_village_name"]).title(),
+            )
+
     return Resolved(
         "ambiguous", "village", text,
         candidates=[{"village_code": r["village_code"], "name": r["lgd_village_name"],

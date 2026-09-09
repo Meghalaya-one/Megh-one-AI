@@ -337,8 +337,8 @@ response_templates:
     - condition: "producer_group_requested"
       suggestion: "Use district, block or village as the grouping instead?"
 
-    - condition: "bank_requested"
-      suggestion: "See the payments by district or block instead?"
+    - condition: "account_number_or_ifsc_requested"
+      suggestion: "See the payments by bank name instead?"
 
     - condition: "person_lookup_requested"
       suggestion: "See the aggregate figures for that village or block?"

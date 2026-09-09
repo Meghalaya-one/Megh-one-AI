@@ -314,6 +314,44 @@ class Settings(BaseSettings):
     # Live schema catalog (semantic.* in megh_db) folded into the SQL prompt.
     SCHEMA_CATALOG_ENABLED: bool = True
 
+    # ── Conversation context layer (ChatGPT-style multi-turn state) ──
+    # Sits around the existing follow-up rewrite (looks_like_followup /
+    # rewrite_followup) and prior_resolved entity carry — it does not replace
+    # them. See app/context_manager.py. Everything here degrades to the
+    # pre-existing behaviour when disabled or on any failure.
+    CONTEXT_LAYER_ENABLED: bool = True
+    # Deterministic structured-state carry (scheme hint, previous/current year
+    # substitution, comparison-entity former/latter/other resolution). Cheap,
+    # no model call; safe to leave on independent of the summary/memory knobs.
+    CONTEXT_STATE_ENABLED: bool = True
+    # Token-aware context window fed to the follow-up rewrite LLM call when a
+    # plain prev.question/prev.answer isn't enough (long conversation). A
+    # "token" here is approximated as 4 characters — no tokenizer dependency.
+    CONTEXT_MAX_TOKENS: int = 1200
+    CONTEXT_RECENT_TURNS: int = 4              # most-recent turns considered "recent"
+    CONTEXT_SUMMARY_MAX_TOKENS: int = 200
+    CONTEXT_HISTORICAL_TURNS_MAX: int = 3      # semantic-memory turns folded in
+    # Periodic conversation summary (schemes/locations/years/metrics discussed
+    # so far), persisted on app.conversations. Updated every N turns, not on
+    # every turn — keeps it off the request-latency critical path most of the
+    # time. Best-effort: a summarization failure never breaks the answer.
+    CONTEXT_SUMMARY_ENABLED: bool = True
+    CONTEXT_SUMMARY_EVERY_N_TURNS: int = 4
+    # Semantic memory: relevant-older-turn retrieval over a dedicated Qdrant
+    # collection (separate from the scheme-KB collection AND from the
+    # semantic response cache — see app/conversation_memory.py). Reuses the
+    # existing Qdrant client + embedding pipeline. Off, or any Qdrant failure,
+    # falls back to PostgreSQL recent history / in-session turns only.
+    CONTEXT_SEMANTIC_MEMORY_ENABLED: bool = True
+    CONTEXT_MEMORY_COLLECTION: str = "megh_conversation_memory"
+    CONTEXT_MEMORY_MIN_SCORE: float = 0.55
+    CONTEXT_MEMORY_TOP_K: int = 5
+    # Only reach for semantic memory when the in-process session has fewer than
+    # this many turns of its own (i.e. a resumed/long conversation past the
+    # in-memory window) — keeps the common case (recent turn already in
+    # session_store) free of an extra embed + Qdrant round trip.
+    CONTEXT_MEMORY_MIN_SESSION_TURNS: int = 2
+
     class Config:
         env_file = ".env"
 

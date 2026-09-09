@@ -1828,7 +1828,14 @@ function scrollChatTop() { if (scrollArea) scrollArea.scrollTo({ top: 0, behavio
 function scrollToBottom() { if (scrollArea) scrollArea.scrollTop = scrollArea.scrollHeight + 9999; }
 
 function nowTime() { return new Date().toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' }); }
-function escapeHTML(s) { return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
+// Quotes MUST be escaped too — this output is used inside HTML attributes like
+// data-ask="${escapeHTML(q)}", and an unescaped " in the source text (e.g. a question
+// that starts with a literal quote character) closes the attribute early and corrupts
+// the element, silently breaking its click handler.
+function escapeHTML(s) {
+  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
 
 function hideWelcome() {
   if (!welcomeRemoved && welcome) {

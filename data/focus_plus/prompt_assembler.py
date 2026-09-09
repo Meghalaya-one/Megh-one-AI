@@ -929,7 +929,8 @@ do not re-derive them):
 Hard constraints, restated because they are the ones most often violated:
 1. `FROM {VIEW_NAME}` is the default and near-universal FROM clause. Do
    NOT query `curated.fact_focus_plus_disbursement` directly -- the view
-   is the privacy boundary (it withholds `bank_name_raw`).
+   already pre-joins year/geography and carries `bank_name_raw`, so there
+   is nothing on the fact the view lacks.
 2. There is NO mandatory predicate. Do not add `WHERE NOT is_placeholder`
    or any PMAY-style filter -- those columns do not exist here and the
    query will error.
@@ -1127,9 +1128,10 @@ wins.
    lives in exactly one of the gate/defaults sections above.
 2. Every number is a source-CSV observation until measured against the
    database -- mark totals `unverified_in_db` and say so.
-3. PII is not negotiable: `member_id`, `pincode`, `bank_name_raw` never
-   reach a user, an export, or a vector store. `member_id` is permitted
-   only inside `COUNT(DISTINCT ...)`.
+3. PII is not negotiable: `member_id` and `pincode` never reach a user, an
+   export, or a vector store. `member_id` is permitted only inside
+   `COUNT(DISTINCT ...)`. `bank_name_raw` is not PII -- it names a bank,
+   not a person -- and may reach a user (e.g. in a bank-wise breakdown).
 4. Never copy a PMAY predicate across (`is_placeholder`, `is_completed`,
    `mapping_category`, `sanction_date`, `installments_paid` do not exist
    here).

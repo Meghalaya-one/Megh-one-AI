@@ -102,8 +102,18 @@ def _fewshot_block(schemes: list[str], question: str = "") -> str:
     examples = few_shot_examples(schemes, question, top_k=4)
     if not examples:
         return ""
-    parts = [f'Q: "{ex["question"]}"\nSQL: {ex["sql"]}' for ex in examples]
-    return "\nVERIFIED EXAMPLES:\n" + "\n\n".join(parts) + "\n"
+    parts = []
+    for ex in examples:
+        if ex["sql"] is None:
+            parts.append(
+                f'Q: "{ex["question"]}"\n'
+                f'NOT ANSWERABLE from this data — {ex["reason"]} Do not substitute a '
+                'different metric (like a row count) to make it look answerable; state '
+                'plainly that the figure is not held in this warehouse.'
+            )
+        else:
+            parts.append(f'Q: "{ex["question"]}"\nSQL: {ex["sql"]}')
+    return "\nEXAMPLES (verified SQL, and known-unanswerable questions):\n" + "\n\n".join(parts) + "\n"
 
 
 def _entities_block(entity_result: dict) -> str:
@@ -126,13 +136,26 @@ def _entities_block(entity_result: dict) -> str:
             elif k == "district_list":
                 vals = v if isinstance(v, list) else [v]
                 quoted = ", ".join(f"'{s}'" for s in vals)
-                region = resolved.get("district_list_region", "this region")
-                lines.append(
-                    f"  lgd_district IN ({quoted})   -- the {len(vals)} districts that make up "
-                    f"\"{region}\" (a hill range, not a single district). Filter on ALL of them "
-                    f"with IN, and state in the answer which districts \"{region}\" covers.")
+                region = resolved.get("district_list_region")
+                if region:
+                    lines.append(
+                        f"  lgd_district IN ({quoted})   -- the {len(vals)} districts that make up "
+                        f"\"{region}\" (a hill range, not a single district). Filter on ALL of them "
+                        f"with IN, and state in the answer which districts \"{region}\" covers.")
+                else:
+                    lines.append(
+                        f"  lgd_district IN ({quoted})   -- the {len(vals)} districts explicitly "
+                        "named for comparison. Filter on ALL of them with IN and GROUP BY district "
+                        "so each gets its own row in the result — do NOT sum them into one figure.")
             elif k == "block":
                 lines.append(f"  lgd_block = {v!r}   -- already uppercase, matches storage exactly")
+            elif k == "block_list":
+                vals = v if isinstance(v, list) else [v]
+                quoted = ", ".join(f"'{s}'" for s in vals)
+                lines.append(
+                    f"  lgd_block IN ({quoted})   -- the {len(vals)} blocks explicitly named "
+                    "for comparison. Filter on ALL of them with IN and GROUP BY block so each "
+                    "gets its own row in the result — do NOT sum them into one figure.")
             elif k == "assembly_constituency":
                 lines.append(
                     f"  UPPER(assembly_constituency_name) = UPPER({v!r})   -- this column "
@@ -158,6 +181,10 @@ def _entities_block(entity_result: dict) -> str:
                         "count do NOT add 'AND NOT is_placeholder' — that guard would drop "
                         "the entire category and return a false 0. Count status_name over "
                         "all rows.")
+            elif k == "tranche_label":
+                lines.append(f"  tranche_label = {v!r}   -- exact stored Focus Plus label "
+                             "(spelled \"Tranch\", not \"Tranche\", plus a month suffix); use "
+                             "it verbatim, do NOT substitute the question's own spelling")
             else:
                 lines.append(f"  {k} = {v!r}")
     if notes:

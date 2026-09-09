@@ -19,9 +19,11 @@ display_name: Focus Plus Curated Star-Schema Semantic Schema (megh_db)
 # WHAT MAKES THIS SCHEME DIFFERENT FROM PMAY AND MGNREGA - read before editing
 # ---------------------------------------------------------------------------
 #
-#   1. IT IS THE ONLY PERSON-LEVEL FACT IN THE DATABASE. member_id, pincode and
-#      bank_name_raw describe identifiable individuals. Rule 7 of
-#      SCHEMA_FOR_DEVELOPERS.md applies to every query written from this file.
+#   1. IT IS THE ONLY PERSON-LEVEL FACT IN THE DATABASE. member_id and pincode
+#      describe identifiable individuals. Rule 7 of SCHEMA_FOR_DEVELOPERS.md
+#      applies to every query written from this file. bank_name_raw is also on
+#      the row but identifies a bank, not a person - aggregate bank-wise
+#      questions (which bank, bank share, bank concentration) are answerable.
 #
 #   2. ONE ROW IS ONE PAYMENT. Not one person, not one household. COUNT(*)
 #      answers "how many disbursements", which is almost never the question the
@@ -63,7 +65,7 @@ display_name: Focus Plus Curated Star-Schema Semantic Schema (megh_db)
 #   financial_year    -> resolved to year_key against dim_year.
 #   id                -> source_row_id.
 #   batch             -> batch_label.
-#   bank_name         -> bank_name_raw, ON THE FACT ONLY - the view drops it.
+#   bank_name         -> bank_name_raw. On both the fact and curated.v_focus_plus.
 #
 #   *** epic_id IS THE CONSEQUENTIAL LOSS. ***
 #   In the source it is the only column that identifies a legacy beneficiary:
@@ -99,10 +101,12 @@ architecture_alignment:
   safety: SQLGlot read-only validation, enforced LIMIT, SELECT-only database role.
   observability: Inputs, outputs, rule firings, SQL, results, chart spec, and response are traceable.
   pii_boundary: >
-    ADDITIONAL FOR THIS SCHEME. member_id, pincode and bank_name_raw must never enter
-    the embedding set, a vector-store payload, an export, or a rendered answer. Set
+    ADDITIONAL FOR THIS SCHEME. member_id and pincode must never enter the embedding
+    set, a vector-store payload, an export, or a rendered answer. Set
     semantic.table_catalog.is_chatbot_visible = false on the fact and expose only the
-    view. Aggregate before anything reaches a user.
+    view. Aggregate before anything reaches a user. bank_name_raw is not an identifier
+    and may appear in a rendered answer (e.g. a bank-wise breakdown), but expect dirty
+    values - see the column note under v_focus_plus.bank_name_raw.
 
 database:
   name: megh_db
@@ -121,15 +125,15 @@ database:
 datasets:
 
   # =========================================================================
-  # PRIMARY QUERY SURFACE - query this, not the fact table.
-  # For this scheme that instruction is a PRIVACY boundary, not a convenience:
-  # the view deliberately withholds bank_name_raw.
+  # PRIMARY QUERY SURFACE - query this, not the fact table. It pre-joins
+  # dim_year and dim_geography and carries bank_name_raw, so there is no
+  # reason to touch fact_focus_plus_disbursement directly.
   # =========================================================================
   v_focus_plus:
     table_name: curated.v_focus_plus
     object_type: view
     over: curated.fact_focus_plus_disbursement
-    column_count: 23
+    column_count: 24
     grain: one row per disbursement - one payment, to one member, in one tranche
     row_count: unverified_in_db
     row_count_note: >
@@ -502,7 +506,7 @@ datasets:
       - "*** COVERAGE IS 3.2%. *** Populated on 12,520 rows only. It is not a usable geography column for this scheme."
       - Use village_code for geography. It is the conformed key and it is NOT NULL.
 
-    # ---- geography attribute carried last by the view ----------------------
+    # ---- geography attribute carried by the view ---------------------------
     - name: entity_type
       source_column: dim_geography.entity_type
       meaning: Whether the geography row is a village or an urban ward.
@@ -517,10 +521,26 @@ datasets:
       - "dim_geography holds 7,200 villages and 164 wards. Focus Plus reaches both - the source carries municipal-board wards such as Williamnagar."
       - "A question about VILLAGES should say whether wards are included. Do not silently mix them in a 'top villages' ranking."
 
+    # ---- banking, carried last by the view ---------------------------------
+    - name: bank_name_raw
+      source_column: fact_focus_plus_disbursement.bank_name_raw
+      meaning: Disbursing bank name exactly as recorded in the source.
+      type: varchar(100)
+      nullable: false
+      category: categorical_attribute
+      nlp_sql_priority: high
+      sql_operations: [WHERE, GROUP BY, ORDER BY]
+      synonyms: [bank, bank name, disbursing bank, paying bank]
+      business_rules:
+      - "NOT an identifier - identifies a bank, not a person. Safe to GROUP BY, ORDER BY and return in an answer, unlike member_id/pincode."
+      - "DIRTY. 42 distinct source values that are really 27 bank names plus 15 numeric codes: the legacy batch stores names, the 12.5K batch stores codes. Casing is inconsistent ('State Bank of India' vs 'BANK OF BARODA'), one value has a leading space (' UJJIVAN SMALL FINANCE BANK') and one is misspelled ('Cananra Bank'). A normalisation table does not exist. (unverified_in_db)"
+      - "If a ranking or breakdown surfaces one of the numeric-code rows (e.g. '1', '6', '33'), flag it as an unresolved raw code rather than presenting it as a bank name. By total amount_disbursed these codes are far below the top real banks, so a top-1 'which bank' answer is unaffected."
+      - "Only the name is held - no account number or IFSC exists anywhere in megh_db for this or any other scheme."
+
   # =========================================================================
-  # UNDERLYING FACT - documented for lineage; query v_focus_plus instead.
-  # For this scheme the view is a PRIVACY boundary. Reaching past it for
-  # bank_name_raw is a deliberate violation, not a shortcut.
+  # UNDERLYING FACT - documented for lineage; query v_focus_plus instead. It
+  # pre-joins dim_year and dim_geography and carries bank_name_raw, so there
+  # is no remaining reason to query the fact directly.
   # =========================================================================
   fact_focus_plus_disbursement:
     table_name: curated.fact_focus_plus_disbursement
@@ -533,7 +553,7 @@ datasets:
     person_level: true
     query_preference: >
       Use curated.v_focus_plus. It pre-joins dim_year and dim_geography, so the generator
-      never has to emit those joins - and it drops bank_name_raw, which is the point.
+      never has to emit those joins, and it carries bank_name_raw too.
     keys_note: >
       EVERY KEY BELOW IS INFERRED FROM COLUMN NAMING. The 2026-09-02 extract carries
       structure only - no PK, FK, index or check-constraint data. Nothing here is a
@@ -554,11 +574,8 @@ datasets:
     - name: bank_name_raw
       type: varchar(100)
       meaning: Disbursing bank name exactly as recorded in the source.
-      withheld_from_view: true
       business_rules:
-      - "*** DELIBERATELY DROPPED FROM v_focus_plus. *** It is the only column any view in megh_db withholds for a reason other than audit noise. That is a privacy boundary. DO NOT REACH PAST THE VIEW FOR IT."
-      - "CONSEQUENCE FOR THE USE CASES: roughly a quarter of the Focus+ use-case workbook is bank-oriented - which bank serves most beneficiaries, bank-wise splits, bank share, bank concentration, single-bank dependency. NONE of them are answerable from the sanctioned query surface. Return 'not available through the approved query surface' and say why. Do not silently answer from the fact."
-      - "It is also DIRTY. 42 distinct source values that are really 27 bank names plus 15 numeric codes: the legacy batch stores names, the 12.5K batch stores codes. Casing is inconsistent ('State Bank of India' vs 'BANK OF BARODA'), one value has a leading space (' UJJIVAN SMALL FINANCE BANK') and one is misspelled ('Cananra Bank'). Even with access it would need a normalisation table that does not exist. (unverified_in_db)"
+      - "Also carried by curated.v_focus_plus (added 2026-09-09) - query the view, not this fact, for the same reasons as every other Focus Plus column. See v_focus_plus.bank_name_raw above for the dirty-value note."
     - name: raw_id
       type: bigint
       meaning: FK to raw.source_rows for full lineage back to the source cell.
@@ -901,12 +918,14 @@ semantic_rules:
   pii_rule:
     critical: true
     text: >
-      This is the only person-level fact in megh_db. member_id, pincode and bank_name_raw
-      identify individuals. Query v_focus_plus, never the fact. Never select an identifier
-      into an answer, an export or a vector-store payload; member_id's only legitimate use
+      This is the only person-level fact in megh_db. member_id and pincode identify
+      individuals. Query v_focus_plus, never the fact. Never select an identifier into
+      an answer, an export or a vector-store payload; member_id's only legitimate use
       is inside COUNT(DISTINCT). Do not build a member-lookup or Member-360 feature. Set
-      semantic.table_catalog.is_chatbot_visible = false on the fact and keep all three
+      semantic.table_catalog.is_chatbot_visible = false on the fact and keep both
       columns out of semantic.column_catalog.sample_values. Aggregate before display.
+      bank_name_raw is not an identifier and is exempt from this rule - it is a bank
+      name, safe to group by and to show, per v_focus_plus.bank_name_raw above.
     contrast_with_pmay: >
       PMAY was de-identified at ingest - names were dropped. Focus Plus was NOT
       de-identified the same way, so the discipline has to come from the application
@@ -948,7 +967,6 @@ semantic_rules:
     - {topic: epic_id, detail: "Dropped at ingest. EPIC lookups, Member-360, AC-code derivation from the 3-letter prefix and cross-scheme EPIC overlap are all unanswerable."}
     - {topic: beneficiary_name, detail: "Dropped at ingest. No name lookup, no name-vs-bank-account reconciliation."}
     - {topic: mobile_number, detail: "Dropped at ingest. Missing-mobile data-quality questions are unanswerable."}
-    - {topic: bank, detail: "bank_name_raw exists on the fact but is deliberately withheld from the view. Bank-wise splits, bank share, bank concentration and single-bank dependency are not answerable through the approved query surface."}
     - {topic: payment_date, detail: "No date column exists. No monthly, quarterly, weekly, exact-date or calendar-year analysis, and no Excel-serial date conversion."}
     - {topic: account_number_ifsc, detail: "Neither is in the source or megh_db. Shared-account and IFSC-mismatch audits are unanswerable."}
     - {topic: farmer_id_nic, detail: "Not in the source or megh_db."}
@@ -965,8 +983,9 @@ nlp_sql_rules:
 
   never_query: curated.fact_focus_plus_disbursement
   never_query_reason: >
-    The fact carries bank_name_raw, which the view deliberately withholds. Querying the
-    fact is a privacy-boundary violation, not an optimisation.
+    curated.v_focus_plus pre-joins dim_year and dim_geography and carries every column
+    the fact does, including bank_name_raw, so querying the fact directly is never
+    necessary and only reintroduces joins the view already did.
 
   mandatory_predicate: NONE
   mandatory_predicate_note: >
@@ -1045,10 +1064,11 @@ nlp_sql_rules:
     If the unit is unconfirmed, say so instead of publishing a converted number.
 
   pii_behavior: >
-    Never SELECT member_id, pincode or bank_name_raw into a result set. member_id is
-    permitted only inside COUNT(DISTINCT). Refuse person-lookup and Member-360 requests
-    on privacy grounds, not on availability grounds - and note that the identifying
-    columns were dropped at ingest anyway.
+    Never SELECT member_id or pincode into a result set. member_id is permitted only
+    inside COUNT(DISTINCT). Refuse person-lookup and Member-360 requests on privacy
+    grounds, not on availability grounds - and note that beneficiary name, mobile
+    number and EPIC id were dropped at ingest anyway. bank_name_raw is not covered by
+    this rule - it identifies a bank, not a person, and may be SELECTed / GROUPed on.
 
   unverified_totals_behavior: >
     No Focus Plus volume or total has been double-derived. Every figure in this file is
@@ -1287,19 +1307,30 @@ few_shot_examples:
 
 - question: Look up member Hasena Bibi and show her village, bank and payment history
   explanation: >
-    beneficiary_name was dropped at ingest, bank_name_raw is withheld from the view, and
-    there is no date column to build a payment history from. This is also a person lookup,
-    which rule 7 prohibits outright. Refuse on privacy grounds and note the columns are
-    absent.
+    beneficiary_name was dropped at ingest, and there is no date column to build a
+    payment history from even if a member could be located. This is also a person
+    lookup, which rule 7 prohibits outright regardless of which columns exist - do
+    not build a member-lookup answer even though bank_name_raw itself is queryable.
+    Refuse on privacy grounds and note the missing columns.
   sql: null
 
 - question: Which bank serves the most Focus Plus beneficiaries?
   explanation: >
-    bank_name_raw exists on the fact but is DELIBERATELY dropped from v_focus_plus. That
-    is a privacy boundary, not an oversight - do not reach past the view. Every bank-wise
-    question (bank share, bank-wise split, bank concentration, single-bank dependency) is
-    unanswerable through the approved query surface. Say so; do not query the fact.
-  sql: null
+    bank_name_raw is on curated.v_focus_plus and is not an identifier, so this is
+    answerable. "Serves the most beneficiaries" is ambiguous per rule 6 (COUNT(*) is
+    payments, not people) - answer with payment count as the primary reading and total
+    amount as a cross-check, both labelled. Some raw values are numeric codes rather
+    than bank names (rule 10) - by total amount_disbursed they rank far below the real
+    banks, so the top result is a genuine bank name, but flag any code that surfaces in
+    a fuller breakdown rather than presenting it as a bank.
+  sql: |
+    SELECT bank_name_raw,
+           COUNT(*)              AS payments,
+           SUM(amount_disbursed) AS amount_raw
+    FROM curated.v_focus_plus
+    GROUP BY bank_name_raw
+    ORDER BY payments DESC
+    LIMIT 1;
 
 - question: How many producer groups are in Focus Plus?
   explanation: >
@@ -1323,8 +1354,9 @@ few_shot_examples:
 
 - question: Which account numbers are shared by multiple Focus Plus members?
   explanation: >
-    Neither an account number nor an IFSC is held in the source or in megh_db, and
-    bank_name_raw - the only banking column that exists - is withheld from the view.
+    Neither an account number nor an IFSC is held in the source or in megh_db.
+    bank_name_raw exists and is queryable, but it identifies a bank, not an account -
+    it cannot answer an account-sharing question.
   sql: null
 
 - question: What is the Focus Plus coverage rate in each district?

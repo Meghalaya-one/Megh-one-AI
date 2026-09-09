@@ -7,13 +7,13 @@ from datetime import date
 from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
 from pydantic import BaseModel, Field, field_validator
 
-from app import auth, conversation_store, llm
+from app import auth, conversation_memory, conversation_store, llm
 from app.cache import metrics, response_cache
 from app.config import settings
 from app.deps import current_scope, require_user
 from app.net import client_ip as _resolve_ip
 from app.semantic_cache import semantic_cache
-from app.session_store import Turn, session_store
+from app.session_store import ConversationState, Turn, session_store
 from app.db import UnsafeSQLError
 from app.llm import ModelBusyError
 from app.pipeline import (
@@ -79,6 +79,23 @@ async def query(req: QueryRequest, request: Request,
         session_id = f"one-{uuid.uuid4().hex[:16]}"
     session = session_store.ensure(session_id, scope.user_id)
     session.scope = scope
+    # Rehydrate the L1 structured state from its L2 (Postgres) mirror when this
+    # is a fresh in-process session resuming an existing, client-named thread —
+    # a worker restart, a session that TTL'd out of session_store, or a request
+    # landing on a different worker. Only on a session with no turns yet, so a
+    # live conversation's in-process state (the source of truth while it's
+    # active) is never clobbered mid-thread. Best-effort: any failure just
+    # means this turn starts with blank state, same as before this layer existed.
+    if not session.turns and client_session:
+        try:
+            durable = await conversation_store.load_context_state(session_id)
+            if durable.get("context_state"):
+                session.state = ConversationState.from_dict(durable["context_state"])
+            if durable.get("summary"):
+                session.summary = durable["summary"]
+                session.summary_turn_count = session.state.turn_count
+        except Exception as e:  # noqa: BLE001
+            logger.warning("context state rehydration failed (non-fatal): %s", e)
 
     # Response + semantic caches are keyed on (question + authorization
     # fingerprint): safe to share across users who resolve to the same scope,
@@ -183,6 +200,21 @@ async def query(req: QueryRequest, request: Request,
         result=result, question=req.question, latency_ms=latency_ms,
         username=scope.username or None, ip=ip,
     )
+    # Semantic conversation memory — indexes this turn for later "relevant
+    # older turns" retrieval (see app.context_manager.build_followup_context).
+    # Fire-and-forget, scoped to this tenant/user/session; never blocks or
+    # fails the response (app.conversation_memory.index_turn degrades silently).
+    conversation_memory.index_turn(
+        tenant_id=scope.tenant_id, user_id=scope.db_user_id, session_id=session_id,
+        question=req.question, standalone_question=result.get("rewritten_question") or req.question,
+        answer=result.get("answer", ""), schemes=result.get("schemes"),
+    )
+    # L2 mirror of the structured conversation state (context_manager.update_state
+    # already ran, in-process, inside answer_question). Runs after persist_turn
+    # above so the app.conversations row it needs is guaranteed to exist,
+    # including on this session's very first turn.
+    conversation_store.save_context_state(
+        session_id=session_id, context_state=session.state.to_dict())
     _mirror_audit(scope, session_id, req.question, result, started, ip)
 
     # Only write back a freshly computed answer, and only under this caller's scope.

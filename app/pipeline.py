@@ -6,6 +6,7 @@ proposal — appropriate at 2 schemes and 20-40 concurrent users; revisit if
 either grows a lot.
 """
 import asyncio
+import itertools
 import json
 import logging
 import numbers
@@ -14,7 +15,7 @@ import re
 import httpx
 from rapidfuzz import fuzz
 
-from app import auth, edge, followups, llm, premise_check, prompt_builder, rag
+from app import auth, context_manager, edge, followups, llm, premise_check, prompt_builder, rag
 from app.config import settings
 from app.db import UnsafeSQLError, run_readonly
 from app.entity_resolver import (
@@ -23,6 +24,7 @@ from app.entity_resolver import (
     lookup_geo_term,
     resolve_dimension,
     resolve_house_status,
+    resolve_tranche_label,
     resolve_village,
     scan_dimension,
 )
@@ -155,6 +157,16 @@ def looks_like_followup(question: str) -> bool:
         return True
     if _FOLLOWUP_LEAD.search(q):
         return True
+    # A question that names its own scheme outright is self-anchoring, same as
+    # _STANDALONE_ANCHOR's "scheme"/"mgnrega"/"pmay" entries — but that regex
+    # predates Focus Plus/CM Elevate and was never extended to them, so "What
+    # benefits will I get under this Focus Plus" tripped _FOLLOWUP_PRONOUN on
+    # "this", found no anchor, and got rewritten against the PREVIOUS turn's
+    # scheme (e.g. "...compared to PMAY-G?") even though it names its own
+    # scheme in full. _mentions_scheme covers all four schemes without having
+    # to keep two scheme-name lists in sync.
+    if _mentions_scheme(q):
+        return False
     if _FOLLOWUP_PRONOUN.search(q) and not _STANDALONE_ANCHOR.search(q):
         return True
     # A bare fragment ("in East Garo Hills", "by block") with no anchor of its own.
@@ -193,9 +205,17 @@ def _scheme_swap_rewrite(prev_question: str, followup: str) -> "str | None":
     return out
 
 
-async def rewrite_followup(question: str, prev: "object") -> str:
+async def rewrite_followup(question: str, prev: "object", extra_context: str = "") -> str:
     """Turn a fragment into a standalone question using the previous turn.
-    Falls back to the original question on any failure — never raises."""
+    Falls back to the original question on any failure — never raises.
+
+    `extra_context` (optional): the context layer's token-budgeted structured
+    state / summary / relevant-older-turns block (see
+    context_manager.build_followup_context) — spliced into the prompt ahead
+    of the previous turn, for a conversation where "the previous turn" alone
+    has lost the thread (e.g. a KNOWLEDGE digression sits between the DATA
+    answer being followed up on and this fragment). Blank by default, so
+    every existing caller is unaffected."""
     if not settings.FOLLOWUP_REWRITE_ENABLED or prev is None:
         return question
     swap = _scheme_swap_rewrite(getattr(prev, "question", "") or "", question)
@@ -207,7 +227,8 @@ async def rewrite_followup(question: str, prev: "object") -> str:
             "context from the PREVIOUS question. Keep the user's intent; change only "
             "what the follow-up changes (e.g. a different district, year, or metric). "
             "Return ONLY the rewritten question, nothing else.\n\n"
-            f'PREVIOUS question: "{prev.question}"\n'
+            + (f"{extra_context}\n\n" if extra_context else "")
+            + f'PREVIOUS question: "{prev.question}"\n'
             f'PREVIOUS answer (for context): "{(prev.answer or "")[:300]}"\n'
             f'FOLLOW-UP: "{question}"\n\n'
             "Standalone question:"
@@ -249,6 +270,13 @@ _ENTITY_JSON_SCHEMA = {
         "village": {"type": "string"},
         "year": {"type": "string"},
         "assembly_constituency": {"type": "string"},
+        # Plural — ONLY when the question names two-or-more blocks to compare
+        # against each other ("compare X and Y"). Kept separate from "block"
+        # rather than making "block" a string-or-array union (some xgrammar
+        # builds reject union types, per the note above).
+        "blocks": {"type": "array", "items": {"type": "string"}},
+        # Same idea, for districts ("compare X and Y between district A and B").
+        "districts": {"type": "array", "items": {"type": "string"}},
     },
     "additionalProperties": False,
 }
@@ -304,7 +332,12 @@ _SCHEME_NAME_PATTERN = {
 _SCHEME_FUZZY_ALIASES = {
     "MGNREGA": ["mgnrega", "mnrega", "nrega"],
     "PMAY-G": ["pmay", "pmayg", "awaas", "awas"],
-    "Focus Plus": ["focusplus"],
+    # "focus" alone, not just "focusplus" — a typo of the short form ("facus",
+    # "focas", "fokus") is 5 chars against a 9-char target and never clears
+    # the 80% ratio bar without it (fuzz.ratio("facus","focusplus") == 57 vs
+    # fuzz.ratio("facus","focus") == 80), so "what facus+" fell through to the
+    # generic capability blurb instead of routing to Focus Plus.
+    "Focus Plus": ["focus", "focusplus"],
     "CM Elevate": ["cmelevate"],
 }
 _FUZZY_SCHEME_ACCEPT = 80
@@ -526,10 +559,38 @@ _SCHEME_LISTING_CUE = re.compile(
     re.IGNORECASE,
 )
 
+# A vague eligibility ask — "is there any scheme that can help my family?",
+# "which scheme should I apply for?" — carries no vocabulary naming a scheme
+# outright, so it used to fall into the "which scheme does your question
+# concern?" pause. That pause is the wrong move here: unlike a DATA question
+# (where guessing the scheme risks a confidently wrong number), there's
+# nothing to get wrong about naming all four — so skip the tap and lay them
+# out directly. When the wording DOES carry scheme-specific vocabulary (e.g.
+# "...to help me build a house") _infer_scheme_from_terms already pins it to
+# one scheme and _needs_scheme_clarification never pauses in the first place —
+# this cue only needs to cover the genuinely scheme-agnostic case, so it
+# defers to that inference rather than overriding it.
+_SCHEME_HELP_CUE = re.compile(
+    r"\bis there (?:any|a) (?:govt\.?|government )?schemes?\b|"
+    r"\b(?:any|a) scheme (?:that|which|to) (?:can |could )?help\b|"
+    r"\bscheme(?:s)? (?:that|which) (?:can|could) help\b|"
+    r"\bwhich scheme (?:can|could|should) (?:i|we)\b|"
+    r"\bwhat scheme should (?:i|we)\b",
+    re.IGNORECASE,
+)
+
 
 def _scheme_listing_answer(question: str) -> "dict | None":
-    if not _SCHEME_LISTING_CUE.search(question or ""):
-        return None
+    explicit = _SCHEME_LISTING_CUE.search(question or "")
+    if not explicit:
+        if not _SCHEME_HELP_CUE.search(question or ""):
+            return None
+        # A "help me" ask that already names scheme-specific vocabulary (a
+        # house, job cards, farmer cash, an enterprise, ...) has a clear
+        # intent to route on — leave it to the normal KNOWLEDGE/RAG path
+        # instead of burying that signal under the generic four-scheme list.
+        if _infer_scheme_from_terms(question) is not None:
+            return None
     lines = [f"- **{name}** — {desc}" for name, desc in _SCHEME_USER_SUMMARY.items()]
     answer = (
         "I cover four Meghalaya government schemes:\n\n" + "\n".join(lines) +
@@ -552,11 +613,29 @@ _SCHEME_COMPARISON_CUE = re.compile(
 )
 
 
+def _scheme_comparison_clarification() -> "ClarificationNeeded":
+    names = list(SCHEME_CATALOG)
+    options = [
+        {"label": f"{a} vs {b}", "question": f"difference between {a} and {b}"}
+        for a, b in itertools.combinations(names, 2)
+    ]
+    options.append({"label": "All four schemes",
+                     "question": "difference between MGNREGA, PMAY-G, Focus Plus and CM Elevate"})
+    return ClarificationNeeded(
+        "Which schemes would you like to compare — MGNREGA, PMAY-G, Focus Plus, or "
+        "CM Elevate? Pick a pair, or compare all four.",
+        options=options,
+        rule="scheme-comparison-not-specified",
+    )
+
+
 def _scheme_comparison_answer(question: str) -> "dict | None":
     if not _SCHEME_COMPARISON_CUE.search(question or ""):
         return None
     named = _named_schemes(question)
-    targets = named if len(named) >= 2 else list(SCHEME_CATALOG)
+    if len(named) < 2:
+        raise _scheme_comparison_clarification()
+    targets = named
     lines = [f"- **{name}** — {_SCHEME_USER_SUMMARY.get(name, '')}" for name in targets]
     answer = (
         "Here's a high-level comparison:\n\n" + "\n".join(lines) +
@@ -646,22 +725,31 @@ def _unsupported_scheme_clarification(question: str, name: str) -> "Clarificatio
     )
 
 
-# ── Bank / financial-channel details — not held for any loaded scheme ───────
-# Focus Plus withholds bank_name_raw from its queryable view for privacy; PMAY-G,
-# CM Elevate and MGNREGA never captured a bank field at ingest at all. Without
-# this check the question reaches SQL generation, which correctly finds no
-# column to use but can only hand back a bare "not available in this data" —
-# true, but it doesn't say *why*, so route it to a real explanation up front.
+# ── Bank / financial-channel details — not held for most loaded schemes ─────
+# Focus Plus now exposes bank_name_raw via curated.v_focus_plus (added so
+# bank-wise disbursement questions can be answered), but it has no
+# account-number/IFSC field, so those specific asks still need the
+# not-held explanation. PMAY-G, CM Elevate and MGNREGA never captured any
+# bank field at ingest at all. Without this check an account/IFSC question
+# reaches SQL generation, which correctly finds no column to use but can only
+# hand back a bare "not available in this data" — true, but it doesn't say
+# *why*, so route it to a real explanation up front.
 _BANK_REQUESTED = re.compile(
     r"\bbanks?\b|\bbanking\b|\bifsc\b|\bbank[\s-]?account|\baccount[\s-]?number|"
     r"\bbank[\s-]?wise\b|\bbank[\s-]?transfer|\bdbt\b|\blifcom\b",
     re.IGNORECASE,
 )
+# Focus Plus only lacks account-number/IFSC fields — bare bank-name questions
+# ("which bank", "bank-wise disbursement") should reach SQL generation instead.
+_BANK_ACCOUNT_DETAIL_REQUESTED = re.compile(
+    r"\bifsc\b|\bbank[\s-]?account|\baccount[\s-]?number|\bbank[\s-]?transfer|"
+    r"\bdbt\b",
+    re.IGNORECASE,
+)
 _BANK_NOT_HELD_TEXT = {
     "Focus Plus": (
-        "Bank details for Focus Plus are withheld from the approved query surface "
-        "for privacy, so bank-wise figures cannot be produced. Shall I answer by "
-        "district, block or village instead?"
+        "Account numbers and IFSC codes aren't held for Focus Plus — only the "
+        "bank name is. Shall I answer using bank name instead?"
     ),
     "CM Elevate": (
         "There is no loan-channel field for CM Elevate — Bank and LIFCOM are not "
@@ -679,11 +767,10 @@ _BANK_NOT_HELD_TEXT = {
     ),
 }
 _BANK_GENERIC_TEXT = (
-    "Bank details aren't available for querying in any of the schemes I cover — "
-    "MGNREGA, PMAY-G, Focus Plus or CM Elevate — either because the field was "
-    "never captured at ingest or, for Focus Plus, because it is withheld from "
-    "the query surface for privacy. Shall I answer by scheme, district, block "
-    "or village instead?"
+    "Bank name is only held for Focus Plus — MGNREGA, PMAY-G and CM Elevate "
+    "never captured a bank field at ingest, and none of the four schemes hold "
+    "account numbers or IFSC codes. Shall I answer using Focus Plus bank name, "
+    "or by scheme, district, block or village instead?"
 )
 
 
@@ -692,8 +779,13 @@ def _named_or_inferred_schemes(question: str) -> list[str]:
     return named or _infer_scheme_from_terms(question) or []
 
 
-def _bank_clarification(question: str) -> "ClarificationNeeded":
+def _bank_clarification(question: str) -> "ClarificationNeeded | None":
     schemes = _named_or_inferred_schemes(question)
+    is_account_detail = bool(_BANK_ACCOUNT_DETAIL_REQUESTED.search(question))
+    if not is_account_detail and schemes == ["Focus Plus"]:
+        # Bare bank-name question scoped to Focus Plus only — bank_name_raw is
+        # queryable via curated.v_focus_plus, so let SQL generation handle it.
+        return None
     text = _BANK_NOT_HELD_TEXT[schemes[0]] if len(schemes) == 1 else _BANK_GENERIC_TEXT
     return ClarificationNeeded(text, rule="column-not-held")
 
@@ -967,7 +1059,7 @@ def _needs_scope_clarification(question: str, resolved: dict) -> bool:
     if _CROSS_SCHEME_SET_QUESTION.search(q):
         return False
     if any(resolved.get(k) for k in
-           ("district", "district_list", "block", "village_code", "year_key")):
+           ("district", "district_list", "block", "block_list", "village_code", "year_key")):
         return False
     return True
 
@@ -1185,16 +1277,13 @@ def _needs_year_clarification(question: str, schemes: list[str], resolved: dict)
     live = [s for s in (schemes or []) if s in _SCHEME_DATA_YEARS]
     if live and all(not _SCHEME_DATA_YEARS[s] for s in live):
         return False
-    # PMAY-G figures (beneficiary counts, sanctioned/released amounts, house
-    # status) are cumulative-to-date by nature — a beneficiary's status doesn't
-    # reset each financial year the way MGNREGA's annual employment cycle does.
-    # Pausing to ask "which year?" on a plain PMAY-G question is an unnecessary
-    # interruption QA flagged repeatedly; default to "all years to date"
-    # instead, the same outcome _ALL_YEARS_CUE gives MGNREGA when the user
-    # types "cumulative". A question naming an explicit year is still caught
-    # above via resolved["year_key"]/_parse_year_key before this runs.
-    if live == ["PMAY-G"]:
-        return False
+    # PMAY-G used to be exempted here (beneficiary counts / house status are
+    # cumulative-to-date, so "which year?" felt like an unnecessary interruption
+    # to an earlier QA pass) and silently defaulted to "all years to date"
+    # instead of asking. Reinstated to ask same as MGNREGA, 2026-09-09, by
+    # explicit product decision — a plain PMAY-G question with no year now
+    # pauses for a FY choice too; say "all years" / "cumulative" explicitly
+    # (see _ALL_YEARS_CUE) to get the old default without the prompt.
     if resolved.get("year_key") or _parse_year_key(q) is not None:
         return False
     if _ALL_YEARS_CUE.search(q) or _TIME_SERIES_CUE.search(q):
@@ -1282,6 +1371,17 @@ _YEAR_RANGE_TOKEN_RE = re.compile(
 )
 
 
+_MALFORMED_YEAR_CUE_RE = re.compile(
+    # "of" deliberately excluded — it's the ending of ordinary amount phrasing
+    # too ("total expenditure of 150000"), not just year phrasing, so it would
+    # false-positive on a real currency figure. "in"/"for"/"during"/"fy" are
+    # unambiguously temporal.
+    r"\b(?:in|for|during|fy|financial\s+year|fiscal(?:\s+year)?)\s*[:\-]?\s*(\d{4,8})"
+    r"\s*[?.!]*\s*\Z",
+    re.IGNORECASE,
+)
+
+
 def _out_of_range_year_in(text: str, schemes: "list[str] | None" = None) -> "str | None":
     """Raw text of the first financial-year token in `text` that NONE of the
     given scheme(s) hold, or None if every year mentioned is available / none is
@@ -1294,12 +1394,33 @@ def _out_of_range_year_in(text: str, schemes: "list[str] | None" = None) -> "str
                 return tok
         elif _YEAR_SHAPED_RE.search(tok):   # e.g. "1999-20" — a year we can't parse
             return tok
+    # A digit run right after an explicit temporal cue, at the very END of the
+    # question ("in 20217", "...beneficiaries in Bamil Reserve Apal in 20217?")
+    # that _YEAR_RANGE_TOKEN_RE above didn't match at all — its 20[1-3]\d
+    # alternative needs a \b right after the 4th digit, so one extra trailing
+    # digit ("20217") makes the WHOLE token invisible to it, not just
+    # unparseable. Without this, "in 20217" skipped the guard entirely and the
+    # SQL generator copied the literal straight into year_key = 20217, ran
+    # clean, and silently returned 0 (2026-09-09 bug report — no clarification
+    # was ever offered). Anchored to end-of-question (not just gated on a cue
+    # word) so a real amount stated mid-sentence ("sanctioned amount of 500000
+    # in Siju") is never mistaken for a year — a year mention is normally the
+    # last thing named in these questions, an amount normally isn't.
+    m = _MALFORMED_YEAR_CUE_RE.search(text or "")
+    if m and _parse_year_key(m.group(1)) is None:
+        return m.group(1)
     return None
 
 
 def _available_years_for(schemes: list[str]) -> "tuple[list[str], list[str]]":
     """(distinct FY list across the given scheme(s), scheme names used). Falls
-    back to every scheme when `schemes` is empty or unrecognised."""
+    back to every scheme when `schemes` is empty or unrecognised.
+
+    Years are merged scheme-by-scheme, so without an explicit sort the result
+    lands in whatever order the schemes happen to combine in (e.g. MGNREGA's
+    2022-23..2025-26 ahead of PMAY-G's earlier 2017-18..2021-22) rather than
+    chronological order. Sort ascending (oldest first) so the year chips read
+    in a sane order regardless of scheme combination."""
     live = [s for s in (schemes or []) if s in _SCHEME_DATA_YEARS] or list(_SCHEME_DATA_YEARS)
     seen: set[str] = set()
     years: list[str] = []
@@ -1308,6 +1429,7 @@ def _available_years_for(schemes: list[str]) -> "tuple[list[str], list[str]]":
             if y not in seen:
                 seen.add(y)
                 years.append(y)
+    years.sort(key=_fy_start)
     return years, live
 
 
@@ -1476,10 +1598,20 @@ async def extract_entity_mentions(question: str) -> dict:
 them. Do not correct spelling or guess the canonical form.
 
 Return ONLY JSON with keys from: "district", "block", "village", "year",
-"assembly_constituency". Include a key ONLY when the question NAMES a specific
-one. A bare word like "village", "villages", "district", "block", "year", or
-the state name "Meghalaya" is NOT a name — omit it. If the question names
-none, return {{}}.
+"assembly_constituency", "blocks", "districts". Include a key ONLY when the
+question NAMES a specific one. A bare word like "village", "villages",
+"district", "block", "year", or the state name "Meghalaya" is NOT a name —
+omit it. If the question names none, return {{}}.
+
+When the question names TWO OR MORE blocks to compare against each other
+("compare X and Y", "X vs Y", "X and Y, the block, not the village"), put ALL
+of their names in the plural "blocks" array — do NOT use the singular "block"
+key and keep only one, that silently drops the other block from the answer.
+Use "block" only when exactly one block is named. The same rule applies to
+districts: TWO OR MORE named to compare against each other go in the plural
+"districts" array, never the singular "district" key — even when one of them
+is a short acronym like "EKH" or "WGH". Use "district" only when exactly one
+district is named.
 
 Block, assembly-constituency and village names overlap heavily in Meghalaya —
 a bare name (e.g. "Mawlai") could be any of the three. Use "assembly_constituency"
@@ -1487,19 +1619,76 @@ ONLY when the question itself signals a constituency: it says "constituency",
 "AC", "assembly", "MLA", or gives a number before the name (e.g. "15 Mawlai",
 "AC 9"). Otherwise tag an ambiguous bare name as "block".
 
+A place name can follow ANY preposition, not just "in"/"for" — "disbursement
+OF Selsella", "expenditure OF West Garo Hills", "spending OF Abagre" all name
+Selsella/West Garo Hills/Abagre as the AREA the figure is about, exactly like
+"disbursement in Selsella" would. Do not read "of" as meaning the metric noun
+(disbursement, expenditure, spending, amount, total) is itself the thing being
+named — the name after "of" is still a place, and must still be extracted.
+
+Examples:
+Question: "Tell me about total disbursement of Selsella across all financial years for MGNREGA."
+JSON: {{"block": "Selsella"}}
+Question: "What is the total expenditure of West Garo Hills under PMAY-G?"
+JSON: {{"district": "West Garo Hills"}}
+Question: "how many job cards issued in Ri Bhoi"
+JSON: {{"district": "Ri Bhoi"}}
+Question: "show me MGNREGA spend"
+JSON: {{}}
+Question: "Compare the sanctioned amounts of Dambo Rongjeng and Samanda, the block, not the village"
+JSON: {{"blocks": ["Dambo Rongjeng", "Samanda"]}}
+Question: "Compare PMAY performance between ekh and wgh for FY 2017-18"
+JSON: {{"districts": ["ekh", "wgh"], "year": "2017-18"}}
+
 Question: "{question}"
 JSON:"""
     raw = await llm.call_classifier(prompt, guided={"guided_json": _ENTITY_JSON_SCHEMA})
     payload = _extract_json(raw)
     if not isinstance(payload, dict):
         return {}
-    out: dict[str, str] = {}
+    out: dict[str, object] = {}
     for k, v in payload.items():
         if k in ("district", "block", "village", "year", "assembly_constituency") \
                 and isinstance(v, str) and v.strip():
             cleaned = _clean_mention(v)
             if cleaned:
                 out[k] = cleaned
+    blocks_raw = payload.get("blocks")
+    if isinstance(blocks_raw, list):
+        cleaned_blocks: list[str] = []
+        seen: set[str] = set()
+        for v in blocks_raw:
+            if not isinstance(v, str):
+                continue
+            c = _clean_mention(v)
+            if c and c.lower() not in seen:
+                seen.add(c.lower())
+                cleaned_blocks.append(c)
+        if len(cleaned_blocks) >= 2:
+            out["blocks"] = cleaned_blocks
+        elif len(cleaned_blocks) == 1 and "block" not in out:
+            # A single-element array is just a singular mention the model
+            # phrased as a list — fold it back so the existing singular path
+            # (block-vs-village disambiguation etc.) still runs for it.
+            out["block"] = cleaned_blocks[0]
+    districts_raw = payload.get("districts")
+    if isinstance(districts_raw, list):
+        cleaned_districts: list[str] = []
+        seen_d: set[str] = set()
+        for v in districts_raw:
+            if not isinstance(v, str):
+                continue
+            c = _clean_mention(v)
+            if c and c.lower() not in seen_d:
+                seen_d.add(c.lower())
+                cleaned_districts.append(c)
+        if len(cleaned_districts) >= 2:
+            out["districts"] = cleaned_districts
+        elif len(cleaned_districts) == 1 and "district" not in out:
+            # A single-element array is just a singular mention the model
+            # phrased as a list — fold it back so the existing singular path
+            # runs for it.
+            out["district"] = cleaned_districts[0]
     return out
 
 
@@ -1516,6 +1705,46 @@ def _parse_year_key(text: str) -> "int | None":
     if m:
         return int(m.group(1))
     return None
+
+
+def _village_chip_question(question: str, raw_text: str, candidate: dict) -> str:
+    """The follow-up question text for one village-disambiguation chip.
+
+    The old approach appended "<block> block, <district>" to the ORIGINAL
+    ambiguous fragment (e.g. "siju") and left the fragment itself unchanged.
+    That only narrows resolve_village's search scope — it does not say WHICH
+    candidate was picked. Two candidates that both fuzzy-match the same raw
+    text and also sit in the same block (e.g. "siju" fuzzy-matches both SIJU
+    SONGMONG and Siju Arteka, both in SIJU block, SOUTH GARO HILLS) stay tied
+    even after the block/district is appended, so every chip regenerates the
+    IDENTICAL question and the clarification loops forever — reported
+    2026-09-09 for both an exact-duplicate dim_geography row (Asimgre, DALU
+    block) and this fuzzy-match case (siju). Substituting the candidate's own
+    canonical name into the question fixes it: re-resolution then runs an
+    EXACT match on a name that is (almost always, and after the duplicate-row
+    fix in entity_resolver.resolve_village, effectively always) unique.
+
+    A second, compounding bug (also reported 2026-09-09, "nongthymmai" in
+    EAST/WEST KHASI HILLS): when the LLM mention-extractor can't cleanly split
+    a resumed chip's OWN text ("Nongthymmai, RI MULIANG block, WEST KHASI
+    HILLS") into village/block, resolve_entities lands back on this same
+    ambiguous-village branch and calls this function AGAIN — with `question`
+    now already carrying the previous round's appended ", <block> block,
+    <district>". Blindly appending another one lets the suffix grow every
+    round ("..., RI MULIANG block, WEST KHASI HILLS, MAWSHYNRUT block, WEST
+    KHASI HILLS, ...", naming more and more blocks at once), which defeats any
+    single-candidate text match downstream and loops forever. Strip a
+    previously-appended suffix (there is at most one meaningful one — this
+    function is the only writer of that shape) before appending the current
+    candidate's, so the text never grows past one such suffix."""
+    stem = question.strip().rstrip(" ?.")
+    stem = re.sub(r"(,\s*[^,]+?\s+block,\s*[^,]+)+$", "", stem, flags=re.IGNORECASE).rstrip()
+    name = candidate["name"]
+    if raw_text and re.search(re.escape(raw_text), stem, re.IGNORECASE):
+        pinned = re.sub(re.escape(raw_text), name, stem, count=1, flags=re.IGNORECASE)
+    else:
+        pinned = f"{stem} ({name})"
+    return f"{pinned}, {candidate['block']} block, {candidate['district']}"
 
 
 async def resolve_entities(question: str, schemes: list[str],
@@ -1566,65 +1795,120 @@ async def resolve_entities(question: str, schemes: list[str],
     display: dict[str, str] = {}
 
     district_canon = None
-    if not mentions.get("district"):
-        # The LLM mention-extractor intermittently drops a plainly-named district
-        # ("how many villages are covered in West Garo Hills" -> {}); fall back to
-        # a deterministic scan of the raw question against the 12-name closed set.
-        backstop = scan_dimension(question, schemes[0], "district")
-        if backstop and backstop.status == "resolved":
-            district_canon = backstop.canonical
-            resolved["district"] = backstop.canonical
-            display["district"] = backstop.display or str(backstop.canonical).title()
-            logger.info("resolve_entities: district backstop matched %r in question text",
-                        backstop.canonical)
-    # A hill-range name ("Garo Hills", "Khasi region") the extractor tagged as a
-    # district isn't one — leave it unresolved so _answer_data's region handler can
-    # offer the range's districts as chips (or expand it). Don't raise the generic
-    # "which district?" here.
-    _mdist = mentions.get("district")
-    if _mdist and detect_region(_mdist, schemes[0] if schemes else "") is not None:
-        _mdist = None
-    if _mdist:
-        r = resolve_dimension(_mdist, schemes[0], "district")
-        if r.status == "ambiguous":
-            raise ClarificationNeeded(f"Which district is being referred to by “{_mdist}”?",
-                                       rule="entity-ambiguous")
-        if r.status == "resolved":
-            district_canon = r.canonical
-            resolved["district"] = r.canonical
-            display["district"] = r.display or str(r.canonical).title()
-        else:
-            # Not a known district — it may be a VILLAGE the extractor
-            # mistagged as "district" (a bare place name after "in" gives the
-            # model no reliable signal for which admin level it is). Try
-            # village resolution before concluding this is out of scope.
-            _vr = await resolve_village(_mdist)
-            if _vr.status == "ambiguous":
-                stem = question.strip().rstrip(" ?.")
-                listed = ", ".join(
-                    f"{c['name']} in {c['block']} block ({c['district']})" for c in _vr.candidates[:5])
-                options = [
-                    {"label": f"{c['name']} — {c['block']} block, {c['district']}",
-                     "question": f"{stem}, {c['block']} block, {c['district']}"}
-                    for c in _vr.candidates[:5]
-                ]
-                raise ClarificationNeeded(
-                    f"“{_mdist}” corresponds to more than one village: {listed}. "
-                    "Which of these is intended?",
-                    options=options, rule="entity-ambiguous", village_hint=_mdist)
-            if _vr.status == "resolved":
-                resolved["village_code"] = _vr.canonical
-                display["village"] = _vr.display or str(_mdist).title()
-            elif settings.OUT_OF_SCOPE_GUARD_ENABLED:
-                # Genuinely not a district, block, or village of ours — almost
-                # always a place in another state ("districts in Guwahati").
-                # Don't silently drop the filter and count 0; say plainly
-                # this is out of scope.
-                raise OutOfScope(f"district '{_mdist}' is not in Meghalaya")
+    if mentions.get("districts"):
+        # Two-or-more named districts to compare against each other (see
+        # extract_entity_mentions) — resolve each independently and carry the
+        # whole set forward as an IN-list, instead of the singular "district"
+        # dimension which can only ever hold one value and would silently
+        # drop every district but the last (the "compare ekh and wgh" bug).
+        _district_canons: list[str] = []
+        _district_displays: list[str] = []
+        for _dname in mentions["districts"]:
+            r = resolve_dimension(_dname, schemes[0], "district")
+            if r.status == "ambiguous":
+                raise ClarificationNeeded(f"Which district is being referred to by “{_dname}”?",
+                                           rule="entity-ambiguous")
+            if r.status != "resolved":
+                notes.append(f"'{_dname}' is not a known district — say so, do not filter on it.")
+                continue
+            _district_canons.append(r.canonical)
+            _district_displays.append(r.display or str(_dname).title())
+        if _district_canons:
+            resolved["district_list"] = _district_canons
+            display["district"] = " and ".join(_district_displays)
+    else:
+        if not mentions.get("district"):
+            # The LLM mention-extractor intermittently drops a plainly-named district
+            # ("how many villages are covered in West Garo Hills" -> {}); fall back to
+            # a deterministic scan of the raw question against the 12-name closed set.
+            backstop = scan_dimension(question, schemes[0], "district")
+            if backstop and backstop.status == "resolved":
+                district_canon = backstop.canonical
+                resolved["district"] = backstop.canonical
+                display["district"] = backstop.display or str(backstop.canonical).title()
+                logger.info("resolve_entities: district backstop matched %r in question text",
+                            backstop.canonical)
+        # A hill-range name ("Garo Hills", "Khasi region") the extractor tagged as a
+        # district isn't one — leave it unresolved so _answer_data's region handler can
+        # offer the range's districts as chips (or expand it). Don't raise the generic
+        # "which district?" here.
+        _mdist = mentions.get("district")
+        if _mdist and detect_region(_mdist, schemes[0] if schemes else "") is not None:
+            _mdist = None
+        if _mdist:
+            r = resolve_dimension(_mdist, schemes[0], "district")
+            if r.status == "ambiguous":
+                raise ClarificationNeeded(f"Which district is being referred to by “{_mdist}”?",
+                                           rule="entity-ambiguous")
+            if r.status == "resolved":
+                district_canon = r.canonical
+                resolved["district"] = r.canonical
+                display["district"] = r.display or str(r.canonical).title()
             else:
-                notes.append(f"'{_mdist}' is not a known district — say so, do not filter on it.")
+                # Not a known district — it may be a VILLAGE the extractor
+                # mistagged as "district" (a bare place name after "in" gives the
+                # model no reliable signal for which admin level it is). Try
+                # village resolution before concluding this is out of scope.
+                _vr = await resolve_village(_mdist)
+                if _vr.status == "ambiguous":
+                    listed = ", ".join(
+                        f"{c['name']} in {c['block']} block ({c['district']})" for c in _vr.candidates[:5])
+                    options = [
+                        {"label": f"{c['name']} — {c['block']} block, {c['district']}",
+                         "question": _village_chip_question(question, _mdist, c)}
+                        for c in _vr.candidates[:5]
+                    ]
+                    raise ClarificationNeeded(
+                        f"“{_mdist}” corresponds to more than one village: {listed}. "
+                        "Which of these is intended?",
+                        options=options, rule="entity-ambiguous", village_hint=_mdist)
+                if _vr.status == "resolved":
+                    resolved["village_code"] = _vr.canonical
+                    display["village"] = _vr.display or str(_mdist).title()
+                elif settings.OUT_OF_SCOPE_GUARD_ENABLED:
+                    # Genuinely not a district, block, or village of ours — almost
+                    # always a place in another state ("districts in Guwahati").
+                    # Don't silently drop the filter and count 0; say plainly
+                    # this is out of scope.
+                    raise OutOfScope(f"district '{_mdist}' is not in Meghalaya")
+                else:
+                    notes.append(f"'{_mdist}' is not a known district — say so, do not filter on it.")
 
-    if mentions.get("block"):
+    if mentions.get("blocks"):
+        # Two-or-more named blocks to compare against each other (see
+        # extract_entity_mentions) — resolve each independently and carry the
+        # whole set forward as an IN-list, instead of the singular "block"
+        # dimension which can only ever hold one value and would silently
+        # drop every block but the last.
+        _has_block_word = bool(re.search(r"\bblock\b", question, re.IGNORECASE))
+        _block_canons: list[str] = []
+        _block_displays: list[str] = []
+        for _bname in mentions["blocks"]:
+            r = resolve_dimension(_bname, schemes[0], "block")
+            if r.status == "ambiguous":
+                raise ClarificationNeeded(f"Which block is being referred to by “{_bname}”?",
+                                           rule="entity-ambiguous")
+            if r.status != "resolved":
+                notes.append(f"'{_bname}' is not a known block — say so, do not filter on it.")
+                continue
+            if not _has_block_word:
+                _vcheck = await resolve_village(_bname)
+                if _vcheck.status in ("resolved", "ambiguous"):
+                    stem = question.strip().rstrip(" ?.")
+                    raise ClarificationNeeded(
+                        f"“{_bname}” could mean either the block or a village with "
+                        "that name. Which did you mean?",
+                        options=[
+                            {"label": f"The {_bname} block", "question": f"{stem}, the block, not the village"},
+                            {"label": f"The {_bname} village", "question": f"{stem}, the village, not the block"},
+                        ],
+                        rule="entity-ambiguous")
+            _block_canons.append(r.canonical)
+            _block_displays.append(r.display or str(_bname).title())
+        if _block_canons:
+            resolved["block_list"] = _block_canons
+            display["block"] = " and ".join(_block_displays)
+    elif mentions.get("block"):
         r = resolve_dimension(mentions["block"], schemes[0], "block")
         if r.status == "ambiguous":
             raise ClarificationNeeded(f"Which block is being referred to by “{mentions['block']}”?",
@@ -1668,7 +1952,10 @@ async def resolve_entities(question: str, schemes: list[str],
                 # this "block" mention is just a duplicate tag for it. Either
                 # way, there's nothing wrong here: don't overwrite an existing
                 # district_canon, and don't fall through to "not a known block".
-                if not district_canon:
+                # Also skip when a district_list comparison already resolved —
+                # this "block" mention is then just the extractor's other tag
+                # for one of those same districts.
+                if not district_canon and not resolved.get("district_list"):
                     district_canon = _as_district.canonical
                     resolved["district"] = _as_district.canonical
                     display["district"] = _as_district.display or str(_as_district.canonical).title()
@@ -1678,22 +1965,53 @@ async def resolve_entities(question: str, schemes: list[str],
                 # bare name after "in" gives the model no reliable signal for
                 # which admin level it is — e.g. "PMAY beneficiaries in
                 # Abagre", a real West Garo Hills village). Try village
-                # resolution before concluding this is out of scope.
-                _vr = await resolve_village(mentions["block"])
+                # resolution before concluding this is out of scope. Scope by
+                # district_canon when the question already pinned one down —
+                # otherwise a village-disambiguation chip's own answer text
+                # ("Nongthymmai, MAWRYNGKNENG block, EAST KHASI HILLS") gets
+                # re-resolved with no district scope, rediscovers the exact
+                # same statewide candidate set the chip was meant to narrow,
+                # and raises the identical clarification forever (reported
+                # 2026-09-09, "nongthymmai" in EAST KHASI HILLS).
+                _vr = await resolve_village(mentions["block"], district=district_canon)
                 if _vr.status == "ambiguous":
-                    stem = question.strip().rstrip(" ?.")
-                    listed = ", ".join(
-                        f"{c['name']} in {c['block']} block ({c['district']})" for c in _vr.candidates[:5])
-                    options = [
-                        {"label": f"{c['name']} — {c['block']} block, {c['district']}",
-                         "question": f"{stem}, {c['block']} block, {c['district']}"}
-                        for c in _vr.candidates[:5]
+                    # District scoping alone doesn't always get to one candidate
+                    # (e.g. several distinctly-blocked villages share a name inside
+                    # the same district). The chip that got us here already names
+                    # the intended block in its own text ("Nongthymmai, MAWRYNGKNENG
+                    # block, EAST KHASI HILLS") — the LLM extractor just keeps
+                    # re-tagging the village as "block" and dropping the real block,
+                    # so re-resolving lands back on the SAME candidate set every
+                    # round and the clarification loops forever (reported
+                    # 2026-09-09, "nongthymmai" in EAST KHASI HILLS). Before asking
+                    # again, check the raw text deterministically: if exactly one
+                    # candidate's own block name appears in it, that already IS the
+                    # user's answer.
+                    _text_hits = [
+                        c for c in _vr.candidates
+                        if c.get("block") and re.search(
+                            rf"\b{re.escape(c['block'])}\b", question, re.IGNORECASE)
                     ]
-                    raise ClarificationNeeded(
-                        f"“{mentions['block']}” corresponds to more than one village: {listed}. "
-                        "Which of these is intended?",
-                        options=options, rule="entity-ambiguous", village_hint=mentions["block"])
-                if _vr.status == "resolved":
+                    if len(_text_hits) == 1:
+                        _pick = _text_hits[0]
+                        resolved["village_code"] = _pick["village_code"]
+                        display["village"] = str(_pick["name"]).title()
+                        _vr = None
+                    else:
+                        listed = ", ".join(
+                            f"{c['name']} in {c['block']} block ({c['district']})" for c in _vr.candidates[:5])
+                        options = [
+                            {"label": f"{c['name']} — {c['block']} block, {c['district']}",
+                             "question": _village_chip_question(question, mentions["block"], c)}
+                            for c in _vr.candidates[:5]
+                        ]
+                        raise ClarificationNeeded(
+                            f"“{mentions['block']}” corresponds to more than one village: {listed}. "
+                            "Which of these is intended?",
+                            options=options, rule="entity-ambiguous", village_hint=mentions["block"])
+                if _vr is None:
+                    pass  # already resolved directly from the single text hit above
+                elif _vr.status == "resolved":
                     resolved["village_code"] = _vr.canonical
                     display["village"] = _vr.display or str(mentions["block"]).title()
                 elif settings.OUT_OF_SCOPE_GUARD_ENABLED:
@@ -1769,12 +2087,11 @@ async def resolve_entities(question: str, schemes: list[str],
             # Betasing block, one in Rerapara) — block is the distinguishing
             # feature, so it MUST be in both the message and the chip label, or
             # they read as duplicates and the user can't tell them apart.
-            stem = question.strip().rstrip(" ?.")
             listed = ", ".join(
                 f"{c['name']} in {c['block']} block ({c['district']})" for c in r.candidates[:5])
             options = [
                 {"label": f"{c['name']} — {c['block']} block, {c['district']}",
-                 "question": f"{stem}, {c['block']} block, {c['district']}"}
+                 "question": _village_chip_question(question, _village_text, c)}
                 for c in r.candidates[:5]
             ]
             raise ClarificationNeeded(
@@ -1815,6 +2132,18 @@ async def resolve_entities(question: str, schemes: list[str],
         if hs and hs.values:
             resolved["house_status"] = hs.values if len(hs.values) > 1 else hs.values[0]
             display["house_status"] = hs.display or " and ".join(hs.values)
+
+    # Focus Plus tranche_label ("Tranch 1".."Tranch 4 - Feb-March") — closed set,
+    # not covered by the LLM mention-extractor, and routinely mistyped against
+    # its odd stored spelling ("tranche2" vs "Tranch 2 - August"). Resolved
+    # deterministically (with a RapidFuzz fallback for misspellings) so a
+    # near-miss maps to the exact stored label instead of silently filtering
+    # the SQL to zero rows and reporting a misleading null total.
+    if "Focus Plus" in schemes:
+        tr = resolve_tranche_label(question, "Focus Plus")
+        if tr and tr.canonical:
+            resolved["tranche_label"] = tr.canonical
+            display["tranche_label"] = tr.display or tr.canonical
 
     if prior_resolved:
         if not mentions.get("district") and "district" not in resolved and prior_resolved.get("district"):
@@ -1998,6 +2327,27 @@ def _rowgrain_no_aggregate(question: str, sql: str) -> "str | None":
     return src
 
 
+_VILLAGE_CODE_FILTER_RE = re.compile(r"\bvillage_code\s*(?:=|IN)\s*", re.IGNORECASE)
+_VILLAGE_NAME_FILTER_RE = re.compile(r"\blgd_village_name\s*(?:=|ILIKE|IN)\s*", re.IGNORECASE)
+
+
+def _village_name_filter_instead_of_code(entity_result: dict, sql: str) -> "int | None":
+    """The resolved village_code when the question resolved to one but the
+    generated SQL filters on lgd_village_name instead — the exact "Bamil
+    Reserve Apal" bug (2026-09-09): entity resolution correctly picked
+    village_code, prompt_builder's RESOLVED ENTITIES block told the generator
+    to use it verbatim and NOT filter on lgd_village_name, and the generator
+    did it anyway, inventing an upper-cased lgd_village_name literal. Storage
+    keeps village names in mixed/title case (curated.v_pmay has "Bamil
+    Reserve Apal", not "BAMIL RESERVE APAL"), so the literal silently matches
+    zero rows and the query runs clean but returns 0. village_code is the
+    only column guaranteed to match."""
+    code = entity_result.get("resolved", {}).get("village_code")
+    if code is None or _VILLAGE_CODE_FILTER_RE.search(sql):
+        return None
+    return code if _VILLAGE_NAME_FILTER_RE.search(sql) else None
+
+
 async def execute_with_repair(question: str, schemes: list[str], entity_result: dict,
                               initial_sql: str | None = None, *,
                               max_repairs: int = 2) -> tuple[str, list[dict]]:
@@ -2005,6 +2355,15 @@ async def execute_with_repair(question: str, schemes: list[str], entity_result: 
     for attempt in range(max_repairs + 1):
         sql = _uppercase_geo_literals(sql)
         try:
+            bad_code = _village_name_filter_instead_of_code(entity_result, sql)
+            if bad_code is not None:
+                raise ValueError(
+                    f"the question resolved to village_code = {bad_code} but this query filters on "
+                    "lgd_village_name instead — village name spelling/case is not reliable for "
+                    "matching (storage keeps mixed/title case, not upper-case), so that filter can "
+                    "silently match zero rows. Replace the lgd_village_name filter with "
+                    f"village_code = {bad_code} exactly, and keep every other clause as it was."
+                )
             if _STATE_PSEUDO_FILTER.search(sql):
                 raise ValueError(
                     "generated SQL filters on a non-existent 'Meghalaya' / entity_type='State' "
@@ -2533,7 +2892,7 @@ async def _answer_data(question: str, scope: "auth.UserScope | None" = None,
     # chips ("which Garo Hills district?") or, if the question already says "all of
     # Garo Hills" or asks for a per-district breakdown, expand it to every district in
     # the range and carry that forward for SQL generation.
-    if not entity_result["resolved"].get("district"):
+    if not entity_result["resolved"].get("district") and not entity_result["resolved"].get("district_list"):
         _scheme0 = schemes[0] if schemes else ""
         region = detect_region(question, _scheme0)
         if region:
@@ -2681,6 +3040,17 @@ async def answer_question(question: str, session: "Session | None" = None,
     raw_question = question
     result = await _run_pipeline(question, session=session, scope=scope)
     _attach_followups(result, result.get("rewritten_question") or raw_question)
+    # Context Updater — fold this turn into the session's structured state and
+    # refresh the rolling summary (both best-effort; see context_manager).
+    # Skipped for a clarification pause: nothing was actually answered yet,
+    # and _run_pipeline never reaches here for one anyway (it raises).
+    if settings.CONTEXT_LAYER_ENABLED and session is not None:
+        try:
+            context_manager.update_state(
+                session, raw_question, result.get("rewritten_question") or raw_question, result)
+            await context_manager.maybe_update_summary(session)
+        except Exception:  # noqa: BLE001 — the context layer must never break an answer
+            logger.warning("context layer post-processing failed (non-fatal)", exc_info=True)
     return result
 
 
@@ -2717,6 +3087,8 @@ async def _run_pipeline(question: str, session: "Session | None" = None,
     # see edge.detect_edge_case's has_context param.
     prev = session.last_turn if session is not None else None
     has_antecedent = prev is not None and prev.route in _ANTECEDENT_ROUTES
+    ctx_state = (session.state if (session is not None and settings.CONTEXT_LAYER_ENABLED
+                                   and settings.CONTEXT_STATE_ENABLED) else None)
 
     # 0a. Resuming a "which area / year?" pause — fold the user's free-text reply
     #     ("West Garo Hills 2023-24", "all of Meghalaya, all years") back into the
@@ -2791,6 +3163,24 @@ async def _run_pipeline(question: str, session: "Session | None" = None,
                 "suggestions": hit.get("suggestions", []),
                 **_empty_data_fields()}
 
+    # 0f. Deterministic reference resolution ("the previous year", "the
+    #     current year", "the former/latter", "the other one", "both") against
+    #     the session's structured conversation state — see
+    #     context_manager.substitute_references. Runs before the follow-up
+    #     detector so a bare "compare that with the previous year" already has
+    #     a concrete year by the time it gets there. Ambiguous ("the other
+    #     one" with no recorded comparison) reuses the existing clarification
+    #     mechanism rather than guessing. Any other failure degrades to the
+    #     question unchanged — the pre-existing follow-up path still runs.
+    if not scope_resumed and ctx_state is not None:
+        try:
+            question = context_manager.substitute_references(question, ctx_state)
+        except context_manager.AmbiguousReference as e:
+            raise ClarificationNeeded(e.question, options=e.options, rule="entity-ambiguous")
+        except Exception:  # noqa: BLE001
+            logger.warning("context_manager.substitute_references failed — continuing unchanged",
+                           exc_info=True)
+
     # 1. Follow-up — rewrite a fragment ("what about EGH?") to a standalone
     #    question using the previous turn, before routing. Only when the previous
     #    turn was an actual scheme answer; otherwise the fragment has nothing
@@ -2799,7 +3189,14 @@ async def _run_pipeline(question: str, session: "Session | None" = None,
     is_followup_rewrite = False
     if looks_like_followup(question):
         if has_antecedent:
-            question = await rewrite_followup(question, prev)
+            _extra_ctx = ""
+            if settings.CONTEXT_LAYER_ENABLED and session is not None:
+                try:
+                    _extra_ctx = await context_manager.build_followup_context(session, question)
+                except Exception:  # noqa: BLE001
+                    logger.warning("context_manager.build_followup_context failed — continuing without it",
+                                   exc_info=True)
+            question = await rewrite_followup(question, prev, extra_context=_extra_ctx)
             is_followup_rewrite = True
         elif _CONTEXTLESS_REF.search(question) and not _mentions_scheme(question):
             # "how launched it?" with no prior scheme answer — don't guess.
@@ -2822,6 +3219,19 @@ async def _run_pipeline(question: str, session: "Session | None" = None,
                 "rewritten_question": question if question != raw_question else None,
                 **_empty_data_fields()}
 
+    # 1f. A follow-up fragment that rewrote to a standalone question still
+    #     naming no scheme (and no scheme-specific vocabulary of its own) gets
+    #     the session's pinned scheme appended deterministically — see
+    #     context_manager.inject_scheme_hint. Only for an actual continuation
+    #     (is_followup_rewrite), never for a brand-new question: that case is
+    #     deliberately left to the existing "which scheme?" pause below.
+    if is_followup_rewrite and ctx_state is not None:
+        try:
+            question = context_manager.inject_scheme_hint(question, ctx_state)
+        except Exception:  # noqa: BLE001
+            logger.warning("context_manager.inject_scheme_hint failed — continuing unchanged",
+                           exc_info=True)
+
     # 1c. Bank / financial-channel details are not held for any loaded scheme —
     #     say so, with the reason, before routing. Checked ahead of the DATA/
     #     KNOWLEDGE split: phrasing like "what is the bank-wise disbursement…"
@@ -2829,7 +3239,9 @@ async def _run_pipeline(question: str, session: "Session | None" = None,
     #     RAG ("not covered in the reference material") instead of explaining
     #     that the column itself isn't queryable.
     if _BANK_REQUESTED.search(question):
-        raise _bank_clarification(question)
+        _clarification = _bank_clarification(question)
+        if _clarification is not None:
+            raise _clarification
 
     # 1d. Administrative expenditure is deliberately excluded from reporting for
     #     every scheme that has it (see _ADMIN_EXPENDITURE_REQUESTED above) —
@@ -2871,9 +3283,18 @@ async def _run_pipeline(question: str, session: "Session | None" = None,
         if _kb_scheme is None and _needs_scheme_clarification(question):
             raise _scheme_clarification(question)
 
-        kb = await rag.answer_from_kb(question, scheme=_kb_scheme)
-        base = {"rewritten_question": question if question != raw_question else None,
-                "schemes": [_kb_scheme] if _kb_scheme else []}
+        # Two or more schemes named outright ("how do I apply across MGNREGA,
+        # PMAY-G, Focus Plus and CM Elevate") — retrieve each scheme's chunks
+        # separately (see rag.answer_from_kb_multi) instead of one unscoped
+        # search, which otherwise lets one scheme's passages crowd out another's.
+        if len(_named) > 1:
+            kb = await rag.answer_from_kb_multi(question, schemes=_named)
+            base = {"rewritten_question": question if question != raw_question else None,
+                    "schemes": _named}
+        else:
+            kb = await rag.answer_from_kb(question, scheme=_kb_scheme)
+            base = {"rewritten_question": question if question != raw_question else None,
+                    "schemes": [_kb_scheme] if _kb_scheme else []}
         if kb:
             return {"route": "knowledge", "intent": "RAG", "confidence": kb["confidence"],
                     "answer": kb["answer"], "sources": kb["sources"],
@@ -2890,6 +3311,18 @@ async def _run_pipeline(question: str, session: "Session | None" = None,
     # TEXT, so an entity can silently drop if it doesn't literally reappear in
     # the rewritten wording (e.g. a village name the rewrite paraphrases away).
     _prior_resolved = prev.resolved_entities if (is_followup_rewrite and prev is not None) else None
+    if is_followup_rewrite and ctx_state is not None:
+        # Extends the fallback above with session-level structured state, so a
+        # KNOWLEDGE/EDGE turn sitting between the last DATA answer and this
+        # follow-up (which leaves resolved_entities empty — see
+        # context_manager.update_state) doesn't erase district/block/village/
+        # year a later "and in 2023-24?" still needs. Turn-level prev values
+        # still win where both are present.
+        try:
+            _prior_resolved = context_manager.merged_prior_resolved(_prior_resolved, ctx_state)
+        except Exception:  # noqa: BLE001
+            logger.warning("context_manager.merged_prior_resolved failed — using turn-level only",
+                           exc_info=True)
     try:
         result = await _answer_data(question, scope=scope, skip_scope_clarify=scope_resumed,
                                      prior_resolved=_prior_resolved,

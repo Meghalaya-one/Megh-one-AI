@@ -10,9 +10,10 @@ It is the sibling of `Annotations/PMAY/README.md` and `Annotations/MGNREGA/READM
 PMAY one for the house method; this one records what is different about Focus Plus, and Focus
 Plus is different in five ways that matter:
 
-1. **It is the only person-level fact in `megh_db`.** `member_id`, `pincode` and
-   `bank_name_raw` describe identifiable individuals. Rule 7 of `SCHEMA_FOR_DEVELOPERS.md`
-   governs every query written from this folder.
+1. **It is the only person-level fact in `megh_db`.** `member_id` and `pincode` describe
+   identifiable individuals. Rule 7 of `SCHEMA_FOR_DEVELOPERS.md` governs every query
+   written from this folder. `bank_name_raw` is also on the row but identifies a bank,
+   not a person, so it is not covered by that rule (see §6.8).
 2. **One row is one payment** — not one person, not one household. `COUNT(*)` answers a question
    almost nobody asks.
 3. **The data is two datasets stacked in one fact**, split by `batch_label`. Nothing in the DDL
@@ -50,7 +51,7 @@ user question
    |                                    NOTE: Focus Plus is NOT in the catalogue yet. See §8.
    v
 [ clarification gate ]   <-- focusplus_classification_rules.yaml     BUILT
-   |  producer groups, EPIC ids, banks, dates -> refuse and redirect
+   |  producer groups, EPIC ids, account/IFSC, dates -> refuse and redirect
    |  batch scope, "beneficiaries", the payment rate -> ask, and pause
    v
 [ defaults ]             <-- focusplus_default_rules.yaml            BUILT
@@ -101,7 +102,7 @@ Two files in `datasets/Focus+/`. One is the data; the other is what the SME want
 | 7 | `beneficiary_name` | **DROPPED** |
 | 8 | `gender` | kept |
 | 9 | `occupation` | kept |
-| 10 | `bank_name` | → `bank_name_raw`, **fact only — withheld from the view** |
+| 10 | `bank_name` | → `bank_name_raw`, kept on the fact and the view |
 | 11 | `status` | **DROPPED** (constant `'106'`) |
 | 12 | `focus_status` | kept |
 | 13 | `verification_status` | kept |
@@ -212,16 +213,16 @@ regardless of its priority. `member_id` is `high` priority and still carries no 
 | `nlp_sql_rules` | 21 keys, including `never_query` and `mandatory_predicate: NONE` |
 | `few_shot_examples` | **34 examples, of which 13 have `sql: null`** — the refusals |
 
-### 4.1 The thirteen deliberate refusals
+### 4.1 The twelve deliberate refusals
 
-Nearly twice PMAY's seven, because more of the use-case workbook rests on columns that do not
-exist. They teach the generator to say *no*:
+Well over PMAY's seven, because more of the use-case workbook rests on columns that do not
+exist. Bank name is no longer one of them — `bank_name_raw` was added to `v_focus_plus` on
+2026-09-09 (§6.8) — but these still teach the generator to say *no*:
 
 | Refused question | Why |
 |---|---|
 | EPIC lookup | Column dropped at ingest, **and** rule 7 forbids person lookup |
 | Member name lookup / payment history | Name dropped; no date to build a history from; person lookup |
-| Which bank serves the most beneficiaries | `bank_name_raw` withheld from the view — a boundary, not an oversight |
 | How many producer groups | No such column anywhere in source or database |
 | Disbursement trend by month | No date column at all |
 | Beneficiaries with no mobile number | Column dropped at ingest |
@@ -432,16 +433,22 @@ the batches are not a clean partition of people, 12,527 overstates the unpaid ba
 unknown amount, and because `epic_id` is gone **this overlap cannot be detected in `megh_db` at
 all.**
 
-### 6.8 `bank_name` is dirty as well as withheld
+### 6.8 `bank_name_raw` is queryable but dirty
+
+Added to `curated.v_focus_plus` on 2026-09-09 — it is a bank name, not a person identifier, so it
+is exempt from the PII rule in §1 and may appear in an answer (bank-wise breakdowns, "which bank"
+questions).
 
 42 distinct source values = **27 real bank names + 15 numeric codes**. The legacy batch stores
 names, the 12.5K batch stores codes. Casing is inconsistent (`State Bank of India` vs
 `BANK OF BARODA`), one value carries a **leading space** (`' UJJIVAN SMALL FINANCE BANK'`), and
-one is misspelled (`Cananra Bank`). Top three: SBI 258,744 · Meghalaya Rural Bank 75,228 ·
-Meghalaya Co-op Apex 25,160.
+one is misspelled (`Cananra Bank`). Top three by total `amount_disbursed` (raw, unit unverified —
+see §6.3): SBI 808,575,000 · Meghalaya Rural Bank 235,087,500 · Meghalaya Co-op Apex 78,625,000 — the
+numeric-code rows sit far below these, so a top-1 "which bank" answer is unaffected, but a fuller
+breakdown should flag any numeric-code row as an unresolved raw value rather than a bank name.
 
-Even if the privacy boundary were lifted, this column would need a normalisation table that does
-not exist.
+There is no normalisation table, so do not present the 42 raw values as 42 banks. Account numbers
+and IFSC codes are still not held anywhere in `megh_db`, for any scheme.
 
 ---
 
@@ -494,10 +501,12 @@ Ordered by how likely each is to produce a wrong published number.
 9. **The semantic catalog has never seen this fact.** `semantic.table_catalog` (9 rows) and
    `column_catalog` (123 rows) were harvested when `curated` held 9 objects and 123 columns; it
    now holds 18 and 249. Run `semantic.refresh_catalog()`, then set
-   `is_chatbot_visible = false` on the fact and keep `member_id`, `pincode` and `bank_name_raw`
-   out of `sample_values`.
-10. **`bank_name_raw` retention.** PMAY dropped its names at ingest; Focus Plus kept three
-    identifying columns. Whether that is intended should be recorded in `meta.data_layers.retention`.
+   `is_chatbot_visible = false` on the fact and keep `member_id` and `pincode` out of
+   `sample_values`. `bank_name_raw` is exempt (§6.8) and may appear in sample_values.
+10. **`bank_name_raw` retention — RESOLVED 2026-09-09.** PMAY dropped its names at ingest;
+    Focus Plus kept two identifying columns (`member_id`, `pincode`) plus `bank_name_raw`, which
+    is not identifying. The retention was intentional and `bank_name_raw` was added to
+    `v_focus_plus` accordingly; see §6.8.
 11. **No Focus Plus scheme document.** Policy questions ("what is the entitlement?") have no
     grounding source, and the workbook's ₹5,000 claim is contradicted by the data.
 
@@ -533,8 +542,9 @@ Run in this order. Steps 1–3 are mechanical and should be automated before the
    fact about asking-versus-assuming belongs in exactly one gate file.**
 2. **Every number in this folder is a source-CSV observation until measured against the
    database.** Mark it `unverified_in_db` and say so in the answer.
-3. **PII is not negotiable.** `member_id`, `pincode` and `bank_name_raw` never reach a user, an
-   export, or a vector store. `member_id` is permitted only inside `COUNT(DISTINCT)`.
+3. **PII is not negotiable.** `member_id` and `pincode` never reach a user, an export, or a
+   vector store. `member_id` is permitted only inside `COUNT(DISTINCT)`. `bank_name_raw` is not
+   PII and is exempt (§6.8).
 4. **Never copy a PMAY predicate across.** `is_placeholder`, `is_completed`, `mapping_category`,
    `sanction_date` and `installments_paid` do not exist here.
 5. **Never present a 3.2%-coverage breakdown as a scheme figure.**
@@ -582,5 +592,6 @@ Two authoring jobs sit outside this folder:
 - **`MASTER/schemes_catalog.yaml` has no Focus Plus entry.** Node 1 cannot route a Focus Plus
   question yet. Stage2 now exists, so the keywords can be derived from it per that folder's
   README §6.4.
-- **`semantic.refresh_catalog()` has never seen this fact**, and when it runs, `member_id`,
-  `pincode` and `bank_name_raw` must be kept out of `sample_values` and the embedding set.
+- **`semantic.refresh_catalog()` has never seen this fact**, and when it runs, `member_id` and
+  `pincode` must be kept out of `sample_values` and the embedding set. `bank_name_raw` is exempt
+  (§6.8).

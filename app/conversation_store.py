@@ -299,6 +299,61 @@ async def set_pinned(*, session_id: str, user_id: int, pinned: bool) -> bool:
     return row is not None
 
 
+def save_context_state(*, session_id: str, context_state: dict,
+                       summary: str | None = None) -> None:
+    """L2 (durable) mirror of the context layer's structured state — see
+    app.session_store.ConversationState and app.context_manager. Fire-and-
+    forget, same stance as persist_turn: a slow/unavailable DB must never
+    block an answer, and this is a convenience cache for resuming a
+    conversation on a different worker, not the source of truth (the
+    in-process Session is). Only touches a conversation that already exists
+    (the turn insert in persist_turn always runs first)."""
+    _spawn(_save_context_state(session_id, context_state, summary))
+
+
+async def _save_context_state(session_id: str, context_state: dict, summary: str | None) -> None:
+    try:
+        if summary is not None:
+            await db.execute(
+                """UPDATE app.conversations
+                   SET context_state = $1, summary = $2, summary_updated_at = NOW()
+                   WHERE session_id = $3""",
+                [json.dumps(context_state, default=str), summary, session_id],
+            )
+        else:
+            await db.execute(
+                """UPDATE app.conversations SET context_state = $1 WHERE session_id = $2""",
+                [json.dumps(context_state, default=str), session_id],
+            )
+    except Exception as e:  # noqa: BLE001 — best-effort, same as persist_turn
+        logger.warning("conversation_store: save_context_state failed (non-fatal): %s", e)
+
+
+async def load_context_state(session_id: str) -> dict:
+    """The durable (L2) structured state + summary for a session — used to
+    rehydrate app.session_store.Session.state when a conversation resumes on a
+    worker that has never seen this session_id in-process (new worker, or the
+    in-process session TTL'd out but the conversation itself hasn't). Returns
+    {} (never raises) if the conversation/columns aren't there yet."""
+    try:
+        row = await db.fetchrow(
+            "SELECT context_state, summary FROM app.conversations WHERE session_id = $1",
+            [session_id],
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning("conversation_store: load_context_state failed (non-fatal): %s", e)
+        return {}
+    if not row:
+        return {}
+    state = row.get("context_state")
+    if isinstance(state, str):
+        try:
+            state = json.loads(state)
+        except (ValueError, TypeError):
+            state = None
+    return {"context_state": state or {}, "summary": row.get("summary")}
+
+
 async def set_archived(*, session_id: str, user_id: int, archived: bool) -> bool:
     """Archiving also unpins: a thread on the archive shelf should not keep a
     slot at the top of the active list if it is ever restored."""

@@ -242,9 +242,12 @@ output_contract:
     user_text: <verbatim span>
     reason: privacy | not_held
     message: >
-      A fourth shape PMAY does not have. Used when the span resolves to a real person or
-      to bank_name_raw. Say the data cannot be shown, offer the aggregate, and do not
-      list candidates - listing near-matches of a person identifier is itself a leak.
+      A fourth shape PMAY does not have. Used when the span resolves to a real person
+      (member_id / pincode / a name) or to an account number / IFSC, none of which
+      exist as a queryable identifier here. bank_name_raw is NOT this case - it is a
+      bank name, not a person, and resolves normally. Say the data cannot be shown,
+      offer the aggregate, and do not list candidates - listing near-matches of a
+      person identifier is itself a leak.
 
 # ---------------------------------------------------------------------------
 overloaded_terms:
@@ -1360,7 +1363,7 @@ measure_vocabulary:
       items:
       - { metric: coverage_rate, reason: no eligible-population denominator is held }
       - { metric: beneficiary_density, reason: no population figures }
-      - { metric: bank_share, reason: bank_name_raw is withheld from the view }
+      - { metric: account_ifsc_analysis, reason: no account number or IFSC column exists }
       - { metric: monthly_trend, reason: no date column exists }
       - { metric: unpaid_backlog_exact, reason: "the cross-cohort overlap needs epic_id, which was dropped" }
 
@@ -1474,12 +1477,20 @@ worked_examples:
 
 - user: "which bank pays the most focus plus beneficiaries"
   resolve:
-  - { text: bank, type: withheld_column, canonical: bank_name_raw }
-  action: refused
-  reason: not_held
-  message: >
-    Bank details are not available through the approved query surface. bank_name_raw is on
-    the fact but deliberately dropped from v_focus_plus. Do not reach past the view.
+  - { text: bank, type: column, canonical: bank_name_raw }
+  sql: |
+    SELECT bank_name_raw,
+           COUNT(*)              AS payments,
+           SUM(amount_disbursed) AS amount_raw
+    FROM curated.v_focus_plus
+    GROUP BY bank_name_raw
+    ORDER BY payments DESC
+    LIMIT 1;
+  expected: { bank_name_raw: State Bank of India, payments: 258744, amount_raw: 808575000 }
+  note: >
+    "Beneficiaries" is read as payments (rule 6) and labelled as such. bank_name_raw is
+    not withheld - it is on curated.v_focus_plus and is not an identifier. Only account
+    number / IFSC questions still refuse (not_held, no such column exists anywhere).
 
 - user: "is EPIC FTB0593681 a focus plus beneficiary"
   resolve:
@@ -1579,8 +1590,8 @@ maintenance:
        access review and may be invisible or over-granted to megh_readonly."
     - "Cross-scheme presence: SELECT DISTINCT scheme_code FROM
        curated.v_cross_scheme_money_district_year."
-    - "Confirm member_id, pincode and bank_name_raw are excluded from
-       semantic.column_catalog.sample_values and from the embedding set."
+    - "Confirm member_id and pincode are excluded from semantic.column_catalog.sample_values
+       and from the embedding set. bank_name_raw is not an identifier and is exempt."
 
   regeneration_rules:
   - Re-profile the CSV AND re-query megh_db. Diff every count here. Explain each change.

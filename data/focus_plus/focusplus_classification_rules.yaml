@@ -44,9 +44,9 @@ clarification_rules:
   - condition: "mobile_number_requested"
     question: "Mobile numbers are not held in the database. Shall I answer on payments, geography or the registration details that are held?"
 
-  - condition: "bank_requested"
-    question: "Bank details are not available through the approved query surface for Focus Plus, so bank-wise figures cannot be produced. Shall I answer by district, block or village instead?"
-
+  # NOTE: bank_name_raw was added to curated.v_focus_plus on 2026-09-09 - a bare
+  # "which bank" / "bank-wise" question is answerable and should NOT gate here.
+  # Only account number / IFSC (never held) still refuses, below.
   - condition: "account_number_or_ifsc_requested"
     question: "Account numbers and IFSC codes are not held in this data. Shall I answer on payments by district, block or village?"
 

@@ -86,6 +86,13 @@ ALTER TABLE app.conversations ADD COLUMN IF NOT EXISTS pinned      BOOLEAN NOT N
 ALTER TABLE app.conversations ADD COLUMN IF NOT EXISTS pinned_at   TIMESTAMPTZ;
 ALTER TABLE app.conversations ADD COLUMN IF NOT EXISTS archived    BOOLEAN NOT NULL DEFAULT FALSE;
 ALTER TABLE app.conversations ADD COLUMN IF NOT EXISTS archived_at TIMESTAMPTZ;
+-- Conversation context layer (app/context_manager.py): the L2 durable copy of
+-- the structured multi-turn state + rolling summary the in-process
+-- session_store keeps as L1. Idempotent, additive — no existing row is touched
+-- beyond getting NULL defaults for these three columns.
+ALTER TABLE app.conversations ADD COLUMN IF NOT EXISTS summary             TEXT;
+ALTER TABLE app.conversations ADD COLUMN IF NOT EXISTS context_state       JSONB;
+ALTER TABLE app.conversations ADD COLUMN IF NOT EXISTS summary_updated_at  TIMESTAMPTZ;
 -- The sidebar reads "my unarchived threads, pinned first, newest first".
 CREATE INDEX IF NOT EXISTS idx_conv_user_shelf
     ON app.conversations(user_id, archived, pinned DESC, last_at DESC);

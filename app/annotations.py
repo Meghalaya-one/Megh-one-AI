@@ -144,7 +144,13 @@ def few_shot_examples(schemes: list[str], question: str = "", top_k: int = 4) ->
     the ones on-topic for this query — not just the first top_k in file order,
     which for MGNREGA are all expenditure queries and left job-card / person-day /
     household questions with no worked example at all. `sorted` is stable, so when
-    nothing overlaps (or `question` is empty) the original file order is kept."""
+    nothing overlaps (or `question` is empty) the original file order is kept.
+
+    A `status: UNANSWERABLE` example (CM Elevate's money/date questions the data
+    genuinely can't answer) has `sql: null` on purpose — it's a negative example
+    meant to be retrieved for exactly this kind of question and teach the refusal,
+    not a worked query. It is returned with sql=None and its `reason` instead of
+    being skipped, so the generator sees the on-topic guard rather than nothing."""
     out: list[dict] = []
     q_tokens = _fewshot_tokens(question)
     for scheme in schemes:
@@ -153,7 +159,11 @@ def few_shot_examples(schemes: list[str], question: str = "", top_k: int = 4) ->
             pool = sorted(pool, key=lambda ex: _fewshot_score(q_tokens, ex["question"]),
                           reverse=True)
         for ex in pool[:top_k]:
-            out.append({"question": ex["question"], "sql": ex["sql"].strip()})
+            if ex.get("status") == "UNANSWERABLE":
+                reason = " ".join(ex.get("reason", "").split())
+                out.append({"question": ex["question"], "sql": None, "reason": reason})
+            else:
+                out.append({"question": ex["question"], "sql": ex["sql"].strip()})
     return out
 
 
