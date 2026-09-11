@@ -142,22 +142,29 @@ class Settings(BaseSettings):
     #    network hop to this box. ──
     #
     #    MODEL ROLES (deployment name -> what it does):
-    #      qwen-model  (qwen3-coder-30b-fp8) : SQL GENERATION ONLY. The scarce,
+    #      qwen-model   (qwen3-coder-30b-fp8) : SQL GENERATION ONLY. The scarce,
     #          quality-critical model — a wrong join here is a wrong number. Kept
     #          free of the cheap calls so its whole batch is available for SQL.
-    #      qwen35-9b   (qwen3.5-9b)          : scheme + intent + entity classification
-    #          AND final answer composition. Cheap pattern/format tasks; the 9B
-    #          handles them with guided-JSON decoding without touching the 30B.
-    #      qwen3-embedding / qwen3-reranker  : RAG (scheme-knowledge) path.
-    #      qwen3-asr                         : voice input transcription.
-    #    A dedicated small classifier (Qwen3-4B) is the planned next split — point
-    #    CLASSIFIER_MODEL at it once it is deployed and has GPU room. See
-    #    docs/INFERENCE_REQUIREMENTS.md.
+    #      qwen4-deploy (Qwen3-4B-Instruct)   : scheme + intent + entity classification
+    #          (CLASSIFIER_MODEL) AND the SQL semantic verifier (SQL_VERIFY_MODEL) —
+    #          two distinct roles sharing one small deployment. Cheap pattern/format
+    #          tasks with guided-JSON decoding; keeps them off the 9B and the 30B.
+    #      qwen35-9b    (qwen3.5-9b)          : final answer composition only
+    #          (RESPONSE_MODEL). Freed from classify duty so composition never
+    #          queues behind the classify/entity/follow-up calls.
+    #      qwen3-embedding / qwen3-reranker   : RAG (scheme-knowledge) path.
+    #      qwen3-asr                          : voice input transcription.
+    #    Classifier handoff from the 9B to the 4B done 2026-09-10 (Task 6 in
+    #    docs/INFERENCE_REQUIREMENTS.md), once qwen4-deploy was confirmed reachable
+    #    via SQL_VERIFY_ENABLED. Watch qwen4-deploy queue depth — it now carries
+    #    both roles — and validate classify accuracy against the old 9B baseline
+    #    on ambiguous queries (abbreviations, cross-scheme, follow-ups).
     AI_MODEL_CA_BUNDLE_PATH: str = ""  # certs/enlight-aiops-internal-ca.pem, if verification is required
 
-    # Classify / intent / entity-extract — on the 9B, NOT the 30B, so the trivial
-    # calls never queue behind SQL generation. Repoint at a dedicated qwen3-4b later.
-    CLASSIFIER_MODEL: str = "qwen35-9b"
+    # Classify / intent / entity-extract — on the dedicated 4B, NOT the 9B or the
+    # 30B, so these frequent small calls never queue behind SQL generation or
+    # composition, and composition never queues behind them either.
+    CLASSIFIER_MODEL: str = "qwen4-deploy"
     CLASSIFIER_BASE_URL: str = "https://10.48.242.4/openai/v1"
     CLASSIFIER_API_KEY: str = ""
     CLASSIFIER_TIMEOUT_SECONDS: int = 30
@@ -171,13 +178,43 @@ class Settings(BaseSettings):
     SQL_GENERATION_TEMPERATURE: float = 0.0
     SQL_GENERATION_MAX_RETRIES: int = 1  # one repair attempt on a validation failure
 
-    # qwen35-9b — final natural-language answer composition (same model as the classifier)
+    # qwen35-9b — final natural-language answer composition only. Classify/intent/
+    # entity-extract moved to qwen4-deploy (see CLASSIFIER_MODEL above) on
+    # 2026-09-10, so this deployment now serves only this role.
     RESPONSE_MODEL: str = "qwen35-9b"
     RESPONSE_MODEL_BASE_URL: str = "https://10.48.242.4/openai/v1"
     RESPONSE_MODEL_API_KEY: str = ""
     RESPONSE_TEMPERATURE: float = 0.0
     RESPONSE_MAX_TOKENS: int = 800
     RESPONSE_TIMEOUT_SECONDS: int = 20
+
+    # ── SQL semantic verifier — qwen3-4b (docs/INFERENCE_REQUIREMENTS.md Task 6) ──
+    # Runs after generate_sql, before the query touches the database: a second
+    # opinion asking "does this SQL actually answer the question, per the schema
+    # rules and resolved entities above it?" (see prompt_builder.build_verify_prompt).
+    # The regex guards already in execute_with_repair only catch SQL shapes a past
+    # bug taught them to recognise (bare row read on an aggregate question,
+    # village-name-instead-of-code, a phantom 'Meghalaya' filter, ...). This
+    # catches the same CLASS of bug — syntactically valid, executes cleanly,
+    # answers the wrong question — in a shape nobody has hand-coded a guard for
+    # yet. A flagged query raises straight into the existing repair loop; no new
+    # control flow needed for that part.
+    # Best-effort: any failure (model not deployed, timeout, unparseable JSON)
+    # degrades to "no issue found" — a verifier outage must never block an
+    # answer that would otherwise have worked.
+    # Deployed 2026-09-10 as served model name "qwen4-deploy" (not the "qwen3-4b"
+    # name docs/INFERENCE_REQUIREMENTS.md Task 6 originally planned) — vLLM
+    # runtime, confirmed reachable on /openai/v1. Verified working end to end.
+    # SQL_VERIFY_MODEL and CLASSIFIER_MODEL now both point at this same
+    # qwen4-deploy deployment — a distinct role each (verify runs once per SQL
+    # generation; classify runs several times per turn), sharing one small model
+    # rather than each getting its own GPU allocation.
+    SQL_VERIFY_ENABLED: bool = True
+    SQL_VERIFY_MODEL: str = "qwen4-deploy"
+    SQL_VERIFY_BASE_URL: str = "https://10.48.242.4/openai/v1"
+    SQL_VERIFY_API_KEY: str = ""
+    SQL_VERIFY_TEMPERATURE: float = 0.0
+    SQL_VERIFY_TIMEOUT_SECONDS: int = 15
 
     # KB chunk + query embeddings for the RAG path, and the semantic cache.
     # "local"  -> fastembed CPU model (LOCAL_EMBEDDING_MODEL), no gateway call.
@@ -261,6 +298,14 @@ class Settings(BaseSettings):
     # questions the scope gate itself skips because their place is already pinned.
     # Off => answer across every year silently, as before.
     YEAR_CLARIFY_ENABLED: bool = True
+    # Pause and ask "which tranche?" when a Focus Plus data question (a metric or
+    # per-dimension breakdown) names no tranche — neither in its text (resolved via
+    # resolve_tranche_label) nor via a resolved entity — and doesn't ask for a
+    # per-tranche breakdown or an explicit "all tranches combined". Offers Tranch 1
+    # / 2 / 3 / 4 plus "all tranches combined" as one-tap replies, the same shape as
+    # YEAR_CLARIFY_ENABLED above. Focus Plus only — no other scheme has a
+    # tranche_label column. Off => answer across every tranche silently, as before.
+    TRANCHE_CLARIFY_ENABLED: bool = True
     # Reply with the standard "I'm Megh One AI — I only cover Meghalaya's MGNREGA
     # / PMAY-G" message when a data question names a district or block that is not
     # in Meghalaya (resolver returns not_found), instead of dropping the filter,

@@ -454,6 +454,57 @@ CM ELEVATE RULES (breaking these produces a wrong number, not just an ugly query
      Every OTHER scheme_specific read MUST carry a cm_scheme_key or scheme_name filter
      — `->>` returns NULL for a missing key, indistinguishable from a genuinely empty
      value.
+  9a. NEVER GUESS A scheme_specific KEY NAME. `->>` and `?` are silent on a missing
+     key — a wrong guess returns 0 rows / NULL and reads exactly like "no data
+     exists" (confirmed live 2026-09-11: a question about Poultry applicants "by
+     sector" was answered "no matching records" because the generator wrote
+     `scheme_specific ->> 'sector'`, when the real, populated key for Poultry is
+     `sector_id` — one keystroke off, and 501 real rows silently became zero). Known
+     real keys, verified live against megh_db, all holding TEXT despite the `_id`
+     suffix: gender_id (all 15 schemes), sector_id (Poultry, Dairy, Goat only —
+     'Poultry'/'Piggery'/etc., mostly NULL), occupation_id (uncoded, no lookup
+     table). For any OTHER scheme_specific field the question names, either match it
+     to a key already confirmed in this prompt, or run
+     `SELECT DISTINCT jsonb_object_keys(scheme_specific)` scoped to that one scheme
+     first and use exactly what comes back — never a plausible-sounding shortened or
+     lengthened form of the word the user typed.
+  9b. When the question's own wording explicitly names a scheme_specific dimension
+     word ("sector", "gender", ...) ALONGSIDE a scheme it already resolved to (e.g.
+     "poultry sector"), the user is asking about THAT SUB-FIELD, not just repeating
+     the scheme name — answer with the sub-field, don't silently drop it and return
+     the bare scheme total (confirmed live 2026-09-11: returning the plain 501
+     scheme-wide count for "applicants associated with poultry sector" was reported
+     back as ignoring "sector" entirely). But two traps stack here, and both must be
+     handled in ONE query, not chosen between:
+       - CASE: sector_id values are stored Title Case ('Poultry', 'Piggery'). Compare
+         with `ILIKE` (or `LOWER(...) = LOWER(...)`), never an exact match on a
+         lowercase guess — that was the original bug (0 rows on 'poultry').
+       - SPARSITY: sector_id is recorded on only a small fraction of rows even for
+         the schemes that have it (26 of 501 Poultry rows; 475 are NULL). A filtered
+         count alone, with no denominator, reads as either "the whole scheme" or "a
+         data error" depending which way it's wrong. Always return THREE numbers
+         together so the answer is self-explanatory — the sector-matched count, how
+         many rows have sector_id recorded at all, and the scheme's total applicant
+         count — e.g.:
+           SELECT COUNT(*) FILTER (WHERE scheme_specific ->> 'sector_id' ILIKE 'poultry')
+                    AS poultry_sector_applicants,
+                  COUNT(*) FILTER (WHERE scheme_specific ->> 'sector_id' IS NOT NULL)
+                    AS sector_recorded,
+                  COUNT(*) AS scheme_total
+           FROM curated.v_cm_elevate
+           WHERE scheme_name = 'Meghalaya Poultry Farming Scheme';
+         THE "RECORDED" TEST MUST BE `->> 'key' IS NOT NULL`, NEVER `? 'key'`. The `?`
+         (has-key) operator checks whether the JSON key is PRESENT, not whether its
+         value is non-null — sector_id is present as a key on every one of the 501
+         rows (with a JSON null value on 475 of them), so `scheme_specific ?
+         'sector_id'` returns TRUE for all 501 and silently makes "sector_recorded"
+         equal the scheme total (confirmed live 2026-09-11: this exact mistake was
+         shipped once already, in this very rule, before being caught). `->>` returns
+         SQL NULL for both a missing key and a JSON-null value, which is exactly the
+         "not really recorded" test wanted here.
+         State all three: "21 applicants have sector recorded as Poultry (out of 26
+         rows where sector is recorded at all; 501 total applicants under the
+         scheme)" — never just the 21, and never just the 501.
  10. Applicant names, mobile numbers, PAN and bank account fields were stripped at
      ingest — a name lookup returns "not held in this data", never a guessed join.
  11. NEVER row-join v_cm_elevate to a PMAY, MGNREGA or Focus Plus fact/view — all such
@@ -475,6 +526,7 @@ CM ELEVATE BUSINESS VOCABULARY (source: cmelevate_schema_partitions.yaml + cmele
     "villages" -> COUNT(DISTINCT village_code) FILTER (WHERE entity_type <> 'Unresolved')   "districts" / "blocks" -> COUNT(DISTINCT lgd_district) / COUNT(DISTINCT lgd_block)
     "amount" / "money" / "disbursed" / "subsidy" / "loan" / "sanctioned amount" -> NOT AVAILABLE, no money column exists   "gender" -> scheme_specific ->> 'gender_id'
     "type" (default) -> applicant_category   "mode" -> application_mode (online / cmconnectcenter)   "schemes" -> COUNT(*) FROM curated.dim_cm_elevate_scheme  (= 15)
+    "sector" -> scheme_specific ->> 'sector_id'   (Poultry/Dairy/Goat only — NEVER 'sector', that key does not exist and silently returns zero rows)
 """.strip()
 
 _CROSS_SCHEME = """

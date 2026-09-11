@@ -42,6 +42,15 @@ _catalog: dict[str, dict[str, list[dict]]] = {}
 _regions: dict[str, list[dict]] = {}
 # scheme -> set of (folded_a, folded_b) pairs fuzzy must never resolve across
 _blocked: dict[str, set[tuple[str, str]]] = {}
+# scheme -> [{name, schemes}] — CM Elevate's scheme-FAMILY groupings ("vehicles" =
+# 4 sub-schemes, "tourism" = 2, "PRIME" = 3, ...), loaded from the resolver YAML's
+# scheme_groupings.groups. Used only to catch a SINGULAR reference to one of these
+# families ("the vehicle scheme") that resolve_cm_scheme couldn't pin to one real
+# sub-scheme — see resolve_cm_scheme_group_ambiguity. The plural/group-breakdown
+# phrasing ("vehicle schemes", "compare the vehicle schemes") is a different,
+# already-answerable question (cmelevate_few_shot.yaml has worked examples) and
+# is left entirely to the SQL generator, same as before this was added.
+_scheme_groups: dict[str, list[dict]] = {}
 # scheme -> [{canonical, tokens, stage_order}] for the house_status closed set,
 # and scheme -> [{tokens, members}] for its derived stage groups. PMAY-G only in
 # practice; keyed by scheme to stay parallel with _catalog.
@@ -119,11 +128,12 @@ def load_all() -> None:
             _house_status[scheme] = []
             _house_status_groups[scheme] = []
             _regions[scheme] = []
+            _scheme_groups[scheme] = []
             continue
 
         dims = data.get("dimensions", {})
         _catalog[scheme] = {}
-        for dim_name in ("district", "block", "year", "assembly_constituency", "tranche_label"):
+        for dim_name in ("district", "block", "year", "assembly_constituency", "tranche_label", "cm_scheme"):
             values = dims.get(dim_name, {}).get("values", [])
             if values:
                 _catalog[scheme][dim_name] = values
@@ -151,10 +161,23 @@ def load_all() -> None:
             })
         _regions[scheme] = regs
 
+        groups: list[dict] = []
+        for name, g in (data.get("scheme_groupings", {}) or {}).get("groups", {}).items():
+            member_schemes = [str(s).strip() for s in (g.get("schemes") or []) if str(s).strip()]
+            if len(member_schemes) < 2:   # nothing to disambiguate
+                continue
+            groups.append({
+                "name": str(name).strip(),
+                "schemes": member_schemes,
+                "aliases": [str(a).strip() for a in (g.get("aliases") or []) if str(a).strip()],
+            })
+        _scheme_groups[scheme] = groups
+
         logger.info(
-            "entity_resolver: %s loaded — %s, %d blocked pairs, %d house_status phrases, %d regions",
+            "entity_resolver: %s loaded — %s, %d blocked pairs, %d house_status phrases, "
+            "%d regions, %d scheme groups",
             scheme, {k: len(v) for k, v in _catalog[scheme].items()}, len(pairs),
-            len(_house_status.get(scheme, [])), len(regs),
+            len(_house_status.get(scheme, [])), len(regs), len(groups),
         )
 
 
@@ -266,17 +289,47 @@ _TRANCHE_GUARD_RE = re.compile(r"tranc", re.IGNORECASE)
 # of all of them), which would silently pin a "which tranche" question to
 # whichever canonical happens to sort first. Require an actual number/ordinal
 # in the question before trusting the fuzzy match.
+#
+# CONFIRMED BUG (2026-09-11, from production query_audit.jsonl): the number
+# had to be ANYWHERE in the question, not next to "tranche" — so "What are
+# the top 3 districts ... across all financial years and tranches?" (a
+# follow-up rewrite that pulled "tranches" in from a PRIOR turn's "all
+# tranches" wording, with no tranche of its own in mind at all) matched this
+# guard purely off the unrelated "top 3", then the fuzzy stage below scored
+# "2nd tranche" at 90.9 against the combined "...top 3... tranches" text —
+# just over the 90-point accept bar — and silently pinned tranche_label to
+# "Tranch 2 - August". That value then flowed into both the SQL generator's
+# WHERE-clause hint AND the response composer's "Entity names" block, so the
+# composer reported "within the Tranch 2 - August data" for a query that was
+# never meant to be tranche-scoped at all (see
+# focusplus-tranche-context-not-carried-bug in project memory).
+#
+# Fixed by requiring the number/ordinal to sit immediately next to "tranch"
+# itself (either side, "tranche 2" / "2nd tranche" / "trance 3"), not merely
+# present somewhere in the sentence.
 _TRANCHE_NUMBER_RE = re.compile(
-    r"\b(?:[1-4]|one|two|three|four|first|second|third|fourth|1st|2nd|3rd|4th)\b",
+    r"\btranc\w*\s+(?:no\.?|number|#)?\s*"
+    r"(?:[1-4]|one|two|three|four|first|second|third|fourth|1st|2nd|3rd|4th)\b"
+    r"|\b(?:[1-4]|one|two|three|four|first|second|third|fourth|1st|2nd|3rd|4th)"
+    r"\s+tranc\w*",
     re.IGNORECASE,
 )
+
+
+def tranche_labels(scheme: str = "Focus Plus") -> list[str]:
+    """Every tranche_label canonical value for `scheme`, in catalogue order
+    (empty for a scheme with no tranche_label dimension, e.g. all but Focus
+    Plus). Used to build the "which tranche?" clarification chips."""
+    return [v["canonical"] for v in _catalog.get(scheme, {}).get("tranche_label", [])]
 
 
 def resolve_tranche_label(question: str, scheme: str = "Focus Plus") -> "Resolved | None":
     """Focus Plus tranche_label ("Tranch 1" .. "Tranch 4 - Feb-March") — a closed
     set of 4 the LLM mention-extractor doesn't cover (see resolve_house_status).
-    Scans the whole question and returns the exact stored label, fuzzy-matched
-    so a misspelling or missing space still resolves."""
+    Scans the whole question and returns every stored label it names (not just
+    the first — "compare tranche 1 and tranche 2" must resolve to both, the
+    same multi-value contract resolve_house_status uses), fuzzy-matched so a
+    misspelling or missing space still resolves."""
     values = _catalog.get(scheme, {}).get("tranche_label", [])
     if not values or not _TRANCHE_GUARD_RE.search(question):
         return None
@@ -285,25 +338,33 @@ def resolve_tranche_label(question: str, scheme: str = "Focus Plus") -> "Resolve
     squashed_q = _squash(folded_q)
 
     # Stage 1/2: exact canonical/alias phrase present verbatim in the question.
-    for v in values:
-        for c in [v["canonical"]] + v.get("aliases", []):
-            if fold(c) in folded_q:
-                return Resolved("resolved", "tranche_label", question,
-                                canonical=v["canonical"], confidence=1.0, display=v["canonical"])
+    # Collect every tranche named, not just the first one found, so a question
+    # naming two or more doesn't silently collapse to a single filter.
+    exact_hits = [v["canonical"] for v in values
+                  if any(fold(c) in folded_q for c in [v["canonical"]] + v.get("aliases", []))]
+    if exact_hits:
+        return Resolved("resolved", "tranche_label", question,
+                        canonical=exact_hits[0] if len(exact_hits) == 1 else None,
+                        confidence=1.0, values=exact_hits,
+                        display=" and ".join(exact_hits))
 
     # Stage 3: squashed containment — "tranch-2" / "Tranch 2" against alias "tranch2".
-    for v in values:
-        for c in [v["canonical"]] + v.get("aliases", []):
-            squashed_c = _squash(fold(c))
-            if squashed_c and squashed_c in squashed_q:
-                return Resolved("resolved", "tranche_label", question,
-                                canonical=v["canonical"], confidence=0.95, display=v["canonical"])
+    squash_hits = [v["canonical"] for v in values
+                   if any(_squash(fold(c)) and _squash(fold(c)) in squashed_q
+                          for c in [v["canonical"]] + v.get("aliases", []))]
+    if squash_hits:
+        return Resolved("resolved", "tranche_label", question,
+                        canonical=squash_hits[0] if len(squash_hits) == 1 else None,
+                        confidence=0.95, values=squash_hits,
+                        display=" and ".join(squash_hits))
 
     if not _TRANCHE_NUMBER_RE.search(question):
         return None
 
     # Stage 6: RapidFuzz partial-ratio over the whole question — catches a
     # genuine misspelling of both the word and the number ("3rd trance").
+    # Single-value only: a fuzzy pass over a multi-tranche comparison risks
+    # both mentions converging on the same nearest label.
     best_canon, best_score = None, 0.0
     for v in values:
         for c in [v["canonical"]] + v.get("aliases", []):
@@ -312,8 +373,165 @@ def resolve_tranche_label(question: str, scheme: str = "Focus Plus") -> "Resolve
                 best_score, best_canon = score, v["canonical"]
     if best_canon and best_score >= _FUZZY_ACCEPT:
         return Resolved("resolved", "tranche_label", question,
-                        canonical=best_canon, confidence=best_score / 100, display=best_canon)
+                        canonical=best_canon, confidence=best_score / 100,
+                        values=[best_canon], display=best_canon)
 
+    return None
+
+
+def resolve_cm_scheme(question: str, scheme: str = "CM Elevate") -> "Resolved | None":
+    """CM Elevate's 15 sub-schemes (scheme_name / cm_scheme_key) — a closed set
+    the LLM mention-extractor doesn't cover (see resolve_house_status,
+    resolve_tranche_label). cmelevate_entity_resolver.yaml flags this
+    dimension "resolve this first. No PMAY counterpart" — without a
+    deterministic resolver, a sub-scheme name that's typo'd or loosely phrased
+    ("diary development" for "Meghalaya Dairy Development Scheme") reaches the
+    SQL generator as raw text, which then has to guess a scheme_name literal;
+    a near-miss doesn't match storage exactly and silently counts zero rows
+    instead of erroring, and the response composer then reports the scheme as
+    "not covered" — wrong, and hard to catch because the query runs clean.
+
+    Scans the whole question and returns every stored scheme it names (not
+    just the first — "compare Piggery and Poultry" must resolve to both, the
+    same multi-value contract resolve_tranche_label uses); the fuzzy stage is
+    single-value only, same reasoning as resolve_tranche_label."""
+    values = _catalog.get(scheme, {}).get("cm_scheme", [])
+    if not values:
+        return None
+
+    padded = f" {fold(question)} "
+    squashed_q = _squash(fold(question))
+
+    def _forms(v: dict) -> list[str]:
+        return [v["canonical"], *(v.get("aliases", []) or [])]
+
+    # Stage 1/2: exact canonical/alias phrase present as a whole word/phrase in
+    # the question — word-boundary, not bare substring, because several
+    # aliases are short common words ("milk", "cow", "villa") that would
+    # otherwise collide with unrelated text (e.g. "villa" inside "village").
+    exact_hits: list[str] = []
+    for v in values:
+        for form in _forms(v):
+            ff = fold(form)
+            if ff and re.search(rf"(?<![A-Z0-9]){re.escape(ff)}(?![A-Z0-9])", padded):
+                exact_hits.append(v["canonical"])
+                break
+    exact_hits = list(dict.fromkeys(exact_hits))
+    if exact_hits:
+        return Resolved("resolved", "cm_scheme", question,
+                        canonical=exact_hits[0] if len(exact_hits) == 1 else None,
+                        confidence=1.0, values=exact_hits,
+                        display=" and ".join(exact_hits))
+
+    # Stage 3: squashed containment — "dairydevelopment", "prime-seed". Only
+    # MULTI-WORD forms are eligible: squashing drops the spaces that stage
+    # 1/2's word-boundary check relies on, so a short single-word alias
+    # ("villa", "cow") would otherwise match as a bare substring of an
+    # unrelated squashed word ("villa" inside "villages"). A single-word
+    # alias is already covered safely by stage 1/2 above.
+    squash_hits: list[str] = []
+    for v in values:
+        for form in _forms(v):
+            if " " not in form.strip():
+                continue
+            sf = _squash(fold(form))
+            if sf and len(sf) >= 5 and sf in squashed_q:
+                squash_hits.append(v["canonical"])
+                break
+    squash_hits = list(dict.fromkeys(squash_hits))
+    if squash_hits:
+        return Resolved("resolved", "cm_scheme", question,
+                        canonical=squash_hits[0] if len(squash_hits) == 1 else None,
+                        confidence=0.95, values=squash_hits,
+                        display=" and ".join(squash_hits))
+
+    # Stage 6: RapidFuzz partial-ratio over the whole question — catches a
+    # genuine misspelling ("diary development" for "Dairy Development").
+    # Only phrases of 6+ folded characters are eligible, so a short alias
+    # can't fuzzy-match noise in an unrelated question. Single-value only: a
+    # fuzzy pass over a multi-scheme comparison risks both mentions
+    # converging on the same nearest label. The accept bar plus the
+    # runner-up gap (same pair used everywhere else in this module) is what
+    # keeps two genuinely confusable schemes (e.g. Dairy vs Piggery,
+    # blocked_matches' own worked example) from resolving on a near-tie —
+    # not a separate blocklist check, which would also veto a clear winner
+    # that merely happens to have one of these schemes as its runner-up.
+    scores: dict[str, float] = {}
+    for v in values:
+        best_for_v = 0.0
+        for form in _forms(v):
+            ff = fold(form)
+            if len(ff) < 6:
+                continue
+            s = fuzz.partial_ratio(ff, padded)
+            if s > best_for_v:
+                best_for_v = s
+        if best_for_v:
+            scores[v["canonical"]] = best_for_v
+    if not scores:
+        return None
+    ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
+    best_canon, best_score = ranked[0]
+    runner_up_score = ranked[1][1] if len(ranked) > 1 else 0.0
+    if best_score >= _FUZZY_ACCEPT and best_score - runner_up_score >= _FUZZY_RUNNER_UP_GAP:
+        return Resolved("resolved", "cm_scheme", question,
+                        canonical=best_canon, confidence=best_score / 100,
+                        values=[best_canon], display=best_canon)
+
+    return None
+
+
+# Singular reference to a CM Elevate scheme-FAMILY word ("the vehicle scheme",
+# "a PRIME scheme") — cmelevate_entity_resolver.yaml's overloaded_terms section
+# documents these as "default: ask" (e.g. "vehicle": four schemes are not
+# interchangeable; "tourism": 403 applications against 3, picking wrong is not a
+# rounding error) with a worked example expecting sql: null and a candidate list.
+# That documentation was never wired to any code — resolve_cm_scheme alone returns
+# None for these (no single exact/fuzzy winner), and nothing upstream asked the
+# question; the SQL generator was then left to guess a scheme_name literal that
+# doesn't exist (confirmed live 2026-09-11: "the vehicle scheme" generated
+# `scheme_name = 'Meghalaya Vehicle Scheme'`, a name that isn't one of the real
+# 15, and silently returned 0 rows dressed up as a refusal).
+# Deliberately keyed on the SINGULAR "scheme" (not "schemes") — the plural asks a
+# different, already-answerable group-breakdown question (cmelevate_few_shot.yaml
+# has worked IN-list examples for "vehicle schemes"/"livestock schemes") and must
+# not be redirected into a clarification pause.
+_CM_GROUP_SINGULAR_CUE: dict[str, re.Pattern] = {
+    "vehicles": re.compile(r"\bvehicle scheme(?!s)\b", re.IGNORECASE),
+    "tourism": re.compile(r"\btourism scheme(?!s)\b", re.IGNORECASE),
+    "PRIME": re.compile(r"\bprime scheme(?!s)\b", re.IGNORECASE),
+    "livestock": re.compile(r"\blivestock scheme(?!s)\b", re.IGNORECASE),
+    "enterprise": re.compile(r"\benterprise scheme(?!s)\b", re.IGNORECASE),
+}
+
+
+def resolve_cm_scheme_group_ambiguity(question: str, scheme: str = "CM Elevate") -> "dict | None":
+    """{'group': name, 'schemes': [...]} when the question names a scheme-family
+    word in the singular that covers 2+ real CM Elevate sub-schemes, or None.
+    Callers should only invoke this after resolve_cm_scheme itself returned
+    nothing — a confident single/multi resolution from the real alias catalogue
+    always wins over this coarser family-word heuristic."""
+    for g in _scheme_groups.get(scheme, []):
+        cue = _CM_GROUP_SINGULAR_CUE.get(g["name"])
+        if cue and cue.search(question or ""):
+            return {"group": g["name"], "schemes": g["schemes"]}
+    return None
+
+
+def resolve_cm_scheme_group(question: str, scheme: str = "CM Elevate") -> "dict | None":
+    """{'group': name, 'schemes': [...]} when the question names one of these
+    scheme-family groups by its own registered PLURAL/collective alias
+    ("vehicle schemes", "livestock", "PRIME family", "transport schemes", ...)
+    — the group-BREAKDOWN reading cmelevate_few_shot.yaml has worked IN-list
+    examples for, as opposed to resolve_cm_scheme_group_ambiguity's singular
+    "which one?" reading. Exact word-boundary match, same discipline as
+    resolve_cm_scheme's own alias stage (stage 1/2)."""
+    padded = f" {fold(question)} "
+    for g in _scheme_groups.get(scheme, []):
+        for alias in g.get("aliases", []):
+            fa = fold(alias)
+            if fa and re.search(rf"(?<![A-Z0-9]){re.escape(fa)}(?![A-Z0-9])", padded):
+                return {"group": g["name"], "schemes": g["schemes"]}
     return None
 
 

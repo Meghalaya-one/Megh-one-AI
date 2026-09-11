@@ -750,3 +750,67 @@ sql_generation_examples:
            COUNT(*) FILTER (WHERE amount_released IS NULL) AS missing_amount_released,
            COUNT(*) FILTER (WHERE father_mother_name IS NULL) AS missing_parent_name
     FROM pmay_beneficiaries;
+- question: Which districts have more than 5000 PMAY houses?
+  sql: |
+    SELECT lgd_district, COUNT(*) AS houses
+    FROM curated.v_pmay
+    WHERE NOT is_placeholder
+    GROUP BY lgd_district
+    HAVING COUNT(*) > 5000
+    ORDER BY houses DESC
+    LIMIT 12;
+  tables:
+  - curated.v_pmay
+- question: Which districts have fewer than 500 completed houses?
+  sql: |
+    SELECT lgd_district, COUNT(*) FILTER (WHERE is_completed) AS completed_houses
+    FROM curated.v_pmay
+    WHERE NOT is_placeholder
+    GROUP BY lgd_district
+    HAVING COUNT(*) FILTER (WHERE is_completed) < 500
+    ORDER BY completed_houses ASC
+    LIMIT 12;
+  tables:
+  - curated.v_pmay
+- question: What percentage of total sanctioned amount does East Khasi Hills account for?
+  sql: |
+    SELECT ROUND(100.0 * SUM(sanctioned_amount) FILTER (WHERE lgd_district = 'EAST KHASI HILLS')
+                 / NULLIF(SUM(sanctioned_amount), 0), 2) AS east_khasi_hills_share_pct
+    FROM curated.v_pmay
+    WHERE NOT is_placeholder;
+  tables:
+  - curated.v_pmay
+- question: Average number of PMAY houses per district
+  sql: |
+    SELECT ROUND(AVG(houses), 2) AS avg_houses_per_district
+    FROM (
+      SELECT lgd_district, COUNT(*) AS houses
+      FROM curated.v_pmay
+      WHERE NOT is_placeholder
+      GROUP BY lgd_district
+    ) d;
+  tables:
+  - curated.v_pmay
+- question: Compare the Garo Hills and Khasi Hills regions on PMAY
+  sql: |
+    SELECT CASE
+             WHEN lgd_district IN ('EAST GARO HILLS', 'NORTH GARO HILLS',
+                                   'SOUTH GARO HILLS', 'SOUTH WEST GARO HILLS',
+                                   'WEST GARO HILLS')        THEN 'Garo Hills'
+             WHEN lgd_district IN ('EAST KHASI HILLS', 'EASTERN WEST KHASI HILLS',
+                                   'SOUTH WEST KHASI HILLS',
+                                   'WEST KHASI HILLS')       THEN 'Khasi Hills'
+             WHEN lgd_district IN ('EAST JAINTIA HILLS',
+                                   'WEST JAINTIA HILLS')     THEN 'Jaintia Hills'
+             WHEN lgd_district = 'RI BHOI'                   THEN 'Ri Bhoi'
+             ELSE 'Unassigned'
+           END AS region,
+           COUNT(*) AS houses,
+           COUNT(*) FILTER (WHERE is_completed) AS completed_houses
+    FROM curated.v_pmay
+    WHERE NOT is_placeholder
+    GROUP BY region
+    ORDER BY houses DESC;
+  tables:
+  - curated.v_pmay
+  note: 'Hill-range groupings are NOT a column in megh_db - they expand to a CASE over the district list. Districts must be uppercase to match storage.'

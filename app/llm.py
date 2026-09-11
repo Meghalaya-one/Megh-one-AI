@@ -265,6 +265,27 @@ async def call_response_composer(prompt: str) -> str:
     )
 
 
+async def call_sql_verifier(
+    prompt: str,
+    *,
+    guided: dict | None = None,
+) -> str:
+    """Second opinion on already-generated SQL — a distinct role from
+    call_classifier even though SQL_VERIFY_MODEL and CLASSIFIER_MODEL both
+    point at the same qwen4-deploy deployment."""
+
+    return await call_model(
+        base_url=settings.SQL_VERIFY_BASE_URL,
+        model=settings.SQL_VERIFY_MODEL,
+        api_key=settings.SQL_VERIFY_API_KEY,
+        prompt=prompt,
+        temperature=settings.SQL_VERIFY_TEMPERATURE,
+        max_tokens=200,
+        timeout=settings.SQL_VERIFY_TIMEOUT_SECONDS,
+        guided=guided if settings.GUIDED_DECODING_ENABLED else None,
+    )
+
+
 # ---------------------------------------------------------------------------
 # RAG-path model roles
 # ---------------------------------------------------------------------------

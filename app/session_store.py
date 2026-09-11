@@ -52,6 +52,8 @@ class ConversationState:
     year: int | None = None                       # year_key, e.g. 2024 for FY2024-25
     previous_year: int | None = None
     metric: str | None = None                     # last metric keyword the user asked about
+    tranche: str | None = None                    # single pinned Focus Plus tranche_label, if any
+    tranche_all_combined: bool = False            # True once "all tranches combined" was chosen
     comparison_entities: list[str] = field(default_factory=list)  # for "the former/latter/other one"
     comparison_kind: str | None = None            # "district" | "block" | "scheme" | "year"
     last_intent: str | None = None                # "DATA" | "KNOWLEDGE" | "EDGE" | "CLARIFY"
@@ -64,7 +66,9 @@ class ConversationState:
         return {
             "scheme": self.scheme, "district": self.district, "block": self.block,
             "village": self.village, "year": self.year, "previous_year": self.previous_year,
-            "metric": self.metric, "comparison_entities": list(self.comparison_entities),
+            "metric": self.metric, "tranche": self.tranche,
+            "tranche_all_combined": self.tranche_all_combined,
+            "comparison_entities": list(self.comparison_entities),
             "comparison_kind": self.comparison_kind, "last_intent": self.last_intent,
             "last_route": self.last_route, "last_question": self.last_question,
             "last_standalone_question": self.last_standalone_question,
@@ -77,7 +81,9 @@ class ConversationState:
         return cls(
             scheme=d.get("scheme"), district=d.get("district"), block=d.get("block"),
             village=d.get("village"), year=d.get("year"), previous_year=d.get("previous_year"),
-            metric=d.get("metric"), comparison_entities=list(d.get("comparison_entities") or []),
+            metric=d.get("metric"), tranche=d.get("tranche"),
+            tranche_all_combined=bool(d.get("tranche_all_combined")),
+            comparison_entities=list(d.get("comparison_entities") or []),
             comparison_kind=d.get("comparison_kind"), last_intent=d.get("last_intent"),
             last_route=d.get("last_route"), last_question=d.get("last_question"),
             last_standalone_question=d.get("last_standalone_question"),

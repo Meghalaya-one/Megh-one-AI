@@ -93,22 +93,60 @@ def load_all() -> None:
 
 # Metric/geo synonyms folded to one canonical token before overlap scoring, so
 # "how much was spent" matches the "expenditure" example and "man-days" matches
-# "person-days". Kept small and scheme-agnostic — just the words that actually
-# differ between how a user phrases a metric and how the few-shot file names it.
+# "person-days". Scheme-agnostic — just the words that actually differ between
+# how a user phrases something and how the few-shot file names it. Broadened
+# from the original small set (money-verb variants, plurals, superlatives) so
+# more phrasings of an already-covered question land on the right example
+# instead of only the exact wording the few-shot file happens to use.
 _FEWSHOT_SYNONYMS = {
+    # money paid out — collapse every verb a user might use for "how much
+    # money moved" to one bucket. Deliberately broad: for ranking purposes we
+    # only need the right MONEY example in-scheme, not to distinguish
+    # sanctioned-vs-released (schema_context.py rules still enforce that
+    # distinction in the generated SQL itself).
     "spend": "expenditure", "spending": "expenditure", "spent": "expenditure",
     "cost": "expenditure", "expense": "expenditure", "expenses": "expenditure",
+    "disbursed": "expenditure", "disburse": "expenditure",
+    "disbursement": "expenditure", "disbursements": "expenditure",
+    "disbursal": "expenditure", "disbursals": "expenditure",
+    "payout": "expenditure", "payouts": "expenditure",
+    "released": "expenditure", "outlay": "expenditure", "paidout": "expenditure",
+    "amount": "expenditure", "money": "expenditure", "fund": "expenditure",
+    "funds": "expenditure",
     "wagebill": "wages", "wage": "wages",
     "manday": "persondays", "mandays": "persondays", "persondays": "persondays",
     "workday": "persondays", "workdays": "persondays",
     "jobcard": "jobcards",
     "hh": "households", "household": "households",
     "house": "houses", "dwelling": "houses", "dwellings": "houses", "unit": "houses",
-    "disbursement": "disbursements", "disbursal": "disbursements", "disbursals": "disbursements",
-    "payout": "disbursements", "payouts": "disbursements",
-    "tranch": "tranche", "cohort": "batch",
+    "tranch": "tranche", "tranches": "tranche", "installments": "installment",
+    "cohort": "batch", "batches": "batch",
     "districts": "district", "blocks": "block", "villages": "village",
     "panchayat": "village", "gp": "village",
+    "panchayats": "village",
+    # generic plurals -> singular (only the ones actually used across the four
+    # schemes' few-shot files; not a general stemmer, so no risk of a wrong
+    # guess on a word we haven't checked).
+    "payments": "payment", "applications": "application", "schemes": "scheme",
+    "beneficiaries": "beneficiary", "records": "record", "years": "year",
+    "farmers": "farmer", "completions": "completion", "sanctions": "sanction",
+    "members": "member", "requests": "request", "statuses": "status",
+    "sites": "site", "stages": "stage", "women": "woman",
+    "women's": "woman",
+    "sanctioned": "sanction",
+    # superlatives/rank direction — canonicalised so "least"/"fewest"/"bottom"
+    # all retrieve a BOTTOM-N example and "most"/"top"/"maximum" all retrieve
+    # a TOP-N example, regardless of which specific word the question or the
+    # few-shot file happens to use.
+    "least": "lowest", "lowest": "lowest", "smallest": "lowest",
+    "minimum": "lowest", "fewest": "lowest", "bottom": "lowest",
+    "fewer": "lowest", "min": "lowest", "lower": "lowest", "worst": "lowest",
+    "most": "highest", "highest": "highest", "largest": "highest",
+    "maximum": "highest", "greatest": "highest", "top": "highest",
+    "greater": "highest", "max": "highest", "best": "highest",
+    "exceeding": "highest", "more": "highest",
+    # US/UK spelling variants seen across the reference docs.
+    "utilization": "utilisation", "program": "programme",
 }
 # Question-shape and filler words carry no signal for which example fits.
 _FEWSHOT_STOP = {
@@ -137,7 +175,7 @@ def _fewshot_score(q_tokens: set[str], example_question: str) -> float:
     return len(q_tokens & e) / (len(q_tokens | e) ** 0.5)
 
 
-def few_shot_examples(schemes: list[str], question: str = "", top_k: int = 4) -> list[dict]:
+def few_shot_examples(schemes: list[str], question: str = "", top_k: int = 5) -> list[dict]:
     """Up to top_k examples per scheme, question+sql only (tables not needed in-prompt).
 
     Ranked by token overlap with `question` so the examples the generator sees are

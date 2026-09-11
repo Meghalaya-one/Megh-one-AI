@@ -1197,6 +1197,55 @@ sql_generation_examples:
     Key discovery MUST be scoped to one scheme - 25 fields are common to all 15 schemes
     and 125 appear in exactly one.
 
+- question: How many CM Elevate applicants are associated with poultry sector?
+  sql: |
+    SELECT COUNT(*) FILTER (WHERE scheme_specific ->> 'sector_id' ILIKE 'poultry')
+             AS poultry_sector_applicants,
+           COUNT(*) FILTER (WHERE scheme_specific ->> 'sector_id' IS NOT NULL)
+             AS sector_recorded,
+           COUNT(*) AS scheme_total
+    FROM curated.v_cm_elevate
+    WHERE scheme_name = 'Meghalaya Poultry Farming Scheme';
+  tables:
+  - curated.v_cm_elevate
+  note: >
+    THE QUESTION NAMES "sector" - answer the sector field, don't silently collapse it
+    into the bare scheme total (that was tried and reported back as ignoring the
+    question, confirmed live 2026-09-11). sector_id needs THREE guards at once: it is
+    stored Title Case ('Poultry', not 'poultry' - compare with ILIKE, never an exact
+    lowercase match, or the filter silently returns 0); the "is it recorded" test MUST
+    be `->> 'sector_id' IS NOT NULL`, NEVER `? 'sector_id'` - the `?` has-key operator
+    is TRUE on all 501 rows because the key is present with a JSON null value on 475
+    of them, which silently makes the "recorded" count equal the scheme total (this
+    exact mistake shipped once already before being caught live); and it is recorded
+    on only 26 of the scheme's 501 rows even with the right predicate - a filtered
+    count with no denominator reads as either "the whole scheme" or "broken data"
+    depending which way it's wrong. State all three numbers: 21 have sector recorded
+    as Poultry, out of 26 rows where sector is recorded at all, out of 501 total
+    applicants under the scheme. Contrast with the NEXT example, which explicitly asks
+    for a breakdown "by" or "each" sector and groups by sector_id instead of filtering
+    to one value.
+
+- question: How many CM Elevate applicants are associated with each poultry sector?
+  sql: |
+    SELECT COALESCE(scheme_specific ->> 'sector_id', '(not recorded)') AS sector,
+           COUNT(*) AS applicants
+    FROM curated.v_cm_elevate
+    WHERE scheme_name = 'Meghalaya Poultry Farming Scheme'
+    GROUP BY 1
+    ORDER BY applicants DESC;
+  tables:
+  - curated.v_cm_elevate
+  note: >
+    THE KEY IS sector_id, NOT 'sector' - one keystroke wrong and `->>` silently returns
+    NULL for every row, which reads as "no matching records" even though the scheme has
+    501 real applicants (confirmed live 2026-09-11: this exact question was answered as a
+    refusal because the generator guessed 'sector'). sector_id exists only for Poultry,
+    Dairy and Goat Farming, and is mostly NULL even there (475 of 501 Poultry rows) - say
+    so rather than implying full coverage. "Sector" in a question about ONE already-named
+    scheme is not asking to filter further; COALESCE the NULLs into their own bucket
+    instead of dropping them.
+
 - question: How many scheme-specific fields does each scheme record?
   sql: |
     SELECT scheme_name, COUNT(DISTINCT k) AS fields

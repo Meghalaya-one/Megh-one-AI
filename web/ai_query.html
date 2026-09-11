@@ -1839,7 +1839,9 @@ function escapeHTML(s) {
 
 function hideWelcome() {
   if (!welcomeRemoved && welcome) {
-    welcome.style.display = 'none';
+    // The welcome card (scheme stats + "Try a question" samples) stays on
+    // screen above the messages at all times now — it is only ever shown,
+    // never hidden, so nothing here touches welcome.style.display.
     welcomeRemoved = true;
     // Restore the normal bottom clearance now that a real message needs room
     // above the fixed composer — see .chat-inner.is-welcome in the stylesheet.
@@ -2765,7 +2767,7 @@ async function openConversation(sid) {
     Object.keys(CI).forEach(killChart);
     window._QD = {};
     messages.innerHTML = '';
-    if (welcome) { welcome.style.display = 'none'; welcomeRemoved = true; }
+    hideWelcome();   // keeps the welcome card ON SCREEN, just drops the "no messages yet" padding
 
     for (const t of turns) {
       addMessage('user', t.question);
@@ -3534,14 +3536,34 @@ function openAdminPanel() {
 // while the login gate was up.
 let appStarted = false;
 async function unlockApp() {
-  document.body.classList.remove('locked', 'auth-pending');
+  // NOTE: .locked / .auth-pending are deliberately NOT cleared yet — the
+  // boot-splash (or login screen) stays up until the block below has decided,
+  // and for a resumed chat finished replaying, what the officer should see.
+  // Clearing them up front used to reveal the empty welcome screen for a beat
+  // before openConversation() swapped the real chat back in on every refresh.
   applyUserChip();
-  loadHistory();            // this officer's conversations
-  if (appStarted) return;
-  appStarted = true;
-  syncProductUI();
-  showGreeting(false);
-  renderUnifiedSamples(); // show the mixed quick-start questions
+  await loadHistory();      // this officer's conversations — awaited so we can
+                             // check below whether the current tab's session
+                             // is one of them before deciding what to show
+
+  if (!appStarted) {
+    appStarted = true;
+    syncProductUI();
+    showGreeting(false);
+    renderUnifiedSamples(); // "Try a question" samples — always populated; the
+                             // welcome card (this + the scheme stats) stays on
+                             // screen whether or not a conversation is replayed
+
+    // A page refresh keeps the same focusSessionId (sessionStorage), but the DOM
+    // itself always boots empty — nothing was replaying the conversation back in,
+    // so a refresh silently dropped the officer onto a chat with no messages
+    // instead of leaving them where they were. If this tab's session id already
+    // has recorded turns, replay it (the welcome card stays visible above it).
+    const existing = HISTORY.find(c => c.session_id === SESSION_ID);
+    if (existing) await openConversation(SESSION_ID);
+  }
+
+  document.body.classList.remove('locked', 'auth-pending');
 
   // Confirm where the scheme APIs live BEFORE anything calls them. Skipping
   // this is what made the overview cards fire at /focus/api/query and 404 when

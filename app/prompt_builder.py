@@ -99,7 +99,7 @@ def _live_schema_block(schemes: list[str]) -> str:
 
 
 def _fewshot_block(schemes: list[str], question: str = "") -> str:
-    examples = few_shot_examples(schemes, question, top_k=4)
+    examples = few_shot_examples(schemes, question, top_k=5)
     if not examples:
         return ""
     parts = []
@@ -182,9 +182,33 @@ def _entities_block(entity_result: dict) -> str:
                         "the entire category and return a false 0. Count status_name over "
                         "all rows.")
             elif k == "tranche_label":
-                lines.append(f"  tranche_label = {v!r}   -- exact stored Focus Plus label "
-                             "(spelled \"Tranch\", not \"Tranche\", plus a month suffix); use "
-                             "it verbatim, do NOT substitute the question's own spelling")
+                vals = v if isinstance(v, list) else [v]
+                quoted = ", ".join(f"'{s}'" for s in vals)
+                if len(vals) == 1:
+                    lines.append(f"  tranche_label = {quoted}   -- exact stored Focus Plus "
+                                 "label (spelled \"Tranch\", not \"Tranche\", plus a month "
+                                 "suffix); use it verbatim, do NOT substitute the question's "
+                                 "own spelling")
+                else:
+                    lines.append(
+                        f"  tranche_label IN ({quoted})   -- the {len(vals)} tranches "
+                        "explicitly named for comparison. Filter on ALL of them with IN and "
+                        "GROUP BY tranche_label so each gets its own row in the result — do "
+                        "NOT sum them into one figure.")
+            elif k == "cm_scheme":
+                vals = v if isinstance(v, list) else [v]
+                quoted = ", ".join(f"'{s}'" for s in vals)
+                if len(vals) == 1:
+                    lines.append(f"  scheme_name = {quoted}   -- exact stored CM Elevate "
+                                 "sub-scheme name (mixed case, stored exactly); use it "
+                                 "verbatim, do NOT substitute the question's own spelling "
+                                 "or wording for it")
+                else:
+                    lines.append(
+                        f"  scheme_name IN ({quoted})   -- the {len(vals)} sub-schemes "
+                        "explicitly named for comparison. Filter on ALL of them with IN and "
+                        "GROUP BY scheme_name so each gets its own row in the result — do "
+                        "NOT sum them into one figure.")
             else:
                 lines.append(f"  {k} = {v!r}")
     if notes:
@@ -225,4 +249,97 @@ def build_repair_prompt(question: str, schemes: list[str], entity_result: dict,
         f"Previous query:\n{failed_sql}\n",
         f'\nQuestion: "{question}"\n',
         "Return the corrected single read-only SELECT. SQL:",
+    ])
+
+
+_VERIFY_CALIBRATION = """
+CALIBRATION — how strict to be:
+Q: "How many payments were made in Tranch 2?"
+RESOLVED ENTITIES: tranche_label = 'Tranch 2 - August'
+SQL: SELECT COUNT(*) AS payments FROM curated.v_focus_plus WHERE tranche_label = 'Tranch 2 - August';
+{"ok": true}
+  (The resolved value IS the whole tranche — "Tranch 2 - August" is a closed-set
+  label, not a month filter layered on top of "Tranch 2". Using it verbatim is
+  correct, not a narrowing of scope.)
+
+Q: "How many MGNREGA person days in East Garo Hills?"
+RESOLVED ENTITIES: lgd_district = 'EAST GARO HILLS'
+SQL: SELECT SUM(person_days) AS person_days FROM curated.v_employment WHERE lgd_district = 'EAST GARO HILLS';
+{"ok": true}
+  (District-level question, district-level filter, on the resolved column. No
+  finer grain was asked for or required.)
+
+Q: "Compare person days between East Garo Hills and West Garo Hills"
+RESOLVED ENTITIES: lgd_district IN ('EAST GARO HILLS', 'WEST GARO HILLS')
+SQL: SELECT SUM(person_days) AS person_days FROM curated.v_employment WHERE lgd_district = 'EAST GARO HILLS';
+{"ok": false, "issue": "Comparison names two districts but the SQL filters on only one (WEST GARO HILLS is dropped), so the result has no second value to compare against."}
+  (This IS a real violation — a resolved value is silently missing from the SQL.)
+
+Q: "How much has been disbursed in Dalu block for Focus Plus?"
+RESOLVED ENTITIES: lgd_block = 'DALU'
+SQL: SELECT SUM(amount_disbursed) AS amount_raw FROM curated.v_focus_plus WHERE lgd_block = 'DALU' LIMIT 1;
+{"ok": true}
+  (SUM(...) IS the aggregation — a SUM/COUNT/AVG with no GROUP BY always returns
+  exactly one row, so the trailing LIMIT 1 is a harmless no-op, not evidence the
+  query is missing an aggregate. Read whether SUM/COUNT/AVG wraps the metric
+  column, never the presence of "LIMIT 1" by itself, to answer check 3.)
+""".strip()
+
+
+def build_verify_prompt(question: str, schemes: list[str], entity_result: dict, sql: str) -> str:
+    """Second-opinion check on already-generated SQL (app.llm.call_sql_verifier),
+    run before the query touches the database.
+
+    Deliberately narrower than the SQL-generation prompt: earlier versions
+    reused the full hand-written rules backbone (build_schema_context) and
+    told the small verifier model to check the SQL against "every rule" —
+    in testing that made it hallucinate violations on already-correct,
+    already-verified SQL (including the project's own few-shot examples) at
+    a high rate, because most of those rules describe how the ANSWER TEXT
+    should be worded (label multiple readings, state a figure as
+    provisional, read money_unit before formatting) rather than what the
+    SQL must contain, and a small model given a long prose rule list tends
+    to find "a" violation rather than confirm there is none. This version
+    hands it only the mechanical, checkable facts — real tables/columns,
+    prohibited joins, resolved entities — plus a closed checklist and two
+    worked "ok: true" examples so it has a calibration anchor for what a
+    passing query looks like, not just failing ones. Still does NOT include
+    the SQL-generation few-shot: those are for writing SQL, not judging it."""
+    return "".join([
+        _live_schema_block(schemes),
+        _prohibited_block(schemes),
+        _entities_block(entity_result),
+        "\n", _VERIFY_CALIBRATION, "\n",
+        "\nCheck the SQL below against ONLY these four things:\n"
+        "  1. Every PROHIBITED JOIN above — is one of them actually used?\n"
+        "  2. Every RESOLVED ENTITY above — is its exact value present in the "
+        "WHERE clause (not dropped, not substituted with different text from "
+        "the question)? Judge this ONLY against the RESOLVED ENTITIES block "
+        "above — an empty or absent block means there is nothing to check here, "
+        "so answer this check true regardless of the question's own wording. "
+        "A phrase in the QUESTION itself like 'all years', 'all tranches', "
+        "'all financial years', 'combined', 'overall' or 'cumulative' is NEVER "
+        "a resolved entity requiring a WHERE-clause value — it is an "
+        "instruction to filter on NOTHING for that dimension, so a WHERE "
+        "clause that omits it entirely is correct, not a violation. Do not "
+        "invent a resolved entity from question text that isn't in the "
+        "RESOLVED ENTITIES block.\n"
+        "  3. Table/grain — does it read a raw per-row table when the question "
+        "asks for a total (missing SUM/COUNT), or vice versa? Judge this ONLY by "
+        "whether SUM/COUNT/AVG wraps the metric column — a trailing LIMIT clause "
+        "proves nothing either way (a SUM/COUNT/AVG with no GROUP BY always "
+        "returns one row, so LIMIT 1 after one is normal, not a sign the "
+        "aggregate is missing).\n"
+        "  4. Metric column — does it aggregate a column that has nothing to "
+        "do with what the question asks for?\n"
+        "Nothing else is in scope. Do not judge phrasing, labelling, rounding, "
+        "unit formatting, or whether the answer text will explain a caveat — "
+        "those happen after this query runs, in a separate step, and are not "
+        "the SQL's job. If you cannot point to a SPECIFIC one of the four "
+        "checks above that this exact SQL fails, answer ok: true.\n",
+        f'\nQuestion: "{question}"\n',
+        f"\nGenerated SQL:\n{sql}\n",
+        '\nRespond with ONLY a JSON object: {"ok": true} if none of the four '
+        'checks are violated, or {"ok": false, "issue": "<which of the four '
+        'checks it fails, and how>"} if one is.\nJSON:',
     ])

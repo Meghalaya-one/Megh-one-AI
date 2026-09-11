@@ -22,11 +22,15 @@ from app.entity_resolver import (
     all_districts,
     detect_region,
     lookup_geo_term,
+    resolve_cm_scheme,
+    resolve_cm_scheme_group,
+    resolve_cm_scheme_group_ambiguity,
     resolve_dimension,
     resolve_house_status,
     resolve_tranche_label,
     resolve_village,
     scan_dimension,
+    tranche_labels,
 )
 from app.schema_context import SCHEME_CATALOG, available_metrics_text
 from app.session_store import Session
@@ -42,6 +46,23 @@ _DATA_HINTS = re.compile(
     r"person[\s-]?days?|expenditure|spend|spent|wage|wages|job cards?|"
     r"houses? (sanction|complet|released|pending)|sanctioned amount|amount released|"
     r"completion rate|utili[sz]ation rate|success rate|per ?cent|percentage|how much|"
+    # Focus Plus / CM Elevate metric nouns — a bare "<scheme> beneficiaries?" /
+    # "disbursements?" with no "how many" in front of it used to have no strong
+    # signal either way and fell through to the LLM classifier, which guessed
+    # KNOWLEDGE for "focus + beneficiaries?" and returned the glossary answer
+    # instead of a count (confirmed live 2026-09-11). These are count/amount
+    # nouns, not process words, so adding them carries the same low
+    # misroute risk as "person-days"/"expenditure" above.
+    r"beneficiar\w*|disburs\w*|"
+    # "How did people apply to CM Elevate?" asks for the recorded
+    # application_mode breakdown (online vs cmconnectcenter — a real, answerable
+    # count), not the application PROCESS ("how do I apply", "how to apply",
+    # already a _KNOWLEDGE_HINTS cue). Third-person/past-tense phrasing is the
+    # reliable signal that separates the two; the LLM classifier alone picked
+    # KNOWLEDGE here and gave a plausible-sounding but unverifiable portal
+    # description instead of the real online/cmconnectcenter split (confirmed
+    # live 2026-09-11, this exact CM Elevate few-shot question).
+    r"how (?:did|do|does) (?:people|applicants|users|they|most people) apply\b|"
     r"\bfy ?20\d\d|20\d\d-\d\d|crore|lakh|highest|lowest|most|least|"
     # correlation / cross-metric comparison phrasing — "do districts with high X
     # also have high Y", "is A related to B by district". These are answered by
@@ -61,6 +82,19 @@ _KNOWLEDGE_HINTS = re.compile(
     r"difference between|guidelines?|rules? for)\b",
     re.IGNORECASE,
 )
+
+# "What is the gender split of CM Elevate applicants?" / "what's the workflow
+# level breakdown?" both open with the strong _KNOWLEDGE_HINTS cue "what is",
+# which used to short-circuit straight to KNOWLEDGE before classify_intent's
+# LLM call ever ran. Adding "split"/"breakdown"/"distribution" into _DATA_HINTS
+# only removed that false shortcut — it still left the LLM to arbitrate, and it
+# guessed KNOWLEDGE for "workflow level breakdown" too (confirmed live
+# 2026-09-11: CM Elevate's own headline finding, "female-majority", and its
+# online/cmconnectcenter split were both unreachable this way). A "breakdown /
+# split / distribution" noun names a computed grouping over real records by
+# construction — there is no scheme-mechanics reading of it — so it can force
+# DATA outright, the same way _CROSS_SCHEME_SET_QUESTION does below.
+_BREAKDOWN_CUE = re.compile(r"\b(split|breakdown|distribution)\b", re.IGNORECASE)
 
 
 class OutOfScope(Exception):
@@ -226,6 +260,10 @@ async def rewrite_followup(question: str, prev: "object", extra_context: str = "
             "Rewrite the FOLLOW-UP as a complete, standalone question by reusing "
             "context from the PREVIOUS question. Keep the user's intent; change only "
             "what the follow-up changes (e.g. a different district, year, or metric). "
+            "Do not introduce any district, year, tranche, scheme, category or other "
+            "filter that is not present in the PREVIOUS question, the PREVIOUS answer, "
+            "the Known context below, or the FOLLOW-UP itself — when in doubt, leave it "
+            "out rather than guess one. "
             "Return ONLY the rewritten question, nothing else.\n\n"
             + (f"{extra_context}\n\n" if extra_context else "")
             + f'PREVIOUS question: "{prev.question}"\n'
@@ -284,6 +322,16 @@ _INTENT_JSON_SCHEMA = {
     "type": "object",
     "properties": {"intent": {"type": "string", "enum": ["DATA", "KNOWLEDGE"]}},
     "required": ["intent"],
+}
+# No `required: ["issue"]` — the verifier only needs to emit "issue" when
+# ok is false; a passing query should cost the fewest tokens possible.
+_SQL_VERIFY_JSON_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "ok": {"type": "boolean"},
+        "issue": {"type": "string"},
+    },
+    "required": ["ok"],
 }
 # Force the SQL completion to open on a bare SELECT/WITH (optionally after
 # whitespace). Body is unconstrained — this enforces statement shape, not a SQL
@@ -373,12 +421,23 @@ def _correct_scheme_spelling(question: str) -> str:
     if not question:
         return question
 
+    # A scheme already named correctly elsewhere in the question (exact match,
+    # e.g. "CM ELEVATE") must not also be "corrected" word-by-word below — the
+    # lone word "Elevate" fuzzy-matches the "cmelevate" alias on its own
+    # (fuzz.ratio("elevate", "cmelevate") ~= 87.5, over the 80 threshold), so
+    # without this guard "CM ELEVATE" gets the already-present "CM" duplicated
+    # into "CM CM Elevate" (and worse on a second pass, e.g. a resumed
+    # clarification chip, into "CM CM CM Elevate").
+    _already_named = {s for s, pat in _SCHEME_NAME_PATTERN.items() if pat.search(question)}
+
     def _sub(m: "re.Match") -> str:
         word = m.group(0)
         if len(word) < 5:
             return word
         wl = word.lower()
         for scheme, aliases in _SCHEME_FUZZY_ALIASES.items():
+            if scheme in _already_named:
+                continue
             if wl in aliases:
                 return word
             if any(fuzz.ratio(wl, a) >= _FUZZY_SCHEME_ACCEPT for a in aliases):
@@ -428,14 +487,21 @@ _MGNREGA_ONLY_TERMS = re.compile(
 )
 _PMAY_ONLY_TERMS = re.compile(
     r"\b(house|houses|housing|dwelling units?|pucca house|kutcha house|"
-    r"sanctioned houses?|instal?ments?|tranche|geotag|"
+    r"sanctioned houses?|instal{1,2}ments?|geotag|"
+    # "tranche"/"tranch" is deliberately NOT here, even though PMAY-G also has
+    # an installments_paid column. Focus Plus's own vocabulary IS "tranche"
+    # (its stored column is literally tranche_label); PMAY-G's own vocabulary
+    # is "installment" (instal?ments? above already covers it). A bare
+    # "tranche 1 vs tranche 2" with no scheme named should default to Focus
+    # Plus, not pause — see _FOCUSPLUS_ONLY_TERMS below, which is where
+    # "tranche" is claimed.
     r"completion certificate|house status|awaas|awas|"
     # "sanctioned"/"released"/"pending" amount phrasing is PMAY-specific — MGNREGA
     # never "sanctions" anything (it has expenditure), CM Elevate has no money
-    # column at all, and Focus Plus vocabulary is "disbursement"/"payment"/
-    # "tranche", not "sanctioned". Without these, a bare "how much sanctioned
-    # amount has been released in [village]?" (no scheme named) fell through to
-    # an unnecessary "which scheme?" pause instead of being understood as PMAY-G.
+    # column at all, and Focus Plus vocabulary is "disbursement"/"payment", not
+    # "sanctioned". Without these, a bare "how much sanctioned amount has been
+    # released in [village]?" (no scheme named) fell through to an unnecessary
+    # "which scheme?" pause instead of being understood as PMAY-G.
     # Plural "amounts"/"numbers" ('s?') — the singular-only forms below missed
     # "sanctioned amountS" (PMAY-OFF-023) and "amount released" is fine as a
     # fixed phrase, but sanction NUMBER(S) (PMAY-OFF-026) had no pattern at all.
@@ -448,11 +514,15 @@ _PMAY_ONLY_TERMS = re.compile(
     re.IGNORECASE,
 )
 # Focus Plus is a Meghalaya STATE farmer cash-benefit scheme. These terms name it or
-# its scheme-specific machinery and belong to no other scheme. "tranche" / "batch" /
-# "disbursement" are deliberately left out — they are shared vocabulary (PMAY also has
-# tranches), so an unnamed question that only uses those still asks "which scheme?".
+# its scheme-specific machinery and belong to no other scheme. "tranche"/"tranch" is
+# claimed HERE, not left shared with PMAY-G: it's Focus Plus's actual vocabulary (the
+# stored column is tranche_label), while PMAY-G's own word for the same idea is
+# "installment" (see _PMAY_ONLY_TERMS). "batch"/"disbursement" are still left out —
+# those really are generic enough that an unnamed question using only those still
+# asks "which scheme?".
 _FOCUSPLUS_ONLY_TERMS = re.compile(
     r"\bfocus[\s-]?plus\b|\bfocus\s*\+|\bfocusplus\b|"
+    r"\btranche?s?\b|"
     r"\bproducer group\b|\bproducer-group\b|\bproducer groups\b|"
     r"\bmeghalayaone\b|\bmbda\b|\bmeghalaya basin development\b|"
     r"\bfocus\+?\s*card\b|\b93k\b|\b12\.5k\b",
@@ -470,7 +540,20 @@ _CMELEVATE_ONLY_TERMS = re.compile(
     r"\bprime small enterprise\b|\bprime tourism vehicle\b|"
     r"\bprime agriculture response vehicle\b|\bgreen taxi\b|"
     r"\bcinema theatre scheme\b|\bsports and wellness centre\b|"
-    r"\bany business venture\b|\brequest_?id\b",
+    r"\bany business venture\b|\brequest_?id\b|"
+    # Missing sub-scheme/commodity words and the scheme-FAMILY phrases
+    # (vehicle/tourism/PRIME/livestock/enterprise scheme(s)) — without these,
+    # a question naming only this vocabulary (no literal "CM Elevate") fell
+    # through to the generic 4-way "MGNREGA, PMAY-G, Focus Plus, or CM
+    # Elevate?" pause instead of being recognized as CM Elevate at all, even
+    # though resolve_cm_scheme's own alias catalogue (or, for the family
+    # words, resolve_cm_scheme_group_ambiguity) can place it precisely
+    # (confirmed live 2026-09-11: "gender split for the tourism vehicle
+    # scheme" and "applications under the vehicle schemes" both asked the
+    # top-level 4-scheme question despite being unambiguously CM Elevate).
+    r"\bdairy\b|\bvehicle schemes?\b|\btourism vehicle\b|\btourism schemes?\b|"
+    r"\bprime schemes?\b|\bprime family\b|\blivestock schemes?\b|"
+    r"\benterprise schemes?\b",
     re.IGNORECASE,
 )
 
@@ -533,6 +616,38 @@ def _scheme_clarification(question: str) -> "ClarificationNeeded":
     )
 
 
+# ── CM Elevate: "the vehicle scheme?" — which of several real sub-schemes? ──
+# The phrase used to name a scheme-FAMILY the question named in the singular
+# (resolve_cm_scheme_group_ambiguity's match) — swapped out for each candidate's
+# real scheme_name so the resumed question resolves cleanly via resolve_cm_scheme's
+# own exact-alias stage, same trick _scheme_option_question uses for the top-level
+# 4-scheme pause above.
+_CM_GROUP_PHRASE = {
+    "vehicles": re.compile(r"\bvehicle scheme(?!s)\b", re.IGNORECASE),
+    "tourism": re.compile(r"\btourism scheme(?!s)\b", re.IGNORECASE),
+    "PRIME": re.compile(r"\bprime scheme(?!s)\b", re.IGNORECASE),
+    "livestock": re.compile(r"\blivestock scheme(?!s)\b", re.IGNORECASE),
+    "enterprise": re.compile(r"\benterprise scheme(?!s)\b", re.IGNORECASE),
+}
+
+
+def _cm_scheme_group_clarification(question: str, group: dict) -> "ClarificationNeeded":
+    stem = question.strip().rstrip(" ?.")
+    schemes = group["schemes"]
+    phrase_re = _CM_GROUP_PHRASE.get(group["group"])
+    options = []
+    for s in schemes:
+        new_q = phrase_re.sub(s, stem, count=1) if phrase_re else None
+        options.append({"label": s, "question": new_q if new_q and new_q != stem else f"{stem} — {s}"})
+    all_list = ", ".join(schemes[:-1]) + " and " + schemes[-1]
+    return ClarificationNeeded(
+        f"“{group['group']}” covers {len(schemes)} separate CM Elevate schemes — "
+        f"{all_list} — and they are not interchangeable. Which one did you mean?",
+        options=options,
+        rule="cm-scheme-group-ambiguous",
+    )
+
+
 # Plain-language, user-facing scheme summaries — separate from SCHEME_CATALOG
 # in schema_context.py, which is written for the SQL-generation prompt (DB
 # grain, money units, join keys) and reads as database jargon to an end user.
@@ -552,8 +667,25 @@ _SCHEME_USER_SUMMARY = {
 # and concisely instead of falling through to RAG, which has no single document
 # listing all 4 schemes and tends to elaborate at length on whichever one scores
 # highest in vector search (QA repeatedly saw an over-detailed PMAY-only answer).
+#
+# The bare "(what|which) schemes?" alternative used to have NO tail anchor, so it
+# also swallowed every "which scheme has the most applications?" / "which scheme
+# dominates each district?" / "which schemes are not statewide?" DATA question —
+# CM Elevate's few-shot corpus alone has a dozen of exactly this shape (superlative
+# or filter questions over its 15 sub-schemes), and every one of them was being
+# answered with the generic four-scheme blurb instead of a real query (confirmed
+# live 2026-09-11: "which scheme has the most applications under CM Elevate?" ->
+# the canned listing, never reaching classify_scheme/resolve_entities/SQL gen).
+# Anchoring the bare form to the tail of the question — "which schemes?" / "what
+# schemes are there/available/offered/supported" / "do you have/know/cover" —
+# keeps the genuinely scheme-agnostic listing asks while letting a superlative or
+# filter question (which always has more text after "scheme(s)") fall through to
+# normal DATA routing.
 _SCHEME_LISTING_CUE = re.compile(
-    r"\b(what|which) schemes?\b|\bschemes? (?:are|is) available\b|"
+    r"\b(?:what|which) schemes?\??\s*$|"
+    r"\b(?:what|which) schemes?\b\s*(?:are\s+(?:there|available|offered|supported)|"
+    r"exist|do (?:you|i) (?:have|know|cover)|can you (?:tell|list))\b|"
+    r"\bschemes? (?:are|is) available\b|"
     r"\blist (?:the |all )?schemes?\b|\bschemes? (?:do you|you) (?:support|cover|know|have)\b|"
     r"\bwhat (?:can|do) you (?:help with|assist with|cover)\b",
     re.IGNORECASE,
@@ -611,6 +743,20 @@ _SCHEME_COMPARISON_CUE = re.compile(
     r"\bdifference between\b.{0,60}\b(mgnrega|pmay|focus\s*plus|cm\s*elevate)\b.{0,20}\b(and|vs\.?|versus)\b",
     re.IGNORECASE,
 )
+# "compare Focus Plus and CM Elevate schemes BY BENEFICIARIES" / "... by amount" /
+# "... by expenditure" names a real figure to pull from megh_db, not "how do the
+# schemes differ conceptually" — _SCHEME_COMPARISON_CUE's bare "compare ... schemes"
+# still matches that (it doesn't require a metric to be absent), so without this
+# guard _scheme_comparison_answer intercepts a genuine statistics question at step
+# 0-a, before classify_intent / DATA routing ever runs, and answers it with the
+# canned RAG-style scheme blurb instead of a queried number.
+_SCHEME_COMPARISON_METRIC_GUARD = re.compile(
+    r"\b(beneficiar\w*|amount|amounts|expenditure|spend\w*|wages?|"
+    r"person[\s-]?days?|job\s?cards?|houses?|disburs\w*|payments?|"
+    r"number of|how many|how much|count of|total|percentage|per ?cent|"
+    r"\brate\b)\b",
+    re.IGNORECASE,
+)
 
 
 def _scheme_comparison_clarification() -> "ClarificationNeeded":
@@ -632,7 +778,21 @@ def _scheme_comparison_clarification() -> "ClarificationNeeded":
 def _scheme_comparison_answer(question: str) -> "dict | None":
     if not _SCHEME_COMPARISON_CUE.search(question or ""):
         return None
+    if _SCHEME_COMPARISON_METRIC_GUARD.search(question or ""):
+        return None  # names a real figure — let classify_intent send it to DATA
     named = _named_schemes(question)
+    if len(named) == 1 or (not named and _infer_scheme_from_terms(question) is not None):
+        # The question already resolves to exactly one of the 4 top-level schemes
+        # — this is a WITHIN-scheme comparison ("compare Piggery and Poultry
+        # schemes under CM Elevate", "compare the three PRIME schemes"), not a
+        # cross-scheme "MGNREGA vs PMAY-G" ask. CM Elevate's 15 sub-units are
+        # themselves called "schemes", so the bare _SCHEME_COMPARISON_CUE word
+        # "scheme(s)" fires here too; asking "which of the 4 schemes?" is
+        # nonsensical when the question already named the one it means (confirmed
+        # live 2026-09-11: "compare Piggery and Poultry schemes under CM Elevate"
+        # raised the 4-way clarification instead of running the sub-scheme
+        # comparison in cmelevate_few_shot.yaml). Let normal DATA routing handle it.
+        return None
     if len(named) < 2:
         raise _scheme_comparison_clarification()
     targets = named
@@ -976,7 +1136,7 @@ _BARE_METRIC_CUE = re.compile(
     r"wages?|wage bill|job cards?|muster rolls?|"
     r"houses?(?:\s+(?:sanctioned|completed|approved|released|pending))?|"
     r"dwelling units?|sanctioned amount|amount released|"
-    r"instal?ments?|disbursements?|utili[sz]ation)\b",
+    r"instal{1,2}ments?|disbursements?|utili[sz]ation)\b",
     re.IGNORECASE,
 )
 # The question already fixes its own scope (a breakdown, a trend, a comparison
@@ -999,6 +1159,20 @@ _HAS_BREAKDOWN = re.compile(
     r"(?:\d+\s+)?(?:districts?|blocks?|villages?|panchayats?|gps?)\b|"
     r"\b\d+\s+(?:largest|biggest|smallest|highest|lowest)\s+"
     r"(?:districts?|blocks?|villages?|panchayats?|gps?)\b|"
+    # "which district received the highest ...", "district with the lowest
+    # ..." — the same rank-window logic as "top N districts" above, just
+    # phrased as "which <geo> ... <superlative>" instead of "<superlative>
+    # <geo>". Still inherently spans every area in the dimension, so
+    # geography is already scoped; only the year is still open. Anchored
+    # loosely (superlative anywhere within ~40 chars either side of the
+    # geography noun) so "which district received the highest total
+    # disbursement" and "highest total expenditure in which district" both
+    # match.
+    r"\bwhich (?:district|block|village|panchayat|gp)\b[^?]{0,40}\b"
+    r"(?:highest|lowest|most|least|maximum|minimum|greatest|top|biggest|"
+    r"largest|smallest)\b|"
+    r"\b(?:highest|lowest|most|least|maximum|minimum|greatest|top|biggest|"
+    r"largest|smallest)\b[^?]{0,40}\bwhich (?:district|block|village|panchayat|gp)\b|"
     r"\bacross (?:the )?(?:districts?|blocks?|villages?|panchayats?|state|years?)\b",
     re.IGNORECASE,
 )
@@ -1128,6 +1302,29 @@ def _scope_clarification(question: str, schemes: list[str]) -> "ClarificationNee
     for s in schemes or []:
         for d in all_districts(s):
             seen.setdefault(d, None)
+    # Schemes with NO time dimension at all (CM Elevate — see
+    # _needs_year_clarification's identical check) still need the AREA half of
+    # this ask (a bare "how many applications" is a real, useful district-level
+    # question, and CM Elevate's own few-shot corpus has district-scoped
+    # examples) — but asking "and which financial year?" on top is nonsensical
+    # when no year exists anywhere on the fact. Reword rather than skip the
+    # gate outright (an earlier pass tried skipping it entirely and lost the
+    # district ask too — see cmelevate-routing-gates-bug memory).
+    live = [s for s in (schemes or []) if s in _SCHEME_DATA_YEARS]
+    area_only = bool(live) and all(not _SCHEME_DATA_YEARS[s] for s in live)
+    if area_only:
+        options = [{"label": d, "question": f"{stem} for {d}"} for d in seen]
+        options.append({
+            "label": "All of Meghalaya",
+            "question": f"{stem} for all of Meghalaya",
+        })
+        return ClarificationNeeded(
+            "Which area should the answer cover — a specific district, block, or "
+            "village? Pick a district below, or choose the statewide total; you can "
+            "also just type a block or village name.",
+            options=options,
+            rule="scope-not-specified",
+        )
     options = [{"label": d, "question": f"{stem} for {d}"} for d in seen]
     options.append({
         "label": "All of Meghalaya, all years",
@@ -1245,7 +1442,15 @@ _METRIC_OR_BREAKDOWN_CUE = re.compile(
     r"\b(how many|how much|number of|count of|no\.? of|total|sum of|average|avg|mean|"
     r"person[\s-]?days?|expenditure|spend(?:ing)?|spent|wages?|wage bill|job cards?|"
     r"muster rolls?|houses?|dwelling units?|sanctioned amount|amount released|"
-    r"instal?ments?|disbursements?|utili[sz]ation|completion rate|success rate|"
+    r"instal{1,2}ments?|disbursements?|utili[sz]ation|completion rate|success rate|"
+    # Focus Plus's own metric nouns — same gap as _DATA_HINTS (see 2026-09-11
+    # fix note there): without these, a bare "<scheme> beneficiaries?" matched
+    # neither this cue nor _MENTIONS_TRANCHE_WORD, so both the year AND
+    # tranche clarification gates were skipped and an unscoped question
+    # reached the SQL generator with no year/tranche pin at all — which then
+    # sometimes guessed a specific tranche on its own instead of correctly
+    # reasoning "no tranche named -> every tranche".
+    r"beneficiar\w*|payments?|"
     r"compare|comparison|versus|\bvs\.?\b|rank(?:ed|ing)?|top \d|highest|lowest|"
     r"most|least|by district|by block|by village|by panchayat|"
     r"district[\s-]?wise|block[\s-]?wise|village[\s-]?wise)\b",
@@ -1322,6 +1527,130 @@ def _year_clarification(question: str, schemes: list[str]) -> "ClarificationNeed
         "combined?",
         options=options,
         rule="year-not-specified",
+    )
+
+
+# ── "Which tranche?" clarification (Focus Plus only) ───────────────────────
+# Focus Plus's amount_disbursed differs sharply by tranche_label (5,000 for
+# Tranch 1, 2,500 for every later tranche — see schema_context.py rule 7), so
+# silently summing every tranche together produces a total that reads as a
+# single entitlement when it's actually a mix ratio. Mirrors
+# _needs_year_clarification / _year_clarification in shape: ask with one-tap
+# chips (Tranch 1..4 plus "all combined") rather than guess, unless the
+# question already names a tranche, asks for a per-tranche breakdown, or
+# explicitly wants every tranche combined.
+_TRANCHE_BREAKDOWN_CUE = re.compile(
+    r"\bby tranche\b|\btranche[\s-]?wise\b|\bper tranche\b|\beach tranche\b|"
+    r"\bacross (?:all )?(?:the )?tranches\b|\btranche breakdown\b|"
+    r"\bsplit by tranche\b|\bbreak(?:down|\s+down)? by tranche\b|"
+    # "which tranche has the most X" / "what tranche..." asks the data to
+    # identify one BY comparing across all of them — the opposite of a
+    # question that's missing a tranche pin, so it must not be asked to pick.
+    r"\bwhich tranche\b|\bwhat tranche\b",
+    re.IGNORECASE,
+)
+_ALL_TRANCHES_CUE = re.compile(
+    r"\ball[\s-]?tranches?\b|\btranches? combined\b|\bcombined tranches?\b|"
+    r"\bcumulative\b|\boverall\b|\bin total\b|\bgrand total\b|\ball[\s-]?time\b",
+    re.IGNORECASE,
+)
+# The literal word "tranche"/"tranch" appearing anywhere with no specific
+# tranche resolved (resolve_tranche_label found nothing) is itself the
+# clearest possible signal that the question is tranche-scoped but doesn't
+# say which one — regardless of whether the wording also happens to match
+# _METRIC_OR_BREAKDOWN_CUE. That cue was borrowed from the year gate and is
+# tuned for money/count metrics ("how much", "disbursements"); it has no
+# "status" or "breakdown" vocabulary, so "give me status breakdown for
+# tranche?" matched neither cue and silently fell through to the SQL
+# generator, which picked one tranche (Tranch 4) on its own with nothing
+# to base that choice on.
+_MENTIONS_TRANCHE_WORD = re.compile(r"\btranche?s?\b", re.IGNORECASE)
+
+# focus_status / verification_status / gender / occupation are populated ONLY
+# on the '12.5K' cohort, which per FOCUS PLUS RULES rule 8 exists ONLY at
+# Tranch 4 (schema_context.py _FOCUSPLUS_RULES #4, #8). A question about one of
+# these columns has no real "which tranche?" to ask — every other tranche has
+# zero such rows, so "all tranches combined" and "Tranch 4" are the same
+# answer. Pausing to ask anyway produces a rewritten question ("... across all
+# tranches") that then fights the Tranch-4-only constraint during SQL
+# generation and burns the repair budget for nothing — skip the gate instead
+# and let it hit the existing focus_status few-shots directly (see
+# "How many Focus Plus registrations are still pending?" in
+# data/focus_plus/focusplus_few_shot.yaml).
+_PERSON_LEVEL_COLUMN_CUE = re.compile(
+    r"\bfocus[\s-]?status\b|\bverification[\s-]?status\b|\bverified\b|\bverification\b|"
+    r"\bgender\b|\bfemale\b|\bmale\b|\bwomen\b|\bmen\b|"
+    r"\boccupation\b|\bfarmers?\b|"
+    r"\bpending\b|\bapproved\b|\brejected\b|\bregistrations?\b",
+    re.IGNORECASE,
+)
+
+
+def _needs_tranche_clarification(question: str, schemes: list[str], resolved: dict,
+                                  *, already_all_combined: bool = False) -> bool:
+    """True when Focus Plus is the ONLY scheme in play, the question is a
+    metric / breakdown question, and it pins no tranche — not in its text
+    (resolve_tranche_label found nothing during resolve_entities) and not via
+    a resolved entity — and doesn't ask for a per-tranche breakdown or an
+    explicit "all tranches combined". Callers must have run resolve_entities
+    first so `resolved` reflects any tranche actually named. Scoped to
+    single-scheme Focus Plus questions only, not "Focus Plus" in schemes —
+    a cross-scheme comparison (schemes has more than one entry) wants one
+    row per scheme, not Focus Plus fragmented into its four tranches on top,
+    and that flow already has its own tuned behaviour this must not disturb.
+
+    `already_all_combined` (optional): True when this session already
+    answered a Focus Plus question with "all tranches combined" earlier in
+    the conversation (see context_manager's ConversationState.tranche_all_combined
+    / session_store) and the current turn is a short follow-up that never
+    re-says "tranche" at all — e.g. "give me top 3 only" right after "...
+    across all tranches". Without this, that kind of bare follow-up has no
+    tranche cue of its own, re-trips this gate, and either re-asks a question
+    the user just answered or (worse) falls through to the SQL generator with
+    no tranche signal and no memory of the choice already made."""
+    if not settings.TRANCHE_CLARIFY_ENABLED:
+        return False
+    if (schemes or []) != ["Focus Plus"]:
+        return False
+    q = question or ""
+    if resolved.get("tranche_label"):
+        return False
+    if already_all_combined:
+        return False
+    if _TRANCHE_BREAKDOWN_CUE.search(q) or _ALL_TRANCHES_CUE.search(q):
+        return False
+    # A question about a person-level / cohort-locked column is always
+    # confined to the 12.5K cohort at Tranch 4 regardless of what the user
+    # says about tranche — asking "which tranche?" has no real answer to
+    # collect, so skip straight past the gate.
+    if _PERSON_LEVEL_COLUMN_CUE.search(q):
+        return False
+    # Trigger on either signal: a money/count metric question with no tranche
+    # named (mirrors the year gate), OR the question literally says
+    # "tranche"/"tranch" without pinning which one — covers status/verification
+    # breakdowns and any other phrasing _METRIC_OR_BREAKDOWN_CUE doesn't know.
+    if not (_METRIC_OR_BREAKDOWN_CUE.search(q) or _MENTIONS_TRANCHE_WORD.search(q)):
+        return False
+    return True
+
+
+def _tranche_clarification(question: str) -> "ClarificationNeeded":
+    stem = question.strip().rstrip(" ?.")
+    labels = tranche_labels("Focus Plus")
+    options = [
+        {"label": lbl, "question": f"{stem} for {lbl}"}
+        for lbl in labels
+    ]
+    options.append({
+        "label": "All tranches combined",
+        "question": f"{stem} across all tranches",
+    })
+    label_list = ", ".join(labels[:-1]) + f" and {labels[-1]}" if len(labels) > 1 else labels[0]
+    return ClarificationNeeded(
+        f"Focus Plus data is split into {label_list}. Which of these is required "
+        "— a single tranche, or all of them combined?",
+        options=options,
+        rule="tranche-not-specified",
     )
 
 
@@ -1586,7 +1915,36 @@ def _clean_mention(value: str) -> str | None:
     core = re.sub(r"^(the|a|an|this|that|each|every|all)\s+", "", v, flags=re.IGNORECASE).strip()
     if not core or core.lower() in _GENERIC_PLACE_TERMS:
         return None
+    # A scheme name is never a place — "... for Focus Plus" reads like a place
+    # after a preposition (the extractor prompt deliberately teaches it to
+    # follow "of"/"for"/"under" onto place names), so the model occasionally
+    # tags the scheme itself as the district/block/village. Reject it here as
+    # a deterministic backstop regardless of what the LLM returned, or it goes
+    # on to fail district/block/village resolution and gets reported as a
+    # place "not in Meghalaya" (reported 2026-09-10: "which district received
+    # highest total disbursement for Focus Plus" -> mentions.district ==
+    # "Focus Plus" -> OutOfScope).
+    if any(rx.search(core) for rx in _SCHEME_NAME_PATTERN.values()):
+        return None
     return v
+
+
+def _mention_in_question(value: str, question: str) -> bool:
+    """True when `value` actually occurs in `question`, case-insensitively and
+    tolerant of whitespace differences. The extractor prompt requires every
+    span to be copied verbatim from the question text, so a value that fails
+    this check isn't a real span — it's a hallucination, not an extraction.
+    Guards against the classifier echoing one of its own few-shot examples
+    (reported 2026-09-11: "Top 5 CM Elevate schemes by applications" — no
+    year mentioned anywhere in the text — came back with {"year": "2017-18"},
+    lifted straight from the FY 2017-18 example in the prompt. For a
+    zero-time-dimension scheme like CM Elevate that phantom year immediately
+    tripped the "no date field" refusal, and because "2017-18" isn't literally
+    in the question, the refusal's own year-stripping regex had nothing to
+    strip — the follow-up chip resent the identical question text and looped
+    forever)."""
+    norm = lambda s: re.sub(r"\s+", " ", s or "").strip().lower()
+    return norm(value) in norm(question)
 
 
 async def extract_entity_mentions(question: str) -> dict:
@@ -1626,6 +1984,11 @@ Selsella/West Garo Hills/Abagre as the AREA the figure is about, exactly like
 (disbursement, expenditure, spending, amount, total) is itself the thing being
 named — the name after "of" is still a place, and must still be extracted.
 
+A SCHEME name (MGNREGA, PMAY-G, Focus Plus, CM Elevate, or a close variant)
+is NEVER a place — do not extract it as a district/block/village even when it
+follows "for"/"of"/"under" exactly like a place would ("disbursement for
+Focus Plus" names the scheme, not an area; extract nothing).
+
 Examples:
 Question: "Tell me about total disbursement of Selsella across all financial years for MGNREGA."
 JSON: {{"block": "Selsella"}}
@@ -1639,6 +2002,8 @@ Question: "Compare the sanctioned amounts of Dambo Rongjeng and Samanda, the blo
 JSON: {{"blocks": ["Dambo Rongjeng", "Samanda"]}}
 Question: "Compare PMAY performance between ekh and wgh for FY 2017-18"
 JSON: {{"districts": ["ekh", "wgh"], "year": "2017-18"}}
+Question: "which district received highest total disbursement for Focus Plus"
+JSON: {{}}
 
 Question: "{question}"
 JSON:"""
@@ -1651,7 +2016,7 @@ JSON:"""
         if k in ("district", "block", "village", "year", "assembly_constituency") \
                 and isinstance(v, str) and v.strip():
             cleaned = _clean_mention(v)
-            if cleaned:
+            if cleaned and _mention_in_question(cleaned, question):
                 out[k] = cleaned
     blocks_raw = payload.get("blocks")
     if isinstance(blocks_raw, list):
@@ -1661,7 +2026,7 @@ JSON:"""
             if not isinstance(v, str):
                 continue
             c = _clean_mention(v)
-            if c and c.lower() not in seen:
+            if c and _mention_in_question(c, question) and c.lower() not in seen:
                 seen.add(c.lower())
                 cleaned_blocks.append(c)
         if len(cleaned_blocks) >= 2:
@@ -1679,7 +2044,7 @@ JSON:"""
             if not isinstance(v, str):
                 continue
             c = _clean_mention(v)
-            if c and c.lower() not in seen_d:
+            if c and _mention_in_question(c, question) and c.lower() not in seen_d:
                 seen_d.add(c.lower())
                 cleaned_districts.append(c)
         if len(cleaned_districts) >= 2:
@@ -2141,9 +2506,48 @@ async def resolve_entities(question: str, schemes: list[str],
     # the SQL to zero rows and reporting a misleading null total.
     if "Focus Plus" in schemes:
         tr = resolve_tranche_label(question, "Focus Plus")
-        if tr and tr.canonical:
-            resolved["tranche_label"] = tr.canonical
-            display["tranche_label"] = tr.display or tr.canonical
+        if tr and tr.values:
+            resolved["tranche_label"] = tr.values if len(tr.values) > 1 else tr.values[0]
+            display["tranche_label"] = tr.display or " and ".join(tr.values)
+
+    # CM Elevate sub-scheme ("Piggery", "Dairy Development", ... — a 15-value
+    # closed set) — resolved deterministically against the SME alias catalogue.
+    # Without this, a typo'd or loosely-phrased sub-scheme name reaches the SQL
+    # generator as raw text, which then guesses a scheme_name literal that
+    # doesn't exactly match storage and silently counts zero rows (see
+    # resolve_cm_scheme's docstring).
+    if "CM Elevate" in schemes:
+        cs = resolve_cm_scheme(question, "CM Elevate")
+        if cs and cs.values:
+            resolved["cm_scheme"] = cs.values if len(cs.values) > 1 else cs.values[0]
+            display["cm_scheme"] = cs.display or " and ".join(cs.values)
+        else:
+            # resolve_cm_scheme found no single real sub-scheme — check whether
+            # the question instead named a scheme-FAMILY word in the singular
+            # ("the vehicle scheme") that covers 2+ real, non-interchangeable
+            # sub-schemes. Left unhandled, this reached the SQL generator as
+            # bare text, which guessed a scheme_name literal that doesn't exist
+            # ('Meghalaya Vehicle Scheme') and silently returned 0 rows dressed
+            # up as a refusal (confirmed live 2026-09-11) — exactly the "never
+            # guess, ask" case cmelevate_entity_resolver.yaml's overloaded_terms
+            # section documents but was never wired to any code path.
+            grp = resolve_cm_scheme_group_ambiguity(question, "CM Elevate")
+            if grp:
+                raise _cm_scheme_group_clarification(question, grp)
+            # Not singular-ambiguous — check the PLURAL/collective reading
+            # ("vehicle schemes", "livestock", "PRIME family"): a real,
+            # already-answerable group-breakdown question (cmelevate_few_shot.yaml
+            # has worked IN-list examples), not something to ask about. Populate
+            # cm_scheme as a multi-value resolve, same shape resolve_cm_scheme
+            # itself uses for "compare Piggery and Poultry" — without this, the
+            # SQL generator's hardcoded IN-list for the group got rejected by the
+            # semantic verifier for having no resolved entity to justify it
+            # (confirmed live 2026-09-11, once the routing fix above let this
+            # question reach SQL generation for the first time).
+            grp2 = resolve_cm_scheme_group(question, "CM Elevate")
+            if grp2:
+                resolved["cm_scheme"] = grp2["schemes"]
+                display["cm_scheme"] = f"the {grp2['group']} schemes ({', '.join(grp2['schemes'])})"
 
     if prior_resolved:
         if not mentions.get("district") and "district" not in resolved and prior_resolved.get("district"):
@@ -2154,6 +2558,25 @@ async def resolve_entities(question: str, schemes: list[str],
             resolved["year_key"] = prior_resolved["year_key"]
         if not mentions.get("village") and "village_code" not in resolved and prior_resolved.get("village_code"):
             resolved["village_code"] = prior_resolved["village_code"]
+        # Focus Plus tranche pin — same fallback as district/block/village/year
+        # above. There is no LLM `mentions` signal for tranche_label (it's
+        # resolved deterministically, not via mention extraction — see
+        # resolve_tranche_label), so the only guard needed is that THIS
+        # question's own resolution found nothing: a bare short follow-up
+        # ("top 3 only") that never re-says "tranche" would otherwise lose the
+        # tranche the previous turn pinned. Only ever carries a real stored
+        # label — never a sentinel — so it stays safe to drop straight into
+        # the SQL prompt's tranche_label filter (see prompt_builder._entities_block).
+        if (schemes == ["Focus Plus"] and "tranche_label" not in resolved
+                and prior_resolved.get("tranche_label")):
+            resolved["tranche_label"] = prior_resolved["tranche_label"]
+        # CM Elevate sub-scheme pin — same fallback as tranche_label above:
+        # there is no LLM `mentions` signal for cm_scheme (resolved
+        # deterministically, not via mention extraction), so a bare follow-up
+        # that never re-names the sub-scheme would otherwise lose it.
+        if (schemes == ["CM Elevate"] and "cm_scheme" not in resolved
+                and prior_resolved.get("cm_scheme")):
+            resolved["cm_scheme"] = prior_resolved["cm_scheme"]
 
     return {"resolved": resolved, "notes": notes, "display": display}
 
@@ -2348,6 +2771,35 @@ def _village_name_filter_instead_of_code(entity_result: dict, sql: str) -> "int 
     return code if _VILLAGE_NAME_FILTER_RE.search(sql) else None
 
 
+async def _verify_sql(question: str, schemes: list[str], entity_result: dict, sql: str) -> "str | None":
+    """One short issue sentence if the semantic verifier (SQL_VERIFY_MODEL,
+    qwen4-deploy — see app/config.py) flags this SQL as not actually
+    answering the question, else None.
+
+    This is the catch-all for the class of bug the regex guards above can't
+    be: they only recognise SQL shapes a past incident already taught them to
+    match. The verifier judges the query against the same schema rules and
+    resolved entities the generator itself was given, instead of a fixed
+    pattern.
+
+    Best-effort like every other auxiliary check in this module (premise_check,
+    followups, context layer): a verifier outage, timeout, or unparseable
+    response degrades to "no issue found" rather than blocking an answer the
+    pipeline would otherwise have produced successfully."""
+    if not settings.SQL_VERIFY_ENABLED:
+        return None
+    try:
+        prompt = prompt_builder.build_verify_prompt(question, schemes, entity_result, sql)
+        raw = await llm.call_sql_verifier(prompt, guided={"guided_json": _SQL_VERIFY_JSON_SCHEMA})
+        data = _extract_json(raw)
+    except Exception:  # noqa: BLE001
+        logger.warning("SQL verifier call failed — continuing without it", exc_info=True)
+        return None
+    if not data or data.get("ok", True):
+        return None
+    return data.get("issue") or "the SQL verifier flagged this query as not answering the question"
+
+
 async def execute_with_repair(question: str, schemes: list[str], entity_result: dict,
                               initial_sql: str | None = None, *,
                               max_repairs: int = 2) -> tuple[str, list[dict]]:
@@ -2383,6 +2835,16 @@ async def execute_with_repair(question: str, schemes: list[str], entity_result: 
                     "single year_key (the latest if none is named) and SUM across geographies, "
                     "never across years. Keep every other clause exactly as it was."
                 )
+            # Last — the free regex guards above catch known bug shapes without
+            # spending a model call; only a query that clears all of them goes to
+            # the semantic verifier, which is the paid check.
+            verify_issue = await _verify_sql(question, schemes, entity_result, sql)
+            if verify_issue:
+                raise ValueError(
+                    f"semantic verifier flagged this query: {verify_issue}. Fix the SQL to "
+                    "address that specific problem and keep every other clause (filters, "
+                    "year_key, geography, aggregation) that is not implicated."
+                )
             rows = await run_readonly(sql)
             return sql, rows
         except (UnsafeSQLError, Exception) as e:
@@ -2413,8 +2875,9 @@ _NUM_TOKEN = re.compile(r"-?\d[\d,]*(?:\.\d+)?")
 # "the data doesn't cover / isn't available / can't be broken down" — a hedge the
 # composer must not use when the query actually returned a usable non-zero value.
 _HEDGE_RE = re.compile(
-    r"do(?:es)?n['’]?t\s+cover|not\s+cover(?:ed)?|isn['’]?t\s+covered|"
-    r"not\s+available|no\s+data\b|doesn['’]?t\s+(?:have|include|contain|provide)|"
+    r"do(?:es)?n['’]?t\s+cover|does\s+not\s+cover(?:ed)?|not\s+cover(?:ed)?|isn['’]?t\s+covered|"
+    r"not\s+available|no\s+data\b|"
+    r"(?:doesn['’]?t|does\s+not|don['’]?t|do\s+not)\s+(?:have|include|contain|provide)|"
     r"only\s+provides?\b|can(?:not|['’]?t)\s+(?:be\s+)?(?:broken\s+down|split)|"
     r"no\s+(?:specific\s+)?(?:breakdown|split)\b",
     re.IGNORECASE,
@@ -2607,6 +3070,21 @@ def _deterministic_answer(rows: list[dict]) -> str:
     )
 
 
+def _no_data_answer(schemes: list[str] | None, entities: dict[str, str] | None) -> str:
+    """Plain 'nothing matched' message for a query that returned no rows at all.
+    Built deterministically rather than left to the composer — on an empty
+    result it sometimes free-forms RAG-style refusal wording ("the reference
+    material does not contain...") that reads like an internal document search
+    failed, when the honest answer is just that no records match the filters."""
+    scope_bits = [v for v in (entities or {}).values() if v]
+    scope = f" for {', '.join(scope_bits)}" if scope_bits else ""
+    msg = f"I couldn't find any matching records{scope} in the data available."
+    metrics = available_metrics_text(schemes or [])
+    if metrics:
+        msg += "\n\nData I do have here:\n" + metrics
+    return msg
+
+
 def _is_plain_list_result(rows: list[dict]) -> bool:
     """A multi-row result whose rows carry no numeric metric — a pure list of
     dimension values (e.g. the districts that satisfy a coverage filter). Those
@@ -2635,6 +3113,7 @@ _DIM_LABEL = {
     "village": "village",
     "year": "financial year",
     "house_status": "house construction stage",
+    "cm_scheme": "CM Elevate sub-scheme",
 }
 
 
@@ -2660,14 +3139,17 @@ async def compose_response(question: str, sql: str, rows: list[dict],
                            notes: list[str] | None = None,
                            entities: dict[str, str] | None = None,
                            schemes: list[str] | None = None) -> str:
+    if not rows:
+        return _no_data_answer(schemes, entities)
     preview = rows[:40]
     truncated = len(rows) > len(preview)
-    # "No usable value" — an empty result, or one whose every numeric cell is 0
-    # or null. This is the shape a metric the data simply doesn't track comes
-    # back as; when we see it, hand the composer the real metric list so it can
-    # tell the user exactly what IS available rather than a vague "not covered".
+    # "No usable value" — every numeric cell is 0 or null (rows is non-empty
+    # here; a truly empty result returns via _no_data_answer above). This is
+    # the shape a metric the data simply doesn't track comes back as; when we
+    # see it, hand the composer the real metric list so it can tell the user
+    # exactly what IS available rather than a vague "not covered".
     _nums = [n for r in rows for _k, n in _row_metrics(r)]
-    no_usable_value = (not rows) or (bool(_nums) and all(n in (0, None) for n in _nums))
+    no_usable_value = bool(_nums) and all(n in (0, None) for n in _nums)
     metrics_block = ""
     if no_usable_value:
         metrics_block = (
@@ -2704,7 +3186,13 @@ async def compose_response(question: str, sql: str, rows: list[dict],
         "it is the exact set the query already selected as matching the question "
         "(e.g. 'which districts have both schemes'). Name those values as the "
         "answer; never say the data 'only lists names' or lacks the detail to "
-        "decide — the filtering happened in the query."
+        "decide — the filtering happened in the query. Never state or imply a "
+        "scope the query wasn't actually filtered to — a specific tranche, year, "
+        "district, block, village or category — unless it appears in the Entity "
+        "names block below or literally in the question; if the question and the "
+        "Entity names block name no tranche/year/area, the result covers all of "
+        "them and must be described that way (e.g. 'across all tranches'), not "
+        "attributed to one you're not told about."
     )
     # For any multi-row result, hand the composer a deterministic summary built
     # from EVERY row — totals, mean, extremes, full dimension coverage — so its
@@ -2808,6 +3296,8 @@ async def classify_intent(question: str) -> str:
     # data, never something in the reference docs. Force DATA before the keyword
     # fast-path so the "what are" knowledge cue can't win.
     if _CROSS_SCHEME_SET_QUESTION.search(question):
+        return "DATA"
+    if _BREAKDOWN_CUE.search(question):
         return "DATA"
     if _DATA_HINTS.search(question) and not _KNOWLEDGE_HINTS.search(question):
         return "DATA"
@@ -2914,6 +3404,16 @@ async def _answer_data(question: str, scope: "auth.UserScope | None" = None,
     # with a concrete year or "all financial years", so this can't loop.
     if _needs_year_clarification(question, schemes, entity_result["resolved"]):
         raise _year_clarification(question, schemes)
+
+    # Focus Plus only: year is settled but the tranche isn't — ask which one
+    # (one-tap chips) rather than silently combining every tranche's payments.
+    # `already_all_combined` lets a session that already answered this once
+    # ("all tranches combined") skip a redundant re-ask on a later bare
+    # follow-up that doesn't restate "tranche" itself.
+    if _needs_tranche_clarification(
+            question, schemes, entity_result["resolved"],
+            already_all_combined=bool((prior_resolved or {}).get("tranche_all_combined"))):
+        raise _tranche_clarification(question)
 
     sql = await generate_sql(question, schemes, entity_result)
 
@@ -3300,8 +3800,8 @@ async def _run_pipeline(question: str, session: "Session | None" = None,
                     "answer": kb["answer"], "sources": kb["sources"],
                     **_empty_data_fields(), **base}
         return {"route": "knowledge", "intent": "RAG", "confidence": "low", "sources": [],
-                "answer": "That isn't covered in the MGNREGA, PMAY-G, Focus Plus or "
-                          "CM Elevate reference material I have.",
+                "answer": "I don't have information about that for MGNREGA, PMAY-G, "
+                          "Focus Plus or CM Elevate.",
                 **_empty_data_fields(), **base}
 
     # 4. DATA -> NL->SQL. On a hard failure, try the KB once before giving up.
@@ -3364,9 +3864,15 @@ async def _data_path_kb_fallback(question: str) -> dict:
     if kb:
         return {"route": "knowledge", "intent": "RAG", "confidence": kb["confidence"],
                 "answer": kb["answer"], "sources": kb["sources"], **_empty_data_fields()}
+    # Name the scheme(s) actually in play, not a hardcoded pair — this message used
+    # to always say "MGNREGA / PMAY-G data" even for a Focus Plus / CM Elevate
+    # question, which reads as if the conversation's own context had been dropped
+    # (it hadn't — this text just never grew past the original two-scheme build).
+    _fallback_schemes = _named_schemes(question) or _infer_scheme_from_terms(question)
+    _schemes_text = " / ".join(_fallback_schemes) if _fallback_schemes else " / ".join(SCHEME_CATALOG)
     return {"route": "data", "intent": "DATA", "confidence": "low",
             "answer": ("I understood the question but couldn't build a working query for it "
-                       "against the current MGNREGA / PMAY-G data. Try rephrasing it, or ask "
+                       f"against the current {_schemes_text} data. Try rephrasing it, or ask "
                        "for a simpler breakdown first (e.g. \"PMAY-G sanctions by district "
                        "for 2023\")."),
             **_empty_data_fields()}

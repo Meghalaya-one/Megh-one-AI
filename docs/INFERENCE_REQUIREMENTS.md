@@ -9,16 +9,20 @@ The application side is already done — see the last section.
 
 ---
 
-## Model roles (target end state)
+## Model roles (current — Task 6 done 2026-09-10)
 
 | Deployment | Model | Role | Endpoint |
 |---|---|---|---|
 | `qwen-model` | qwen3-coder-30b-fp8 | **SQL generation only** | `/openai/v1` |
-| `qwen35-9b` | qwen3.5-9b | classify + intent + entity **and** answer composition | `/openai/v1` |
-| `qwen3-4b` *(to deploy)* | Qwen3-4B-Instruct | dedicated classify + intent + entity (takes over from the 9B) | `/openai/v1` |
+| `qwen35-9b` | qwen3.5-9b | answer composition only | `/openai/v1` |
+| `qwen4-deploy` | Qwen3-4B-Instruct | classify + intent + entity, **and** SQL semantic verifier (two roles, one deployment) | `/openai/v1` |
 | `qwen3-embedding` | qwen3-embedding-0.6b | RAG embeddings | `/openai/v1` |
 | `qwen3-reranker` | qwen3-reranker-0.6b | RAG rerank | `/openai/v1` |
 | `qwen3-asr` | qwen3-asr-1.7b | voice input | `/openai/v1` |
+
+Deployed under the served name `qwen4-deploy`, not the `qwen3-4b` name Task 6
+below originally specified — the app config (`app/config.py`) points at
+`qwen4-deploy` for both `CLASSIFIER_MODEL` and `SQL_VERIFY_MODEL`.
 
 ---
 
@@ -71,7 +75,7 @@ Append:
 --enable-prefix-caching
 --guided-decoding-backend=xgrammar
 ```
-(The app sends `guided_json` constraints for the classification calls now routed here.)
+(This deployment now serves composition only — classification moved to `qwen4-deploy`. The app still sends `guided_json` constraints for the composition call.)
 
 ## Task 5 — API endpoint consistency
 
@@ -85,16 +89,21 @@ Preferred: **redeploy both on the plain `vllm` runtime** (like `qwen-model`) so
 all models share one URL / auth / metrics surface. If the gateway already routes
 by `model` name on `/openai/v1`, confirm via the acceptance test and skip.
 
-## Task 6 — Deploy the dedicated classifier (when Card B has room)
+## Task 6 — Deploy the dedicated classifier — DONE (2026-09-10)
 
-Deploy **`qwen3-4b`**:
+Deployed as **`qwen4-deploy`** (not the `qwen3-4b` served name originally
+planned below — update any monitoring/acceptance-test references accordingly):
 - Runtime **`vllm`** (not huggingface)
 - Weights: `Qwen3-4B-Instruct` on a PVC
 - GPU mem request **16 GiB**, `--gpu-memory-utilization=0.12`, `--max-model-len=8192`,
   `--guided-decoding-backend=xgrammar`
-- Served model name `qwen3-4b`, on `/openai/v1`
+- Confirmed reachable on `/openai/v1`
 
-Then the app sets `CLASSIFIER_MODEL=qwen3-4b`. Until then it uses `qwen35-9b`.
+App-side: `CLASSIFIER_MODEL=qwen4-deploy` and `SQL_VERIFY_MODEL=qwen4-deploy`
+(`app/config.py`) — both roles share this one deployment. Watch its queue depth
+(`vllm:num_requests_waiting`) since it now carries classify traffic (several
+calls per turn) on top of the SQL-verify traffic (one call per SQL generation)
+it already had.
 
 ## Task 7 — Monitoring to expose (per model)
 
@@ -113,7 +122,7 @@ curl -sk https://10.48.242.4/openai/v1/chat/completions \
   -H "Authorization: Bearer <qwen35-9b key>" \
   -d '{"model":"qwen35-9b","messages":[{"role":"user","content":"say hi"}]}'
 ```
-HTTP 200 with `choices[0].message.content`. Repeat for `qwen-model`, `qwen3-4b`.
+HTTP 200 with `choices[0].message.content`. Repeat for `qwen-model`, `qwen4-deploy`.
 ASR: `POST /openai/v1/audio/transcriptions` with a WAV → `{"text":…}`.
 
 **2. Prefix caching** — same 2 KB SQL prompt twice; 2nd materially faster;
@@ -139,8 +148,9 @@ throughput.
 
 ## Already handled on the application side (no AIOps action)
 
-- `CLASSIFIER_MODEL` → `qwen35-9b` (was `qwen-model`); the 30B does SQL only.
-  `SQL_GENERATION_MODEL` stays `qwen-model`. Config in `backend/config.py`.
+- `CLASSIFIER_MODEL` → `qwen4-deploy` (was `qwen35-9b`, was `qwen-model` before
+  that); the 30B does SQL only. `SQL_GENERATION_MODEL` stays `qwen-model`.
+  `RESPONSE_MODEL` stays `qwen35-9b`, now composition-only. Config in `app/config.py`.
 - App bounds its own gateway concurrency (`MODEL_MAX_CONCURRENCY`) and sheds with
   HTTP 503 past the limit; exact-match + semantic response caches; sends
   `guided_json` / `guided_regex` constraints (safe if the gateway ignores them).

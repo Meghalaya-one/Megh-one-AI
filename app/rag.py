@@ -34,6 +34,30 @@ _REFUSAL_SENTENCE = re.compile(
     re.IGNORECASE,
 )
 
+# Safety net for when the composer ignores the instructed refusal sentence
+# above and free-forms its own — seen in the wild as "The provided reference
+# material does not contain a specific status breakdown for X.", which
+# _REFUSAL_SENTENCE doesn't match, so it leaked straight to the user instead
+# of falling back to the pipeline's plain "I don't have information..."
+# message. Any answer matching this is treated as a full refusal (return
+# None), the same as one that's empty after _REFUSAL_SENTENCE stripping.
+_LIKELY_REFUSAL = re.compile(
+    r"reference material|do(?:es)?n'?t (?:contain|have|cover|include)|"
+    r"not (?:covered|available)|no information (?:is )?available",
+    re.IGNORECASE,
+)
+
+
+def _is_whole_refusal(text: str) -> bool:
+    """True when every sentence in `text` reads as a refusal, even though it
+    doesn't match the exact instructed template (_REFUSAL_SENTENCE) — the
+    composer sometimes free-forms its own wording instead of the requested
+    sentence. A partial caveat inside an otherwise substantive answer (e.g.
+    one sentence noting a scheme "doesn't cover private land") has other,
+    non-matching sentences alongside it and is left alone."""
+    sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+|\n+", text) if s.strip()]
+    return bool(sentences) and all(_LIKELY_REFUSAL.search(s) for s in sentences)
+
 # The general_faq.md sources are flat "### Question?\nAnswer." pairs (see
 # kb_ingest._chunk), so a chunk's own body opens by restating the question as
 # its heading. The high-confidence path below returns that body verbatim, and
@@ -135,6 +159,8 @@ Answer:"""
         # phrase appeared anywhere — strip just the refusal sentence instead,
         # and only treat it as "no answer" when nothing substantive remains.
         cleaned = _REFUSAL_SENTENCE.sub("", answer).strip()
+        if cleaned and _is_whole_refusal(cleaned):
+            cleaned = ""
         if not cleaned:
             # Not just a stray hedge sentence — the composer refused outright.
             # Runs at non-zero temperature, so on passages that genuinely do
@@ -146,6 +172,8 @@ Answer:"""
             # context is cheap; a second outright refusal is trusted as real.
             answer = await llm.call_response_composer(prompt)
             cleaned = _REFUSAL_SENTENCE.sub("", answer).strip()
+            if cleaned and _is_whole_refusal(cleaned):
+                cleaned = ""
             if not cleaned:
                 return None
         return {
@@ -202,12 +230,16 @@ Reference passages:
 Answer:"""
     answer = await llm.call_response_composer(prompt)
     cleaned = _REFUSAL_SENTENCE.sub("", answer).strip()
+    if cleaned and _is_whole_refusal(cleaned):
+        cleaned = ""
     if not cleaned:
         # Same one-retry tolerance as answer_from_kb — a non-zero-temperature
         # outright refusal on passages that do answer the question is
         # sometimes just a bad sample.
         answer = await llm.call_response_composer(prompt)
         cleaned = _REFUSAL_SENTENCE.sub("", answer).strip()
+        if cleaned and _is_whole_refusal(cleaned):
+            cleaned = ""
         if not cleaned:
             return None
 

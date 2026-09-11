@@ -215,6 +215,16 @@ def state_to_resolved_entities(state: "ConversationState | None") -> dict:
         out["village_code"] = state.village
     if state.year is not None:
         out["year_key"] = state.year
+    if state.tranche:
+        out["tranche_label"] = state.tranche
+    if state.tranche_all_combined:
+        # Not a real stored value — must never be copied into resolve_entities'
+        # `resolved` dict (that feeds the SQL prompt's WHERE-clause filter
+        # verbatim, see prompt_builder._entities_block). This key exists only
+        # so _answer_data can tell _needs_tranche_clarification "the user
+        # already picked 'all tranches combined' earlier this session" without
+        # re-asking on a bare follow-up that doesn't restate "tranche".
+        out["tranche_all_combined"] = True
     return out
 
 
@@ -321,6 +331,25 @@ def update_state(session: "Session | None", raw_question: str, standalone_questi
             except (TypeError, ValueError):
                 pass
 
+        # Focus Plus tranche — mirrors district/block/village/year above, plus
+        # an explicit "all combined" flag (see state_to_resolved_entities):
+        # resolve_tranche_label only ever returns something for a SPECIFIC
+        # named tranche (see app.entity_resolver), so a Focus Plus-only turn
+        # that reached here with no tranche_label at all only did so because
+        # _needs_tranche_clarification's gate was already satisfied by an
+        # explicit "all tranches combined" / breakdown cue (or a prior
+        # all-combined choice) — never by silent default. Recording that
+        # keeps a later bare follow-up ("top 3 only") from losing the choice
+        # or getting re-asked.
+        if schemes == ["Focus Plus"]:
+            tl = resolved.get("tranche_label")
+            if tl:
+                state.tranche = tl if isinstance(tl, str) else (tl[0] if len(tl) == 1 else None)
+                state.tranche_all_combined = False
+            else:
+                state.tranche = None
+                state.tranche_all_combined = True
+
         metric = detect_metric(standalone_question or raw_question)
         if metric:
             state.metric = metric
@@ -364,6 +393,10 @@ def build_state_block(state: "ConversationState | None") -> str:
         parts.append(f"year={_fy_text(state.year)}")
     if state.metric:
         parts.append(f"metric={state.metric}")
+    if state.tranche:
+        parts.append(f"tranche={state.tranche}")
+    elif state.tranche_all_combined:
+        parts.append("tranche=all combined")
     return "Known context: " + ", ".join(parts) if parts else ""
 
 

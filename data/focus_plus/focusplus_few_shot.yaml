@@ -448,6 +448,21 @@ sql_generation_examples:
   note: 'Grouped by batch as well, because Tranch 4 contains BOTH cohorts. Ordering is
     by label, not by time - the month words in the labels are not dates.'
 
+- question: Compare disbursements between Tranch 1 and Tranch 2
+  sql: |
+    SELECT tranche_label,
+           COUNT(*)              AS payments,
+           SUM(amount_disbursed) AS amount_raw
+    FROM curated.v_focus_plus
+    WHERE tranche_label IN ('Tranch 1', 'Tranch 2 - August')
+    GROUP BY tranche_label
+    ORDER BY tranche_label;
+  tables:
+  - curated.v_focus_plus
+  note: 'A comparison names TWO OR MORE tranches - filter on all of them with IN and
+    GROUP BY tranche_label so each gets its own row. Never collapse a comparison to a
+    single WHERE tranche_label = value, and never sum the named tranches into one row.'
+
 - question: How many payments were made in Tranch 2?
   sql: |
     SELECT COUNT(*) AS payments, SUM(amount_disbursed) AS amount_raw
