@@ -132,7 +132,8 @@ async def query(req: QueryRequest, request: Request,
             # the answer as free text ("West Garo Hills 2023-24", "East Khasi
             # Hills"). Remember the question so the pipeline merges that reply back
             # into it next turn instead of treating it as a brand-new question.
-            if e.rule in ("scope-not-specified", "year-not-specified", "entity-ambiguous"):
+            if e.rule in ("scope-not-specified", "year-not-specified", "entity-ambiguous",
+                         "ranking-count-not-specified"):
                 session.pending_scope_q = req.question
                 session.pending_village_hint = e.village_hint
             # Shape it for the frontend clarification renderer (intent CLARIFY +

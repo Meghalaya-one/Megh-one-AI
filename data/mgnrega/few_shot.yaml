@@ -94,6 +94,13 @@ sql_generation_examples:
         AND village_code = 277001;
     tables: [curated.v_expenditure]
 
+  - question: "How much did Uming village spend across all financial years combined?"
+    sql: |
+      SELECT ROUND(SUM(total_exp), 2) AS total_expenditure_lakh
+      FROM curated.v_expenditure
+      WHERE village_code = 277001;
+    tables: [curated.v_expenditure]
+
   - question: "Average expenditure per village in Ri Bhoi for 2025-26"
     sql: |
       SELECT ROUND(SUM(total_exp) / COUNT(DISTINCT village_code), 2)
@@ -206,6 +213,30 @@ sql_generation_examples:
       LIMIT 1;
     tables: [curated.v_employment]
 
+  - question: "How many person-days were generated in Uming village in 2023-24?"
+    sql: |
+      SELECT SUM(person_days) AS person_days
+      FROM curated.v_employment
+      WHERE year_key = 2023
+        AND village_code = 277001;
+    tables: [curated.v_employment]
+
+  - question: "How many person-days were generated in Uming village across all financial years combined?"
+    sql: |
+      SELECT SUM(person_days) AS person_days
+      FROM curated.v_employment
+      WHERE village_code = 277001;
+    tables: [curated.v_employment]
+
+  - question: "What percentage of employment persons were women in West Garo Hills for 2025-26?"
+    sql: |
+      SELECT ROUND(100.0 * SUM(women_employment_provided)
+             / NULLIF(SUM(persons_employed), 0), 2) AS women_share_pct
+      FROM curated.v_employment
+      WHERE year_key = 2025
+        AND lgd_district = 'WEST GARO HILLS';
+    tables: [curated.v_employment]
+
   - question: "Which district had the highest women employment in 2025-26?"
     sql: |
       SELECT lgd_district, SUM(women_employment_provided) AS women_employment_provided
@@ -239,6 +270,13 @@ sql_generation_examples:
       SELECT SUM(households_completed_100_days) AS households_completed_100_days
       FROM curated.v_employment
       WHERE year_key = 2025;
+    tables: [curated.v_employment]
+
+  - question: "How many households completed 100 days of work in Uming village across all financial years combined?"
+    sql: |
+      SELECT SUM(households_completed_100_days) AS households_completed_100_days
+      FROM curated.v_employment
+      WHERE village_code = 277001;
     tables: [curated.v_employment]
 
   - question: "100-day completions by district for 2025-26"

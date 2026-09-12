@@ -337,26 +337,36 @@ def resolve_tranche_label(question: str, scheme: str = "Focus Plus") -> "Resolve
     folded_q = fold(question)
     squashed_q = _squash(folded_q)
 
-    # Stage 1/2: exact canonical/alias phrase present verbatim in the question.
-    # Collect every tranche named, not just the first one found, so a question
-    # naming two or more doesn't silently collapse to a single filter.
-    exact_hits = [v["canonical"] for v in values
-                  if any(fold(c) in folded_q for c in [v["canonical"]] + v.get("aliases", []))]
-    if exact_hits:
+    # Stage 1/2/3: exact canonical/alias phrase present verbatim in the
+    # question, falling back to squashed containment ("tranch2" / "Tranch-2")
+    # for any catalog value the exact stage didn't already catch. Checked
+    # INDEPENDENTLY per catalog value and merged — never stop at the first
+    # stage that finds anything for SOME value, because a two-tranche
+    # comparison can easily have one tranche match at the exact stage and the
+    # other only at the squash stage: "Tranch 1"'s canonical has no month
+    # suffix and matches the bare question text exactly, but "Tranch 2"'s
+    # canonical is "Tranch 2 - August" and only matches via its squashed
+    # "tranch2" alias. The old code found "Tranch 1" via exact match and
+    # returned immediately, silently dropping "Tranch 2" from the result
+    # entirely (confirmed live 2026-09-12: "compare Tranch 1 and Tranch 2"
+    # resolved to Tranch 1 ONLY — the missing second entity then sent the
+    # semantic verifier into a repair loop over SQL that was actually correct,
+    # because it looked like "Tranch 2 - August" in the SQL had no matching
+    # resolved entity to justify it).
+    hits: list[str] = []
+    hit_confidence = 1.0
+    for v in values:
+        forms = [v["canonical"]] + v.get("aliases", [])
+        if any(fold(c) in folded_q for c in forms):
+            hits.append(v["canonical"])
+        elif any(_squash(fold(c)) and _squash(fold(c)) in squashed_q for c in forms):
+            hits.append(v["canonical"])
+            hit_confidence = min(hit_confidence, 0.95)
+    if hits:
         return Resolved("resolved", "tranche_label", question,
-                        canonical=exact_hits[0] if len(exact_hits) == 1 else None,
-                        confidence=1.0, values=exact_hits,
-                        display=" and ".join(exact_hits))
-
-    # Stage 3: squashed containment — "tranch-2" / "Tranch 2" against alias "tranch2".
-    squash_hits = [v["canonical"] for v in values
-                   if any(_squash(fold(c)) and _squash(fold(c)) in squashed_q
-                          for c in [v["canonical"]] + v.get("aliases", []))]
-    if squash_hits:
-        return Resolved("resolved", "tranche_label", question,
-                        canonical=squash_hits[0] if len(squash_hits) == 1 else None,
-                        confidence=0.95, values=squash_hits,
-                        display=" and ".join(squash_hits))
+                        canonical=hits[0] if len(hits) == 1 else None,
+                        confidence=hit_confidence, values=hits,
+                        display=" and ".join(hits))
 
     if not _TRANCHE_NUMBER_RE.search(question):
         return None

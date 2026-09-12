@@ -96,6 +96,22 @@ _KNOWLEDGE_HINTS = re.compile(
 # DATA outright, the same way _CROSS_SCHEME_SET_QUESTION does below.
 _BREAKDOWN_CUE = re.compile(r"\b(split|breakdown|distribution)\b", re.IGNORECASE)
 
+# Same shape of bug as _BREAKDOWN_CUE above, different trigger word: "What is
+# the average amount disbursed per beneficiary?" / "What is the total
+# disbursed in West Garo Hills?" open with "what is" (a _KNOWLEDGE_HINTS cue)
+# AND also match "average"/"total" (a _DATA_HINTS cue), so neither fast-path
+# branch fires and it falls to the LLM classifier — which guessed KNOWLEDGE
+# for a plain average-per-beneficiary question live (confirmed 2026-09-12: a
+# Focus Plus "average disbursed per beneficiary" question got answered from
+# the reference docs with a flat ₹5,000 rate instead of the real computed
+# average). "What is the average/total/sum/count/number of X" is a computed
+# aggregate by construction, never scheme-mechanics — force DATA the same way
+# _BREAKDOWN_CUE does.
+_METRIC_WHATIS_CUE = re.compile(
+    r"\bwhat (?:is|was|are|were)\b.{0,40}\b(average|avg|mean|total|sum|number|count)\b",
+    re.IGNORECASE,
+)
+
 
 class OutOfScope(Exception):
     """Raised when the question is about a place the assistant doesn't cover —
@@ -995,39 +1011,6 @@ def _admin_expenditure_clarification(question: str) -> "ClarificationNeeded":
     return ClarificationNeeded(text, rule="column-not-held")
 
 
-# ── "What % were women?" — women_employment_provided has no confirmed ratio ──
-# schema_context.py's MGNREGA rule 6: women_employment_provided may be reported
-# as a raw count, but NEVER as a computed ratio/percentage/share — its
-# definition (persons vs households, and against which denominator) is
-# unconfirmed, so a computed percentage risks a confidently wrong number. The
-# SQL-gen prompt already carries this as a text rule, but a question that
-# explicitly demands the percentage can still make the model try (and fail
-# oddly) rather than explain why — so intercept it here, before SQL
-# generation, the same way the bank / admin-expenditure checks do.
-# PMAY-G's analogous "share of houses allotted to women" IS a well-defined,
-# supported computation (house_alloted_to has an explicit Woman* value set) —
-# excluded here via _WOMEN_SHARE_PMAYG_CONTEXT so this doesn't also block that.
-_WOMEN_SHARE_REQUESTED = re.compile(
-    r"\b(percentage|percent|%|share|ratio|proportion)\b[^?.!]{0,40}\bwomen\b|"
-    r"\bwomen\b[^?.!]{0,40}\b(percentage|percent|%|share|ratio|proportion)\b",
-    re.IGNORECASE,
-)
-_WOMEN_SHARE_PMAYG_CONTEXT = re.compile(
-    r"\bhouses?\b|\bdwelling\b|\ballot\w*\b", re.IGNORECASE,
-)
-_WOMEN_SHARE_NOT_COMPUTABLE_TEXT = (
-    "A reliable percentage or share can't be computed for women's employment — "
-    "women_employment_provided's exact definition (which denominator it's a "
-    "share of) isn't confirmed in the source data, so publishing a ratio risks "
-    "a misleading number. I can give you the raw count of women provided "
-    "employment instead — would that help?"
-)
-
-
-def _women_share_clarification(question: str) -> "ClarificationNeeded":
-    return ClarificationNeeded(_WOMEN_SHARE_NOT_COMPUTABLE_TEXT, rule="column-not-held")
-
-
 def _needs_scheme_clarification(question: str) -> bool:
     """True when the question names no scheme, doesn't ask for a cross-scheme
     view outright, and uses no vocabulary that pins it to one scheme. In that
@@ -1071,7 +1054,18 @@ _EXPLICIT_COUNT = re.compile(
 _WANTS_ALL = re.compile(
     r"\b(all|every|each|entire|complete|full)\b.{0,20}\b(districts?|blocks?|villages?|"
     r"panchayats?|list|row|rows)\b"
-    r"|\blist\s+(?:of\s+)?all\b|\bfor\s+all\b|\bacross\s+all\b|\bno limit\b|\bevery row\b",
+    r"|\blist\s+(?:of\s+)?all\b|\bfor\s+all\b|\bacross\s+all\b|\bno limit\b|\bevery row\b|"
+    # A free-text reply to the "top 3/5/10 or the complete list?" pause — the
+    # dimension word (blocks/districts/...) already sits earlier in the merged
+    # question, not right after "all", so these stand on their own instead of
+    # requiring one of the words above within 20 chars.
+    r"\ball of (?:them|it)\b|\beverything\b|"
+    r"\b(?:show|give)\s+(?:me\s+)?all\b|\bthe\s+(?:complete|full)\s+list\b|"
+    # A bare "all" as the whole reply, merged on as the trailing comma-fragment
+    # ("...sanctioned in 2023-24, all") — anchored to end-of-string so an
+    # unrelated mid-question "all" (e.g. "all of Meghalaya") isn't caught here;
+    # that shape is already handled by the dimension-adjacent alternative above.
+    r",\s*all\s*[?.]?\s*$",
     re.IGNORECASE,
 )
 _TOPN_CHOICES = (3, 5, 10)
@@ -1142,10 +1136,16 @@ _BARE_METRIC_CUE = re.compile(
 # The question already fixes its own scope (a breakdown, a trend, a comparison
 # across a dimension, or an explicit "all of Meghalaya") — nothing to ask.
 _HAS_BREAKDOWN = re.compile(
-    r"\bby (?:district|block|village|panchayat|gp|year|month)\b|"
+    r"\bby (?:district|block|village|panchayat|gp|year|month|scheme|program(?:me)?|sector)\b|"
     r"\b(?:per|each|every|for all|across all|all the) "
-    r"(?:district|block|village|panchayat|year|month)s?\b|"
-    r"\b(?:district|block|village|year)[\s-]?wise\b|"
+    r"(?:district|block|village|panchayat|year|month|scheme|program(?:me)?|sector)s?\b|"
+    # "under each CM ELEVATE program", "for every PMAY-G scheme" — a scheme name
+    # or other short qualifier can sit between "each/every" and the dimension
+    # word itself; allow up to a few words of slack for scheme/program/sector
+    # specifically (kept out of the tight pattern above to avoid over-matching
+    # "each ... district" style geography phrasing where slack isn't needed).
+    r"\b(?:per|each|every)\b[^?.!]{0,25}\b(?:scheme|program(?:me)?|sector)s?\b|"
+    r"\b(?:district|block|village|year|scheme|program(?:me)?|sector)[\s-]?wise\b|"
     r"\bbreak[\s-]?down\b|\btrend\b|\byear[\s-]?on[\s-]?year\b|"
     r"\bover (?:the )?(?:last|past) \w+ years?\b|"
     r"\bcompare\b|\bcomparison\b|\bversus\b|\bvs\.?\b|"
@@ -1156,9 +1156,9 @@ _HAS_BREAKDOWN = re.compile(
     # blocks", "10 largest villages". It inherently spans every area in that
     # dimension, so geography is already scoped; only the year is still open.
     r"\b(?:top|bottom|leading|largest|biggest|smallest|highest|lowest)\s+"
-    r"(?:\d+\s+)?(?:districts?|blocks?|villages?|panchayats?|gps?)\b|"
+    r"(?:\d+\s+)?(?:districts?|blocks?|villages?|panchayats?|gps?|schemes?|program(?:me)?s?|sectors?)\b|"
     r"\b\d+\s+(?:largest|biggest|smallest|highest|lowest)\s+"
-    r"(?:districts?|blocks?|villages?|panchayats?|gps?)\b|"
+    r"(?:districts?|blocks?|villages?|panchayats?|gps?|schemes?|program(?:me)?s?|sectors?)\b|"
     # "which district received the highest ...", "district with the lowest
     # ..." — the same rank-window logic as "top N districts" above, just
     # phrased as "which <geo> ... <superlative>" instead of "<superlative>
@@ -1168,19 +1168,29 @@ _HAS_BREAKDOWN = re.compile(
     # geography noun) so "which district received the highest total
     # disbursement" and "highest total expenditure in which district" both
     # match.
-    r"\bwhich (?:district|block|village|panchayat|gp)\b[^?]{0,40}\b"
+    r"\bwhich (?:district|block|village|panchayat|gp)s?\b[^?]{0,40}\b"
     r"(?:highest|lowest|most|least|maximum|minimum|greatest|top|biggest|"
     r"largest|smallest)\b|"
     r"\b(?:highest|lowest|most|least|maximum|minimum|greatest|top|biggest|"
-    r"largest|smallest)\b[^?]{0,40}\bwhich (?:district|block|village|panchayat|gp)\b|"
-    r"\bacross (?:the )?(?:districts?|blocks?|villages?|panchayats?|state|years?)\b",
+    r"largest|smallest)\b[^?]{0,40}\bwhich (?:district|block|village|panchayat|gp)s?\b|"
+    # Same rank-window shape as above, but for scheme/program/sector — a scheme
+    # name or other qualifier ("CM Elevate", "PMAY-G") often sits between
+    # "which" and the dimension word itself ("which CM Elevate programs have
+    # the highest..."), so this variant allows slack there too.
+    r"\bwhich\b[^?.!]{0,25}\b(?:schemes?|program(?:me)?s?|sectors?)\b[^?]{0,40}\b"
+    r"(?:highest|lowest|most|least|maximum|minimum|greatest|top|biggest|"
+    r"largest|smallest)\b|"
+    r"\b(?:highest|lowest|most|least|maximum|minimum|greatest|top|biggest|"
+    r"largest|smallest)\b[^?]{0,40}\bwhich\b[^?.!]{0,25}\b(?:schemes?|program(?:me)?s?|sectors?)\b|"
+    r"\bacross (?:the )?(?:districts?|blocks?|villages?|panchayats?|state|years?|schemes?|program(?:me)?s?|sectors?)\b",
     re.IGNORECASE,
 )
 _EXPLICIT_STATEWIDE = re.compile(
     r"\b(?:in|for|across|over|of) (?:all of |the (?:whole|entire) )?meghalaya\b|"
     r"\bstate[\s-]?(?:wide|level|total)\b|\boverall\b|\bin total\b|\bgrand total\b|"
     r"\ball (?:the )?(?:years|districts|blocks|villages)\b|\bentire state\b|"
-    r"\bevery year\b|\bsince inception\b|\ball[\s-]?time\b|\bto date\b|\bcumulative\b",
+    r"\bevery year\b|\bsince inception\b|\ball[\s-]?time\b|"
+    r"\b(?:up )?(?:to|till|until) (?:date|now)\b|\bso far\b|\bcumulative\b",
     re.IGNORECASE,
 )
 # A cross-scheme set / overlap question whose answer IS a geography list or its
@@ -1233,7 +1243,8 @@ def _needs_scope_clarification(question: str, resolved: dict) -> bool:
     if _CROSS_SCHEME_SET_QUESTION.search(q):
         return False
     if any(resolved.get(k) for k in
-           ("district", "district_list", "block", "block_list", "village_code", "year_key")):
+           ("district", "district_list", "block", "block_list", "village_code",
+            "village_code_list", "assembly_constituency", "year_key")):
         return False
     return True
 
@@ -1424,7 +1435,8 @@ _ALL_YEARS_CUE = re.compile(
     r"\ball[\s-]?(?:the\s+)?(?:financial |fiscal |fy )?years?\b|"
     r"\bevery (?:financial |fiscal )?year\b|\beach year\b|"
     r"\bacross (?:all )?(?:the )?(?:financial |fiscal )?years?\b|"
-    r"\ball[\s-]?time\b|\bsince inception\b|\bto date\b|\bcumulative\b|"
+    r"\ball[\s-]?time\b|\bsince inception\b|"
+    r"\b(?:up )?(?:to|till|until) (?:date|now)\b|\bso far\b|\bcumulative\b|"
     r"\ball years combined\b|\boverall\b|\bin total\b|\bgrand total\b",
     re.IGNORECASE,
 )
@@ -1625,11 +1637,23 @@ def _needs_tranche_clarification(question: str, schemes: list[str], resolved: di
     # collect, so skip straight past the gate.
     if _PERSON_LEVEL_COLUMN_CUE.search(q):
         return False
-    # Trigger on either signal: a money/count metric question with no tranche
-    # named (mirrors the year gate), OR the question literally says
-    # "tranche"/"tranch" without pinning which one — covers status/verification
-    # breakdowns and any other phrasing _METRIC_OR_BREAKDOWN_CUE doesn't know.
-    if not (_METRIC_OR_BREAKDOWN_CUE.search(q) or _MENTIONS_TRANCHE_WORD.search(q)):
+    # Trigger ONLY when the question literally says "tranche"/"tranch" without
+    # pinning which one. `_METRIC_OR_BREAKDOWN_CUE` used to also trigger this
+    # gate (mirroring the year gate), but that cue matches "beneficiar*" and
+    # "payments?" — i.e. almost every Focus Plus money/count question, not
+    # just tranche-sensitive ones. None of the Focus Plus few-shot SQL (totals,
+    # geography, gender, batch, status, FY breakdowns) scopes by tranche_label
+    # at all — SUM(amount_disbursed) is well-defined across tranches, and the
+    # one genuine mix-ratio trap (a naive per-beneficiary AVERAGE) is handled
+    # by scoping to batch_label, not by asking the user to pick a tranche (see
+    # "What is the average Focus Plus payment per member?" in
+    # focusplus_few_shot.yaml). Confirmed live 2026-09-12: this over-broad
+    # trigger paused nearly every Focus Plus beneficiary/disbursement question
+    # for an unwanted tranche pick, and a scope-pause reply that re-entered
+    # here with tranche_label already resolved but not yet threaded through
+    # the merged question text sent the SQL generator into a repair loop that
+    # burned the retry budget and crashed out to the KB fallback.
+    if not _MENTIONS_TRANCHE_WORD.search(q):
         return False
     return True
 
@@ -2059,13 +2083,22 @@ JSON:"""
 
 def _parse_year_key(text: str) -> "int | None":
     """FY start year as an int from '2023', '2023-24', '2023-2024', 'FY 2023-24',
-    'FY23'. Returns None if no plausible year (2010-2039) is present."""
+    'FY23', or a bare two-digit range like '25-26' with no century at all —
+    users type financial years this way constantly (2026-09-10 UAT: "25-26" was
+    not understood as a year), and without this branch the mention never
+    resolves to a year_key at all. Returns None if no plausible year
+    (2010-2039) is present."""
     m = re.search(r"\b(20[1-3]\d)\s*[-/]\s*(?:20)?\d{2}\b", text)   # 2023-24 / 2023-2024
     if m:
         return int(m.group(1))
     m = re.search(r"\bfy\s*'?(\d{2})\b", text, re.IGNORECASE)        # FY23
     if m:
         return 2000 + int(m.group(1))
+    m = re.search(r"(?<!\d)(\d{2})\s*[-/]\s*(\d{2})(?!\d)", text)    # bare 25-26
+    if m:
+        y1, y2 = int(m.group(1)), int(m.group(2))
+        if 10 <= y1 <= 39 and y2 == (y1 + 1) % 100:
+            return 2000 + y1
     m = re.search(r"\b(20[1-3]\d)\b", text)                          # bare 2023
     if m:
         return int(m.group(1))
@@ -2248,13 +2281,45 @@ async def resolve_entities(question: str, schemes: list[str],
         _has_block_word = bool(re.search(r"\bblock\b", question, re.IGNORECASE))
         _block_canons: list[str] = []
         _block_displays: list[str] = []
+        # A bare comparison name with no admin-level word ("X or Y", "compare X
+        # and Y") gets tagged into this "blocks" array by default (see the
+        # extractor prompt's own "tag an ambiguous bare name as block" rule),
+        # even when both names are actually VILLAGES — e.g. "which has more
+        # completed houses: <village 1> or <village 2>". When a name here
+        # isn't a resolvable block at all, it used to just get a "not a known
+        # block" note and get dropped; with every name dropped, geography
+        # stayed fully unresolved and the generic scope pause fired, offering
+        # every district statewide instead of just the two villages named
+        # (reported 2026-09-10, PMAY-OFF-022). Try village resolution as a
+        # fallback for exactly the names that fail as a block, mirroring the
+        # `_vcheck` block-vs-village disambiguation a few lines below.
+        _village_canons: list[int] = []
+        _village_displays: list[str] = []
         for _bname in mentions["blocks"]:
             r = resolve_dimension(_bname, schemes[0], "block")
             if r.status == "ambiguous":
                 raise ClarificationNeeded(f"Which block is being referred to by “{_bname}”?",
                                            rule="entity-ambiguous")
             if r.status != "resolved":
-                notes.append(f"'{_bname}' is not a known block — say so, do not filter on it.")
+                _vr = await resolve_village(_bname, district=district_canon)
+                if _vr.status == "ambiguous":
+                    listed = ", ".join(
+                        f"{c['name']} in {c['block']} block ({c['district']})" for c in _vr.candidates[:5])
+                    options = [
+                        {"label": f"{c['name']} — {c['block']} block, {c['district']}",
+                         "question": _village_chip_question(question, _bname, c)}
+                        for c in _vr.candidates[:5]
+                    ]
+                    raise ClarificationNeeded(
+                        f"“{_bname}” corresponds to more than one village: {listed}. "
+                        "Which of these is intended?",
+                        options=options, rule="entity-ambiguous", village_hint=_bname)
+                if _vr.status == "resolved":
+                    _village_canons.append(_vr.canonical)
+                    _village_displays.append(_vr.display or str(_bname).title())
+                else:
+                    notes.append(f"'{_bname}' is not a known block or village — say so, "
+                                 "do not filter on it.")
                 continue
             if not _has_block_word:
                 _vcheck = await resolve_village(_bname)
@@ -2273,6 +2338,9 @@ async def resolve_entities(question: str, schemes: list[str],
         if _block_canons:
             resolved["block_list"] = _block_canons
             display["block"] = " and ".join(_block_displays)
+        if _village_canons:
+            resolved["village_code_list"] = _village_canons
+            display["village"] = " and ".join(_village_displays)
     elif mentions.get("block"):
         r = resolve_dimension(mentions["block"], schemes[0], "block")
         if r.status == "ambiguous":
@@ -2752,6 +2820,50 @@ def _rowgrain_no_aggregate(question: str, sql: str) -> "str | None":
 
 _VILLAGE_CODE_FILTER_RE = re.compile(r"\bvillage_code\s*(?:=|IN)\s*", re.IGNORECASE)
 _VILLAGE_NAME_FILTER_RE = re.compile(r"\blgd_village_name\s*(?:=|ILIKE|IN)\s*", re.IGNORECASE)
+_DIV_100_RE = re.compile(r"/\s*100\b")
+# CM Elevate's is_withdraw is a real, well-defined boolean column that is FALSE
+# on every one of the 8,543 rows today (schema_context.py rule 15) — a filtered
+# COUNT against it is a genuine, correct zero, not a sign of a missing/hallucinated
+# metric. compose_response's generic zero-hedging guidance (written to catch
+# hallucinated columns that always read NULL/0) can't tell the two apart on its
+# own, so a query that visibly filters is_withdraw gets an explicit note telling
+# the composer this particular zero IS the real, complete answer (confirmed live
+# 2026-09-12: without this, "how many applications have been withdrawn in Ri
+# Bhoi" — SQL correctly `is_withdraw = TRUE`, 0 rows — was composed as "doesn't
+# cover a withdrawal count", a false refusal over a query that ran exactly right).
+_IS_WITHDRAW_FILTER_RE = re.compile(r"\bis_withdraw\b", re.IGNORECASE)
+
+
+def _genuine_zero_notes(sql: str) -> list[str]:
+    """Notes overriding compose_response's default zero-hedge for CM Elevate
+    columns where a real 0 is the correct, complete answer (not a missing
+    metric) — see _IS_WITHDRAW_FILTER_RE above."""
+    if _IS_WITHDRAW_FILTER_RE.search(sql):
+        return [
+            "is_withdraw is a real, always-queryable boolean column (FALSE on every "
+            "current row) — if the result is 0, that IS the true, complete withdrawal "
+            "count for this scope. State it plainly as '0 applications withdrawn', "
+            "never as data that 'isn't tracked' or 'doesn't cover' withdrawals."
+        ]
+    return []
+
+
+def _crore_conversion_for_single_village(entity_result: dict, sql: str) -> bool:
+    """True when the SQL converts a MGNREGA money column to CRORE (÷100) while
+    the question is scoped to a single village — a grain small enough that
+    the true figure is routinely well under 1 crore, so rounding the crore
+    value to 2 decimal places can display a real, non-zero lakh amount as
+    "0.00 crore" (reported 2026-09-10 UAT: Maska's real 0.49 lakh MGNREGA
+    expenditure came back as "0.00 crore" for exactly this reason). MGNREGA
+    money is natively LAKH (schema_context's MGNREGA rule 4) — the crore
+    conversion exists only for cross-scheme/statewide normalisation against
+    PMAY's rupee figures, never for a single village's own figure."""
+    if not entity_result.get("resolved", {}).get("village_code"):
+        return False
+    # "crore" is checked as a plain substring, not \bcrore\b — it is always used
+    # here as an identifier suffix ("total_expenditure_crore"), and an
+    # underscore is a word character, so \b never falls between "_" and "c".
+    return bool(_DIV_100_RE.search(sql)) and "crore" in sql.lower()
 
 
 def _village_name_filter_instead_of_code(entity_result: dict, sql: str) -> "int | None":
@@ -2769,6 +2881,28 @@ def _village_name_filter_instead_of_code(entity_result: dict, sql: str) -> "int 
     if code is None or _VILLAGE_CODE_FILTER_RE.search(sql):
         return None
     return code if _VILLAGE_NAME_FILTER_RE.search(sql) else None
+
+
+def _village_code_as_geography_key(entity_result: dict, sql: str) -> "int | None":
+    """The resolved village_code when the generated SQL filters `geography_key`
+    directly to that same integer literal instead of `village_code` — a
+    silent-wrong-number bug distinct from the lgd_village_name one above.
+    geography_key is a small surrogate key on curated.dim_geography, entirely
+    unrelated to the LGD village_code (e.g. MASKA village is geography_key =
+    5999 but village_code = 277769), so plugging the resolved village_code
+    value straight into geography_key's WHERE clause matches no row and the
+    query runs clean but returns NULL (reported 2026-09-10 UAT: a real ~0.5
+    lakh MGNREGA expenditure for a small village came back "doesn't cover
+    that metric" because the generated SQL filtered geography_key = 277769 —
+    a village_code — instead of village_code = 277769). Filtering geography_key
+    via a dim_geography subquery keyed on village_code is fine and NOT
+    flagged — only a bare literal placed in geography_key's slot is."""
+    code = entity_result.get("resolved", {}).get("village_code")
+    if code is None:
+        return None
+    if re.search(rf"\bgeography_key\s*=\s*{code}\b", sql):
+        return code
+    return None
 
 
 async def _verify_sql(question: str, schemes: list[str], entity_result: dict, sql: str) -> "str | None":
@@ -2802,7 +2936,7 @@ async def _verify_sql(question: str, schemes: list[str], entity_result: dict, sq
 
 async def execute_with_repair(question: str, schemes: list[str], entity_result: dict,
                               initial_sql: str | None = None, *,
-                              max_repairs: int = 2) -> tuple[str, list[dict]]:
+                              max_repairs: int = 3) -> tuple[str, list[dict]]:
     sql = initial_sql if initial_sql is not None else await generate_sql(question, schemes, entity_result)
     for attempt in range(max_repairs + 1):
         sql = _uppercase_geo_literals(sql)
@@ -2815,6 +2949,27 @@ async def execute_with_repair(question: str, schemes: list[str], entity_result: 
                     "matching (storage keeps mixed/title case, not upper-case), so that filter can "
                     "silently match zero rows. Replace the lgd_village_name filter with "
                     f"village_code = {bad_code} exactly, and keep every other clause as it was."
+                )
+            bad_geo_code = _village_code_as_geography_key(entity_result, sql)
+            if bad_geo_code is not None:
+                raise ValueError(
+                    f"the question resolved to village_code = {bad_geo_code} but this query filters "
+                    f"geography_key = {bad_geo_code} instead — geography_key is a different surrogate "
+                    "key, unrelated in value to village_code, so this filter matches no row and "
+                    "silently returns NULL/zero instead of the real figure. Replace "
+                    f"geography_key = {bad_geo_code} with village_code = {bad_geo_code} exactly (the "
+                    "curated view carries village_code as a direct column), and keep every other "
+                    "clause as it was."
+                )
+            if _crore_conversion_for_single_village(entity_result, sql):
+                raise ValueError(
+                    "this query converts a MGNREGA money column to CRORE (dividing by 100) for a "
+                    "question scoped to a single village — MGNREGA money is natively LAKH RUPEES, "
+                    "and a single village's figure is routinely well under 1 crore, so rounding it "
+                    "to crore at 2 decimal places can display a real, non-zero amount as a "
+                    "misleading '0.00 crore'. Report the figure directly in LAKH instead (remove "
+                    "the ÷100 conversion and the crore alias/label), and keep every other clause "
+                    "as it was."
                 )
             if _STATE_PSEUDO_FILTER.search(sql):
                 raise ValueError(
@@ -3299,6 +3454,8 @@ async def classify_intent(question: str) -> str:
         return "DATA"
     if _BREAKDOWN_CUE.search(question):
         return "DATA"
+    if _METRIC_WHATIS_CUE.search(question):
+        return "DATA"
     if _DATA_HINTS.search(question) and not _KNOWLEDGE_HINTS.search(question):
         return "DATA"
     if _KNOWLEDGE_HINTS.search(question) and not _DATA_HINTS.search(question):
@@ -3432,6 +3589,7 @@ async def _answer_data(question: str, scope: "auth.UserScope | None" = None,
     # houses") is never part of the SQL — check it against the result so the
     # composer corrects a false premise instead of repeating it as fact.
     notes = list(entity_result.get("notes") or [])
+    notes.extend(_genuine_zero_notes(sql))
     if settings.PREMISE_CHECK_ENABLED:
         try:
             notes.extend(premise_check.check_premises(question, rows))
@@ -3748,13 +3906,6 @@ async def _run_pipeline(question: str, session: "Session | None" = None,
     #     same reasoning and same place as the bank check just above.
     if _ADMIN_EXPENDITURE_REQUESTED.search(question):
         raise _admin_expenditure_clarification(question)
-
-    # 1e. "What percentage were women?" — no confirmed denominator to compute
-    #     one from (see _WOMEN_SHARE_REQUESTED above). Same place, same reasoning.
-    #     PMAY-G's house-allotment women's share is a different, well-defined
-    #     computation — left alone.
-    if _WOMEN_SHARE_REQUESTED.search(question) and not _WOMEN_SHARE_PMAYG_CONTEXT.search(question):
-        raise _women_share_clarification(question)
 
     # 2. Route: number question or scheme-rules question?
     intent = await classify_intent(question)

@@ -365,6 +365,23 @@ sql_generation_examples:
   - curated.v_cm_elevate
   note: Two named schemes returned side by side, never silently merged.
 
+- question: Compare applicant counts for Piggery and Poultry across Ri Bhoi and East Khasi Hills
+  sql: |
+    SELECT scheme_name, lgd_district, COUNT(*) AS applications
+    FROM curated.v_cm_elevate
+    WHERE scheme_name IN ('Meghalaya Piggery Development Scheme',
+                          'Meghalaya Poultry Farming Scheme')
+      AND lgd_district IN ('RI BHOI', 'EAST KHASI HILLS')
+    GROUP BY scheme_name, lgd_district
+    ORDER BY scheme_name, lgd_district;
+  tables:
+  - curated.v_cm_elevate
+  note: >
+    Two schemes AND two districts named together is one GROUP BY scheme_name,
+    lgd_district — four cells, not two separate single-scheme or single-district
+    queries. State all four counts and, if useful, which district leads for each
+    scheme.
+
 - question: Compare the three PRIME schemes
   sql: |
     SELECT scheme_name,
@@ -864,6 +881,54 @@ sql_generation_examples:
   tables:
   - curated.v_cm_elevate
 
+- question: What is the current application status distribution across CM Elevate?
+  sql: |
+    SELECT COALESCE(data_verified, '(not recorded)') AS status, COUNT(*) AS applications
+    FROM curated.v_cm_elevate
+    GROUP BY 1
+    ORDER BY applications DESC;
+  tables:
+  - curated.v_cm_elevate
+  note: >
+    "Current status" / "application status" with no further qualifier is
+    data_verified, NOT current_file_status — the word "current" in the question is
+    not a cue for the current_file_status COLUMN. current_file_status only applies
+    when the question says "file status" or "workflow" explicitly (see the
+    "workflow file status breakdown" example below).
+
+- question: How many CM Elevate applicants have completed data verification in Ri Bhoi?
+  sql: |
+    SELECT COUNT(*) FILTER (WHERE data_verified = 'Valid')            AS verified,
+           COUNT(*) FILTER (WHERE data_verified IS DISTINCT FROM 'Valid') AS not_verified,
+           COUNT(*)                                                   AS total_applications,
+           ROUND(COUNT(*) FILTER (WHERE data_verified = 'Valid') * 100.0
+                 / NULLIF(COUNT(*), 0), 1)                             AS verified_pct
+    FROM curated.v_cm_elevate
+    WHERE lgd_district = 'RI BHOI';
+  tables:
+  - curated.v_cm_elevate
+  note: >
+    "Completed verification" / "verified" means data_verified = 'Valid' — there is
+    no 'Completed' literal anywhere in this column, never invent one. State both the
+    verified and not-verified counts (On Hold + Invalid + Wrong + NULL combined),
+    plus the verified percentage, in one query — never just one side.
+
+- question: What is the status-wise applicant count for Piggery in Umshaken village?
+  sql: |
+    SELECT COALESCE(data_verified, '(not recorded)') AS status, COUNT(*) AS applications
+    FROM curated.v_cm_elevate
+    WHERE scheme_name = 'Meghalaya Piggery Development Scheme'
+      AND lgd_village_name = 'UMSHAKEN'
+    GROUP BY 1
+    ORDER BY applications DESC;
+  tables:
+  - curated.v_cm_elevate
+  note: >
+    "Status-wise ... count" is a GROUP BY over every data_verified value at the
+    named scope, never a single filtered count for one status guessed from the
+    scheme/village total — a village this small can still split across Valid /
+    On Hold / Invalid / Wrong / not-recorded.
+
 - question: How many applications have invalid or wrong data?
   sql: |
     SELECT data_verified, COUNT(*) AS applications
@@ -922,15 +987,19 @@ sql_generation_examples:
 
 - question: Show the workflow file status breakdown
   sql: |
-    SELECT current_file_status, COUNT(*) AS applications
+    SELECT CASE WHEN LOWER(current_file_status) LIKE 'sendback%' THEN 'sendback'
+                ELSE LOWER(current_file_status) END AS file_status,
+           COUNT(*) AS applications
     FROM curated.v_cm_elevate
-    GROUP BY current_file_status
+    GROUP BY 1
     ORDER BY applications DESC;
   tables:
   - curated.v_cm_elevate
   note: >
     About 98.4% sit at 'forward'. This is near-constant, not a distribution - and
     'forward' means the file moved on, NOT that it was approved or funded.
+    'sendback' and 'sendback to vdv/citizen' are the same idea stored two ways
+    (rule 7) - merged into one bucket here, never shown as two separate rows.
 
 - question: How many applications were sent back?
   sql: |
@@ -1225,6 +1294,35 @@ sql_generation_examples:
     applicants under the scheme. Contrast with the NEXT example, which explicitly asks
     for a breakdown "by" or "each" sector and groups by sector_id instead of filtering
     to one value.
+
+- question: How many applicants under Piggery and Poultry are associated with poultry sector in Ri Bhoi?
+  sql: |
+    SELECT scheme_name,
+           COUNT(*) FILTER (WHERE scheme_specific ->> 'sector_id' ILIKE 'poultry')
+             AS poultry_sector_applicants,
+           COUNT(*) FILTER (WHERE scheme_specific ->> 'sector_id' IS NOT NULL)
+             AS sector_recorded,
+           COUNT(*) AS scheme_total
+    FROM curated.v_cm_elevate
+    WHERE scheme_name IN ('Meghalaya Piggery Development Scheme',
+                          'Meghalaya Poultry Farming Scheme')
+      AND lgd_district = 'RI BHOI'
+    GROUP BY scheme_name
+    ORDER BY scheme_name;
+  tables:
+  - curated.v_cm_elevate
+  note: >
+    NAMING TWO SCHEMES TOGETHER — the sector test stays INSIDE the two
+    COUNT(*) FILTER(...) clauses only; it must NEVER also appear in the outer
+    WHERE. Putting it in the WHERE too (`AND scheme_specific ->> 'sector_id' IS
+    NOT NULL`) silently corrupts scheme_total into the sector-recorded count AND
+    drops Piggery from the result entirely, since Piggery never carries
+    sector_id at all (confirmed live 2026-09-12: this exact mistake reported
+    Poultry's Ri Bhoi scheme_total as 8 instead of the real 238, with Piggery
+    missing rather than shown as 0/0/1950). Every named scheme gets its own row
+    with its true, unfiltered scheme_total — for one with no sector_id key at
+    all, say plainly that sector isn't tracked for it rather than reading its
+    0 as "checked and found none".
 
 - question: How many CM Elevate applicants are associated with each poultry sector?
   sql: |

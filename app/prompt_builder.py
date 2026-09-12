@@ -126,7 +126,21 @@ def _entities_block(entity_result: dict) -> str:
             "values, not any name or spelling from the question text. These are already "
             "resolved against the database (correct case, correct code, correct year_key):"
         )
+        # A resolved village_code already pins one exact village — a finer grain than
+        # district/block, which entity resolution also carries here only because they
+        # scoped the village lookup (resolve_village(text, district=..., block=...)),
+        # not because the question needs them enforced as their own separate filter.
+        # Rendering "lgd_block = 'MAWSHYNRUT'" as an equally MANDATORY entity alongside
+        # village_code told the SQL verifier the block filter must appear verbatim too;
+        # a generator that reasonably left it out (village_code already implies it) then
+        # got its correct SQL rejected as "missing the resolved block entity" (reported
+        # 2026-09-12 UAT: Nongthymmai in Mawshynrut block, WEST KHASI HILLS). Suppress
+        # district/block here whenever village_code is present — they are redundant
+        # with it, never an independent filter to double up on.
+        _skip = {"district", "block"} if resolved.get("village_code") else set()
         for k, v in resolved.items():
+            if k in _skip:
+                continue
             if k == "district_list_region":
                 continue  # rendered alongside district_list
             if k == "village_code":
@@ -156,6 +170,15 @@ def _entities_block(entity_result: dict) -> str:
                     f"  lgd_block IN ({quoted})   -- the {len(vals)} blocks explicitly named "
                     "for comparison. Filter on ALL of them with IN and GROUP BY block so each "
                     "gets its own row in the result — do NOT sum them into one figure.")
+            elif k == "village_code_list":
+                vals = v if isinstance(v, list) else [v]
+                quoted = ", ".join(str(s) for s in vals)
+                lines.append(
+                    f"  village_code IN ({quoted})   -- the {len(vals)} villages explicitly "
+                    "named for comparison. Filter on ALL of them with IN and GROUP BY "
+                    "village_code (and lgd_village_name, which is on the same row) so each "
+                    "village gets its own row in the result — do NOT sum them into one figure, "
+                    "and do NOT filter on lgd_village_name instead.")
             elif k == "assembly_constituency":
                 lines.append(
                     f"  UPPER(assembly_constituency_name) = UPPER({v!r})   -- this column "
@@ -283,6 +306,66 @@ SQL: SELECT SUM(amount_disbursed) AS amount_raw FROM curated.v_focus_plus WHERE 
   exactly one row, so the trailing LIMIT 1 is a harmless no-op, not evidence the
   query is missing an aggregate. Read whether SUM/COUNT/AVG wraps the metric
   column, never the presence of "LIMIT 1" by itself, to answer check 3.)
+
+Q: "How many households completed 100 days of work in Maska?"
+RESOLVED ENTITIES: village_code = 277769
+SQL: SELECT SUM(households_completed_100_days) AS households_completed_100_days FROM curated.v_employment WHERE village_code = 277769;
+{"ok": true}
+  (village_code is a surrogate integer key, not the place name — it will NEVER
+  textually resemble "Maska" the way lgd_district = 'EAST GARO HILLS' resembles
+  the district name in the question. That mismatch is expected and correct, not
+  a sign the entity was dropped or substituted. Check 2 asks whether the
+  RESOLVED ENTITY's value (277769) is in the WHERE clause verbatim — it is —
+  never whether the question's own place name also appears literally.)
+
+Q: "How much was disbursed under Focus Plus Tranch 2 for all of Meghalaya, all years"
+RESOLVED ENTITIES: tranche_label = 'Tranch 2 - August'
+SQL: SELECT SUM(amount_disbursed) AS amount_raw FROM curated.v_focus_plus WHERE tranche_label = 'Tranch 2 - August';
+{"ok": true}
+  (Confirmed live 2026-09-12 as a repeat false-positive: a verifier run kept
+  rejecting this exact query, arguing "the question asks for all of Meghalaya,
+  all years" so the SQL must ALSO filter lgd_district and year_key — that is
+  backwards. "For all of Meghalaya, all years" is the ONE-TAP CHIP TEXT for
+  "no geography filter, no year filter" (see the calibration instruction above)
+  — it is not a second and third resolved entity on top of the tranche. The
+  ONLY RESOLVED ENTITY here is tranche_label, and it IS present in the WHERE
+  clause verbatim. A correct query for "all of Meghalaya, all years" has NO
+  lgd_district and NO year_key filter — adding one, or rejecting the query for
+  lacking one, is the actual violation.)
+
+Q: "How many farmers received Focus Plus assistance during FY 2025-26?"
+RESOLVED ENTITIES: (empty)
+SQL: SELECT COUNT(*) AS registrations FROM curated.v_focus_plus WHERE batch_label = '12.5K' AND occupation = 'Farmer' AND year_key = 2025;
+{"ok": true}
+  (RESOLVED ENTITIES is empty, but that only means the question named no
+  district/block/village/tranche for the entity resolver to pin. batch_label
+  and occupation are NOT entities — they are business-vocabulary filters the
+  SCHEMA RULES require for this question shape (a schema rule literally says
+  "farmers" -> occupation = 'Farmer', scoped to batch_label = '12.5K' because
+  occupation is only ever populated on that cohort). A schema-rule-mandated
+  categorical filter with no matching row in an empty RESOLVED ENTITIES block
+  is expected and correct — it is not "inventing an unlisted filter". Check 2
+  only flags a RESOLVED ENTITY's value being dropped or substituted; it never
+  flags a category value (batch_label, gender, occupation, focus_status,
+  verification_status, or any other closed-vocabulary column) that the SCHEMA
+  RULES derive directly from a word in the question, whether or not the
+  entities block happens to be empty.)
+
+Q: "What was the total expenditure in Nongthymmai, Mawshynrut block, West Khasi Hills for FY 2022-23?"
+RESOLVED ENTITIES: village_code = 276411
+           year_key = 2022
+SQL: SELECT SUM(total_exp) AS total_expenditure_lakh FROM curated.v_expenditure WHERE village_code = 276411 AND year_key = 2022;
+{"ok": true}
+  (The question names a block ("Mawshynrut") and a district ("West Khasi
+  Hills") in its own text, but the RESOLVED ENTITIES block above lists ONLY
+  village_code and year_key — no lgd_block, no lgd_district. That is
+  deliberate: village_code already pins one exact village, which is already
+  inside that one exact block and district, so a separate lgd_block /
+  lgd_district filter would be pure redundancy, not a missing requirement.
+  NEVER treat a block/district name that appears in the QUESTION text as an
+  entity the SQL must separately filter on — check 2 only ever applies to
+  values that appear in the RESOLVED ENTITIES block itself; an unlisted
+  district/block name is not a violation to invent.)
 """.strip()
 
 
@@ -318,12 +401,35 @@ def build_verify_prompt(question: str, schemes: list[str], entity_result: dict, 
         "above — an empty or absent block means there is nothing to check here, "
         "so answer this check true regardless of the question's own wording. "
         "A phrase in the QUESTION itself like 'all years', 'all tranches', "
-        "'all financial years', 'combined', 'overall' or 'cumulative' is NEVER "
-        "a resolved entity requiring a WHERE-clause value — it is an "
-        "instruction to filter on NOTHING for that dimension, so a WHERE "
-        "clause that omits it entirely is correct, not a violation. Do not "
-        "invent a resolved entity from question text that isn't in the "
-        "RESOLVED ENTITIES block.\n"
+        "'all financial years', 'all districts', 'all of Meghalaya', 'statewide', "
+        "'the whole state', 'every district', 'combined', 'overall' or "
+        "'cumulative' is NEVER a resolved entity requiring a WHERE-clause value "
+        "— each names a dimension (year, tranche, geography, ...) and is an "
+        "instruction to filter on NOTHING for THAT dimension only, so a WHERE "
+        "clause that omits a filter for that one dimension is correct, not a "
+        "violation — this holds independently for every dimension the question "
+        "mentions, so 'Tranch 2 for all of Meghalaya, all years' correctly keeps "
+        "the tranche_label filter (a real RESOLVED ENTITY) while correctly "
+        "omitting BOTH a geography filter (because of 'all of Meghalaya') AND a "
+        "year filter (because of 'all years') — omitting those two is not "
+        "'missing requirements from the question's scope', it is exactly what "
+        "'all of Meghalaya, all years' asks for. Do not invent a resolved entity "
+        "from question text that isn't in the RESOLVED ENTITIES block. Separately: "
+        "a WHERE-clause filter on a CLOSED-VOCABULARY CATEGORY COLUMN (e.g. "
+        "batch_label, gender, occupation, focus_status, verification_status, "
+        "status_name, data_verified, applicant_category — any column whose schema "
+        "rules or business-vocabulary mapping tie it to a word in the question, "
+        "such as 'farmers' -> occupation = 'Farmer' or a gender/status breakdown "
+        "requiring batch_label = '12.5K') is NEVER something Check 2 evaluates, "
+        "REGARDLESS of whether the RESOLVED ENTITIES block is empty, non-empty, or "
+        "says nothing about that column. RESOLVED ENTITIES only ever lists "
+        "geography/time/tranche-style identifiers the entity resolver pinned "
+        "(district, block, village, year, tranche); it is not, and was never meant "
+        "to be, an exhaustive list of every WHERE-clause value the SQL is allowed "
+        "to contain. Judge check 2 ONLY on whether a RESOLVED ENTITY's own value "
+        "was dropped or substituted — never flag a category-column filter as "
+        "'not in the resolved entities' or 'not mandated by the question', that is "
+        "not what this check is for.\n"
         "  3. Table/grain — does it read a raw per-row table when the question "
         "asks for a total (missing SUM/COUNT), or vice versa? Judge this ONLY by "
         "whether SUM/COUNT/AVG wraps the metric column — a trailing LIMIT clause "
