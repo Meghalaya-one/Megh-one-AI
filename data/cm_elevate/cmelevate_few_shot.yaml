@@ -15,6 +15,11 @@
 #   COUNT(*) ONLY                   there is NO measure column. If an example
 #                                   contains SUM or AVG over a v_cm_elevate
 #                                   column, it is WRONG
+#   applicants -> DISTINCT          "applicants"/"beneficiaries" = distinct people,
+#                                   COUNT(DISTINCT request_id) - request_id repeats on
+#                                   ~36 rows (all Piggery), so COUNT(*) overcounts them.
+#                                   "applications"/"requests" = the raw row count,
+#                                   COUNT(*), unchanged. (2026-09-13 policy change)
 #   NO DATE ANYTHING                no year, month, date_trunc, BETWEEN on a date,
 #                                   no ingested_at, no request_id parsing
 #   entity_type <> 'Unresolved'     on VILLAGE counts and lists only - never on
@@ -58,14 +63,39 @@ sql_generation_examples:
 
 - question: How many beneficiaries are there under CM Elevate?
   sql: |
-    SELECT COUNT(*) AS applications
+    SELECT COUNT(DISTINCT request_id) AS applicants
     FROM curated.v_cm_elevate;
   tables:
   - curated.v_cm_elevate
   note: >
-    'Beneficiary' resolves to an application. The grain is a REQUEST, not an award -
-    nothing in this data confirms anyone received anything. Say 'applications' in the
-    answer.
+    'Beneficiary' resolves to an applicant, not a raw row. The grain is a REQUEST, not
+    an award - nothing in this data confirms anyone received anything - but request_id
+    is also NOT unique (about 36 numbers repeat, all inside Piggery), so a bare
+    COUNT(*) overcounts applicants by those duplicates. Say 'applicants' in the answer,
+    not 'applications'.
+
+- question: How many CM Elevate applicants are there?
+  sql: |
+    SELECT COUNT(DISTINCT request_id) AS applicants
+    FROM curated.v_cm_elevate;
+  tables:
+  - curated.v_cm_elevate
+  note: >
+    'Applicants' means distinct people, not rows. Dedupe on request_id - never
+    COUNT(*), which double-counts the ~36 repeating request_id values. Contrast with
+    'How many CM Elevate applications are there?' above, which asks for the raw
+    request count and stays COUNT(*).
+
+- question: How many CM Elevate applicants are there in West Garo Hills?
+  sql: |
+    SELECT COUNT(DISTINCT request_id) AS applicants
+    FROM curated.v_cm_elevate
+    WHERE lgd_district = 'WEST GARO HILLS';
+  tables:
+  - curated.v_cm_elevate
+  note: >
+    Same rule as the programme-level applicant count, scoped by district: 'applicants'
+    dedupes on request_id, 'applications' does not.
 
 - question: How many distinct applications are there?
   sql: |
@@ -381,6 +411,32 @@ sql_generation_examples:
     lgd_district — four cells, not two separate single-scheme or single-district
     queries. State all four counts and, if useful, which district leads for each
     scheme.
+
+- question: How many applicants are there in Umling block under Piggery, Poultry and Dairy?
+  sql: |
+    SELECT scheme_name,
+           COUNT(DISTINCT request_id) AS applicants
+    FROM curated.v_cm_elevate
+    WHERE scheme_name IN ('Meghalaya Piggery Development Scheme',
+                          'Meghalaya Poultry Farming Scheme',
+                          'Meghalaya Dairy Development Scheme')
+      AND lgd_block = 'UMLING'
+    GROUP BY scheme_name
+    ORDER BY scheme_name;
+  tables:
+  - curated.v_cm_elevate
+  note: >
+    THREE (OR MORE) NAMED SCHEMES IN ONE "how many applicants" QUESTION IS STILL
+    A GROUP BY, never a single merged COUNT(*) with no breakdown — the same rule
+    as the two-scheme case above, it does not relax as more schemes are listed.
+    State each scheme's own applicant count AND the combined total across all
+    three (confirmed live 2026-09-13: "Piggery, Poultry and Dairy" collapsed to
+    one bare `COUNT(*) ... WHERE scheme_name IN (...)` with no GROUP BY at all,
+    losing the per-scheme breakdown the question needs and also using COUNT(*)
+    instead of COUNT(DISTINCT request_id) for "applicants"). Naming three or
+    four schemes by comma list ("A, B and C") is exactly the same shape as
+    naming two with "and" — resolve every named scheme into the IN-list and
+    GROUP BY scheme_name regardless of how many are named.
 
 - question: Compare the three PRIME schemes
   sql: |
@@ -1343,6 +1399,39 @@ sql_generation_examples:
     so rather than implying full coverage. "Sector" in a question about ONE already-named
     scheme is not asking to filter further; COALESCE the NULLs into their own bucket
     instead of dropping them.
+
+- question: Give me the applicant count and pendency status for Piggery, Poultry and Dairy in Ri Bhoi, broken down by sector.
+  sql: |
+    SELECT scheme_name,
+           COALESCE(scheme_specific ->> 'sector_id', '(not recorded)') AS sector,
+           COUNT(*) AS applicant_count,
+           COUNT(*) FILTER (WHERE data_verified = 'On Hold') AS pending_applications
+    FROM curated.v_cm_elevate
+    WHERE scheme_name IN ('Meghalaya Piggery Development Scheme',
+                          'Meghalaya Poultry Farming Scheme',
+                          'Meghalaya Dairy Development Scheme')
+      AND lgd_district = 'RI BHOI'
+    GROUP BY scheme_name, sector
+    ORDER BY scheme_name, applicant_count DESC;
+  tables:
+  - curated.v_cm_elevate
+  note: >
+    "BROKEN DOWN BY SECTOR" / "BY SECTOR" / "EACH SECTOR" WITH NO SPECIFIC SECTOR
+    VALUE NAMED means GROUP BY the sector dimension itself (COALESCE the NULLs
+    into their own "(not recorded)" bucket) — it is a completely different
+    request from "associated with POULTRY sector" / "belongs to DAIRY sector",
+    which names one sector VALUE to filter/count, not a breakdown (see the
+    "poultry sector" examples above; that shape uses COUNT(*) FILTER(...), never
+    a plain GROUP BY). Do NOT confuse the two just because one of the SCHEMES
+    named in the IN-list (here, "Poultry") is spelled the same as a possible
+    sector VALUE — the question is asking for a cross-tab of scheme x sector,
+    not "how many of these three schemes are in the poultry sector" (confirmed
+    live 2026-09-13: this exact question was answered instead with a
+    poultry_sector_applicants FILTER on every scheme, which is the wrong
+    request — it silently substituted the narrower filtered-count shape for the
+    breakdown that was actually asked for). Piggery carries no sector_id key at
+    all, so every one of its rows lands in "(not recorded)" — that is the
+    correct, informative answer for Piggery here, not a sign the query is wrong.
 
 - question: How many scheme-specific fields does each scheme record?
   sql: |

@@ -64,9 +64,18 @@ _PRECEDING_STOPWORDS = {
 _PRECEDING_STOP_PHRASES = ("more than", "less than", "at least", "at most", "up to",
                            "fewer than", "greater than", "no more than", "as many as")
 # Words right after the number that mark it as a ranking length, not a stock.
+# "batch"/"cohort" are here for a different reason: in this schema "12.5K" and
+# "93K" are literal batch_label VALUES (proper names for the two Focus Plus
+# cohorts, see schema_context.py rule 4) — "the 12.5K batch" names which rows
+# to read, it doesn't assert a count of anything. Without this, has_scale in
+# _is_asserted_quantity below treats every "<number><scale>" as a stock
+# regardless of context, so "status breakdown for the 12.5K batch" (whose
+# breakdown sums to 12,527, not exactly 12,500) got flagged as contradicting
+# an "assumed figure" it never asserted. Confirmed live 2026-09-12.
 _FOLLOWING_STOPWORDS = {
     "highest", "lowest", "largest", "smallest", "biggest", "top", "best", "worst",
     "leading", "years", "year", "months", "month", "days", "day", "weeks", "quarters",
+    "batch", "batches", "cohort", "cohorts",
 }
 
 # Determiners that flag the number as a *given* the question builds on.

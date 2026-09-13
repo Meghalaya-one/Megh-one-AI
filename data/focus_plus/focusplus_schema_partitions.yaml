@@ -1096,6 +1096,22 @@ few_shot_examples:
            COUNT(*) FILTER (WHERE member_id IS NULL) AS payments_with_no_member_id
     FROM curated.v_focus_plus;
 
+- question: How many Focus Plus beneficiaries are there in West Garo Hills?
+  explanation: >
+    Scoped to one named district with no grouping and nothing to compare against, so
+    this is a request for a single figure, not the ambiguity-driven three-reading
+    breakdown above. COUNT(DISTINCT source_sl_no) is the answer - the same proxy
+    already used for "beneficiaries" in the per-beneficiary average examples - and,
+    exactly as there, it carries batch_label = '93K' rather than being left bare:
+    source_sl_no numbering restarts within each batch, so an unscoped distinct count
+    would silently mix the two cohorts' serials as if they were one identifier space.
+  sql: |
+    SELECT COUNT(DISTINCT source_sl_no) AS beneficiaries
+    FROM curated.v_focus_plus
+    WHERE lgd_district = 'WEST GARO HILLS'
+      AND batch_label = '93K'
+      AND NOT has_geo_conflict;
+
 - question: How many disbursements are there in each batch?
   explanation: batch_label splits the fact into the paid legacy cohort and the newer registration cohort. Most Focus Plus questions need this split.
   sql: |

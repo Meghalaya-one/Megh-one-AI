@@ -584,9 +584,19 @@ def resolve_dimension(text: str, scheme: str, dimension: str) -> Resolved:
     folded_input = fold(text)
     squashed_input = _squash(folded_input)
 
-    # Stage 1 + 2: exact match on canonical or an alias.
+    # Stage 1 + 2: exact match on canonical, an alias, or the acronym
+    # ("WGH" for West Garo Hills) — without the acronym in `candidates`, a
+    # question like "beneficiaries in wgh" only resolves when the LLM mention
+    # extractor happens to drop the district slot entirely and the raw-text
+    # `scan_dimension` backstop kicks in; when the extractor instead echoes
+    # "wgh" back verbatim as the district mention, this function used to be
+    # the only thing consulted and fell through to not_found, leaving the
+    # RESOLVED ENTITIES block empty even though the abbreviation is genuine
+    # (confirmed live 2026-09-13: a resumed "...in wgh across all financial
+    # years" turn failed this way while the original "...in wgh?" turn had
+    # happened to hit the scan_dimension backstop instead).
     for v in values:
-        candidates = [v["canonical"]] + v.get("aliases", [])
+        candidates = _match_forms(v)
         if folded_input in (fold(c) for c in candidates):
             canon = _db_form(v["canonical"], dimension)
             return Resolved("resolved", dimension, text, canonical=canon, confidence=1.0,
@@ -594,7 +604,7 @@ def resolve_dimension(text: str, scheme: str, dimension: str) -> Resolved:
 
     # Stage 3: squash (strip all punctuation/spacing) match.
     for v in values:
-        candidates = [v["canonical"]] + v.get("aliases", [])
+        candidates = _match_forms(v)
         if squashed_input in (_squash(fold(c)) for c in candidates):
             canon = _db_form(v["canonical"], dimension)
             return Resolved("resolved", dimension, text, canonical=canon, confidence=0.95,

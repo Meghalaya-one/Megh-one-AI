@@ -245,6 +245,23 @@ def _prohibited_block(schemes: list[str]) -> str:
     return f"\nPROHIBITED JOINS:\n{prohibited}\n" if prohibited else ""
 
 
+def _fewshot_ranking_text(question: str, entity_result: dict) -> str:
+    """`question` plus any resolved district/block canonical names, so few-shot
+    retrieval matches geography-specific worked examples even when the question
+    uses an abbreviation or alias (e.g. "wgh") that doesn't textually overlap
+    with an example's spelled-out district name. Ranking-only — the literal
+    question sent to the LLM is untouched (see build_sql_prompt below).
+    Confirmed live 2026-09-13: without this, "...beneficiaries in wgh across
+    all financial years" scored every financial-year example above the correct
+    single-district worked example, because "wgh" shares no tokens with "West
+    Garo Hills" and financial/year did double duty for four separate examples."""
+    resolved = entity_result.get("resolved", {})
+    extra = " ".join(
+        str(resolved[k]) for k in ("district", "block") if resolved.get(k)
+    )
+    return f"{question} {extra}".strip() if extra else question
+
+
 def build_sql_prompt(question: str, schemes: list[str], entity_result: dict) -> str:
     catalog = schema_introspect.catalog_block(schemes)
     return "".join([
@@ -252,7 +269,7 @@ def build_sql_prompt(question: str, schemes: list[str], entity_result: dict) -> 
         _live_schema_block(schemes),
         (catalog + "\n") if catalog else "",
         _prohibited_block(schemes),
-        _fewshot_block(schemes, question),
+        _fewshot_block(schemes, _fewshot_ranking_text(question, entity_result)),
         _entities_block(entity_result),
         f"\nThe user's question is about: {', '.join(schemes)}.\n",
         f'\nQuestion: "{question}"\nSQL:',

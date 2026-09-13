@@ -26,11 +26,38 @@ _SUBJECT_TO_SCHEME = {"mgnrega": "MGNREGA", "pmay": "PMAY-G", "pmayg": "PMAY-G",
 
 _cache: dict = {
     "loaded": False, "tables": [], "glossary": [], "metrics": [], "joins": [],
+    "columns": [],
     # Live information_schema extract (structure, not SME prose). Populated by
     # _load_live_schema(); empty => the prompt falls back to the hand-written
     # schema_context.py backbone alone.
     "live_loaded": False, "live_columns": {}, "live_fks": [],
 }
+
+# semantic.column_catalog has no subject_area column of its own (unlike
+# table_catalog/glossary) — its rows are keyed by table_name, so scheme
+# membership is inferred from a substring match instead. Shared dimension
+# tables (dim_geography, dim_year, dim_scheme, ...) match nothing here and
+# fall through to "applies to every scheme", same as a NULL subject_area
+# elsewhere in this module.
+_TABLE_NAME_TO_SCHEME = {
+    "employment": "MGNREGA", "expenditure": "MGNREGA", "mgnrega": "MGNREGA",
+    "pmay": "PMAY-G",
+    "focus_plus": "Focus Plus",
+    "cm_elevate": "CM Elevate",
+}
+
+
+def _table_matches_scheme(table_name: str, schemes: list[str]) -> bool:
+    name = (table_name or "").lower()
+    for key, scheme in _TABLE_NAME_TO_SCHEME.items():
+        if key in name:
+            return scheme in schemes
+    return True
+
+
+def _is_scheme_specific_table(table_name: str) -> bool:
+    name = (table_name or "").lower()
+    return any(key in name for key in _TABLE_NAME_TO_SCHEME)
 
 # The only schemas the read-only app role can see, and the only ones worth
 # putting in front of the SQL generator.
@@ -63,10 +90,31 @@ async def _load_semantic_catalog() -> None:
             _cache["joins"] = await db.fetch_rows("SELECT * FROM semantic.join_graph")
         except Exception:  # noqa: BLE001
             _cache["joins"] = []
+        try:
+            # Client UAT sheet (2026-09-13): this table is where SMEs record the
+            # traps that actually break generated SQL — new/renamed identity
+            # columns (beneficiary_key), verbatim source spellings that don't
+            # match the "correct" English word (tranche_label stored as
+            # "Tranch"), and storage-format gotchas (lgd_district/lgd_block
+            # stored UPPERCASE-only). Until now nothing in the prompt pipeline
+            # ever read it — every one of those traps had to be discovered live
+            # and hand-copied into schema_context.py/the few-shot yaml, which is
+            # exactly the kind of manual sync that drifts. Loading it here means
+            # a new data_quality_note SMEs add shows up in the prompt the next
+            # time the process restarts, without a matching code change.
+            _cache["columns"] = await db.fetch_rows(
+                """SELECT table_schema, table_name, column_name, description,
+                          data_quality_note
+                   FROM semantic.column_catalog
+                   WHERE is_chatbot_visible IS NOT FALSE
+                     AND (data_quality_note IS NOT NULL OR description IS NOT NULL)
+                   ORDER BY table_schema, table_name, column_name""")
+        except Exception:  # noqa: BLE001 — table shape varies; optional
+            _cache["columns"] = []
         _cache["loaded"] = True
         logger.info("schema_introspect: catalog loaded — %d tables, %d glossary terms, "
-                    "%d metrics", len(_cache["tables"]), len(_cache["glossary"]),
-                    len(_cache["metrics"]))
+                    "%d metrics, %d column notes", len(_cache["tables"]), len(_cache["glossary"]),
+                    len(_cache["metrics"]), len(_cache["columns"]))
     except Exception as e:  # noqa: BLE001 — never block startup on the catalog
         logger.warning("schema_introspect: catalog load failed (SQL prompt uses static "
                        "context only): %s", e)
@@ -179,6 +227,23 @@ def catalog_block(schemes: list[str], *, max_terms: int = 24) -> str:
             if name and formula:
                 lines.append(f"  {name} = {str(formula)[:200]}")
 
+    # data_quality_note carries the traps that actually break queries (a new
+    # identity column, a verbatim source misspelling, a case-sensitive storage
+    # format) — surfaced ahead of description since that's what a query
+    # generator needs to see before writing SQL, not after something breaks.
+    cols = [c for c in _cache["columns"] if _table_matches_scheme(c.get("table_name"), schemes)]
+    # Scheme-specific traps first, shared dim_* notes after — so the max_terms
+    # cap (below) trims generic geography/year notes before it ever trims a
+    # scheme-specific one, regardless of which sorts first alphabetically.
+    cols = sorted(cols, key=lambda c: not _is_scheme_specific_table(c.get("table_name")))
+    if cols:
+        lines.append("\nLIVE CATALOG — column notes (from semantic.column_catalog):")
+        for c in cols[:max_terms]:
+            note = (c.get("data_quality_note") or c.get("description") or "").strip()
+            if note:
+                lines.append(
+                    f"  {c['table_schema']}.{c['table_name']}.{c['column_name']}: {note[:280]}")
+
     return ("\n".join(lines) + "\n") if lines else ""
 
 
@@ -188,6 +253,7 @@ def snapshot() -> dict:
         "tables": _cache["tables"],
         "glossary": _cache["glossary"],
         "metrics": _cache["metrics"],
+        "columns": _cache["columns"],
         "join_graph": _cache["joins"],
         "live_loaded": _cache["live_loaded"],
         "live_columns": _cache["live_columns"],

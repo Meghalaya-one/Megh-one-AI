@@ -1590,12 +1590,214 @@ _MENTIONS_TRANCHE_WORD = re.compile(r"\btranche?s?\b", re.IGNORECASE)
 # "How many Focus Plus registrations are still pending?" in
 # data/focus_plus/focusplus_few_shot.yaml).
 _PERSON_LEVEL_COLUMN_CUE = re.compile(
-    r"\bfocus[\s-]?status\b|\bverification[\s-]?status\b|\bverified\b|\bverification\b|"
+    # Bare "status" is included, not just the "focus status" / "verification
+    # status" compounds — schema_context.py rule 13 makes an unqualified
+    # "status"/"status breakdown"/"status-wise" mean focus_status by default,
+    # which is exactly as cohort-locked as the compound forms. Missing this
+    # let "give me the status breakdown for tranche 1" slip past both this
+    # gate and _person_level_tranche_conflict straight into a guaranteed-empty
+    # query (confirmed live 2026-09-12).
+    r"\bstatus\b|\bfocus[\s-]?status\b|\bverification[\s-]?status\b|\bverified\b|\bverification\b|"
     r"\bgender\b|\bfemale\b|\bmale\b|\bwomen\b|\bmen\b|"
     r"\boccupation\b|\bfarmers?\b|"
     r"\bpending\b|\bapproved\b|\brejected\b|\bregistrations?\b",
     re.IGNORECASE,
 )
+
+# A tranche label is "Tranch 4 - Feb-March" — the ONLY tranche the 12.5K
+# person-level cohort belongs to (schema_context.py rule 4/8). Matches the
+# canonical value's leading "Tranch 4" regardless of the month suffix.
+_TRANCH4_LABEL_RE = re.compile(r"^tranch\s*4\b", re.IGNORECASE)
+
+
+def _person_level_tranche_conflict(question: str, schemes: list[str], resolved: dict) -> bool:
+    """True when the question asks for a person-level column (status/gender/
+    occupation/verification — the 12.5K-cohort-only fields, rule 4) AND names
+    one or more SPECIFIC tranches, NONE of which is Tranch 4. That combination
+    can never have any matching rows — the 12.5K cohort IS Tranch 4, so a
+    filter for Tranch 1/2/3 plus any of these columns is a structural
+    contradiction, not an ordinary "no rows matched" outcome. Left to run as
+    plain SQL this produces the confusing generic "couldn't find any matching
+    records" fallback (`_no_data_answer`) with no explanation of WHY — catching
+    it here lets `_answer_data` explain the real reason instead, and skips a
+    wasted SQL round trip. Scoped to single-scheme Focus Plus only, mirroring
+    `_needs_tranche_clarification`."""
+    if (schemes or []) != ["Focus Plus"]:
+        return False
+    if not _PERSON_LEVEL_COLUMN_CUE.search(question or ""):
+        return False
+    tranche_label = resolved.get("tranche_label")
+    if not tranche_label:
+        return False
+    labels = tranche_label if isinstance(tranche_label, list) else [tranche_label]
+    return not any(_TRANCH4_LABEL_RE.match(str(lbl)) for lbl in labels)
+
+
+def _person_level_tranche_conflict_answer(question: str, schemes: list[str],
+                                          entity_result: dict) -> dict:
+    """Deterministic explanation for `_person_level_tranche_conflict` — no SQL
+    is run because the answer (zero rows, always) is already known from the
+    schema, not from the data."""
+    display = entity_result.get("display", {}).get("tranche_label") or "that tranche"
+    resolved = entity_result["resolved"]
+    answer = (
+        f"{display} has no status, gender, occupation or verification data. "
+        "Those fields are recorded only for the 12.5K registration cohort, and "
+        "that cohort falls entirely under Tranch 4 — ask for Tranch 4, or drop "
+        "the tranche filter, to see that breakdown."
+    )
+    return {
+        "route": "data",
+        "intent": "DATA",
+        "confidence": "high",
+        "schemes": schemes,
+        "resolved_entities": resolved,
+        "sql": "",
+        "sql_query": "",
+        "row_count": 0,
+        "rows": [],
+        "data": [],
+        "answer": answer,
+    }
+
+
+# Client UAT sheet (FOCUS-030, 2026-09-13): "Give me an overall Focus+ data
+# summary" got a correct but thin answer — just payments/beneficiaries/amount/
+# districts/blocks/villages from one plain SELECT. The client's remark wants a
+# richer report: years/batches/tranches available, the top district by each
+# of two different rankings (most beneficiaries vs. highest disbursement —
+# genuinely different districts in this data), top bank, and the 12.5K-only
+# gender/occupation/status/verification splits. That shape can't come from one
+# flat SELECT the normal way (each of those needs its own GROUP BY / ORDER BY /
+# LIMIT 1), and letting the LLM free-write ad hoc SQL plus prose for a dozen
+# figures at once is exactly the kind of multi-fact answer this project's
+# numeric-faithfulness guard exists to catch failures of, not prevent them.
+# Deterministic instead: one CTE query gets every figure in a single round
+# trip, and the answer is built directly from those rows — no composer call,
+# so nothing here can be transcribed wrong.
+_FOCUSPLUS_OVERALL_SUMMARY_CUE = re.compile(
+    r"\boverall\b[^.?!]{0,40}\b(summary|picture|snapshot)\b|"
+    r"\b(summary|snapshot|overview)\b[^.?!]{0,40}\boverall\b|"
+    r"\b(complete|full|entire)\s+(data\s+)?summary\b|"
+    r"\bsummari[sz]e\b.{0,30}\bfocus\b|\bfocus\b.{0,30}\bdata\s+summary\b",
+    re.IGNORECASE,
+)
+
+_FOCUSPLUS_OVERALL_SUMMARY_SQL = """
+WITH totals AS (
+  SELECT COUNT(*) AS payments,
+         COUNT(DISTINCT beneficiary_key) AS beneficiaries,
+         SUM(amount_disbursed) AS amount,
+         COUNT(DISTINCT lgd_district) AS districts,
+         COUNT(*) FILTER (WHERE lgd_district IS NULL) AS missing_district_rows
+  FROM curated.v_focus_plus
+),
+years AS (
+  SELECT string_agg(DISTINCT financial_year_short, ', ' ORDER BY financial_year_short) AS years_list
+  FROM curated.v_focus_plus
+),
+batches AS (
+  SELECT string_agg(DISTINCT batch_label, ', ' ORDER BY batch_label) AS batch_list
+  FROM curated.v_focus_plus
+),
+tranches AS (
+  SELECT COUNT(DISTINCT tranche_label) AS tranche_count
+  FROM curated.v_focus_plus
+),
+top_beneficiary_district AS (
+  SELECT lgd_district AS top_ben_district, COUNT(DISTINCT beneficiary_key) AS top_ben_district_count
+  FROM curated.v_focus_plus WHERE lgd_district IS NOT NULL
+  GROUP BY lgd_district ORDER BY top_ben_district_count DESC LIMIT 1
+),
+top_disbursement_district AS (
+  SELECT lgd_district AS top_amt_district, SUM(amount_disbursed) AS top_amt_district_amount
+  FROM curated.v_focus_plus WHERE lgd_district IS NOT NULL
+  GROUP BY lgd_district ORDER BY top_amt_district_amount DESC LIMIT 1
+),
+top_bank AS (
+  SELECT bank_name_raw AS top_bank_name, SUM(amount_disbursed) AS top_bank_amount
+  FROM curated.v_focus_plus WHERE bank_name_raw IS NOT NULL AND bank_name_raw !~ '^[0-9]+$'
+  GROUP BY bank_name_raw ORDER BY top_bank_amount DESC LIMIT 1
+),
+gender AS (
+  SELECT COUNT(*) FILTER (WHERE gender = 'Female') AS female,
+         COUNT(*) FILTER (WHERE gender = 'Male') AS male
+  FROM curated.v_focus_plus WHERE batch_label = '12.5K'
+),
+occupation AS (
+  SELECT COUNT(*) FILTER (WHERE occupation = 'Farmer') AS farmers
+  FROM curated.v_focus_plus WHERE batch_label = '12.5K'
+),
+status AS (
+  SELECT COUNT(*) FILTER (WHERE focus_status = 'Pending') AS pending,
+         COUNT(*) FILTER (WHERE focus_status = 'Approved') AS approved,
+         COUNT(*) FILTER (WHERE focus_status = 'Rejected') AS rejected,
+         COUNT(*) FILTER (WHERE verification_status = 'Approved') AS verified_approved
+  FROM curated.v_focus_plus WHERE batch_label = '12.5K'
+)
+SELECT totals.payments, totals.beneficiaries, totals.amount, totals.districts,
+       totals.missing_district_rows, years.years_list, batches.batch_list,
+       tranches.tranche_count, top_beneficiary_district.top_ben_district,
+       top_beneficiary_district.top_ben_district_count,
+       top_disbursement_district.top_amt_district,
+       top_disbursement_district.top_amt_district_amount,
+       top_bank.top_bank_name, top_bank.top_bank_amount,
+       gender.female, gender.male, occupation.farmers,
+       status.pending, status.approved, status.rejected, status.verified_approved
+FROM totals, years, batches, tranches, top_beneficiary_district,
+     top_disbursement_district, top_bank, gender, occupation, status
+LIMIT 1;
+""".strip()
+
+
+def _focusplus_wants_overall_summary(question: str, schemes: list[str]) -> bool:
+    return schemes == ["Focus Plus"] and bool(_FOCUSPLUS_OVERALL_SUMMARY_CUE.search(question or ""))
+
+
+def _money(v) -> str:
+    return f"₹{float(v):,.2f}"
+
+
+async def _focusplus_overall_summary_answer(schemes: list[str], entity_result: dict) -> dict:
+    rows = await run_readonly(_FOCUSPLUS_OVERALL_SUMMARY_SQL)
+    r = rows[0]
+    avg_per_beneficiary = float(r["amount"]) / r["beneficiaries"]
+    answer = (
+        f"Focus+ overall summary:\n"
+        f"- Disbursement records (payments): {r['payments']:,}\n"
+        f"- Unique beneficiaries: {r['beneficiaries']:,}\n"
+        f"- Total amount disbursed: {_money(r['amount'])}\n"
+        f"- Average disbursement per beneficiary: {_money(avg_per_beneficiary)}\n"
+        f"- Financial years available: {r['years_list']}\n"
+        f"- Batches: {r['batch_list']} (93K = legacy paid cohort, 12.5K = registration cohort)\n"
+        f"- Tranches: {r['tranche_count']}\n"
+        f"- Districts represented: {r['districts']}, plus {r['missing_district_rows']} "
+        "payment records with no district resolved\n"
+        f"- District with the most beneficiaries: {r['top_ben_district']} — "
+        f"{r['top_ben_district_count']:,}\n"
+        f"- District with the highest disbursement: {r['top_amt_district']} — "
+        f"{_money(r['top_amt_district_amount'])}\n"
+        f"- Top bank by disbursement: {r['top_bank_name']} — {_money(r['top_bank_amount'])}\n"
+        f"- Gender split (12.5K cohort only, ~3% of beneficiaries): "
+        f"{r['female']:,} female, {r['male']:,} male\n"
+        f"- Farmers (12.5K cohort only): {r['farmers']:,}\n"
+        f"- Status (12.5K cohort only): {r['pending']:,} Pending, {r['approved']:,} Approved, "
+        f"{r['rejected']:,} Rejected\n"
+        f"- Verification status (12.5K cohort only): {r['verified_approved']:,} Approved"
+    )
+    return {
+        "route": "data",
+        "intent": "DATA",
+        "confidence": "high",
+        "schemes": schemes,
+        "resolved_entities": entity_result["resolved"],
+        "sql": _FOCUSPLUS_OVERALL_SUMMARY_SQL,
+        "sql_query": _FOCUSPLUS_OVERALL_SUMMARY_SQL,
+        "row_count": 1,
+        "rows": rows,
+        "data": rows,
+        "answer": answer,
+    }
 
 
 def _needs_tranche_clarification(question: str, schemes: list[str], resolved: dict,
@@ -2013,6 +2215,15 @@ is NEVER a place — do not extract it as a district/block/village even when it
 follows "for"/"of"/"under" exactly like a place would ("disbursement for
 Focus Plus" names the scheme, not an area; extract nothing).
 
+Likewise, a CM Elevate SUB-SCHEME name is NEVER a place, even though several
+of them sound like plausible village/block names in isolation: Piggery,
+Poultry, Dairy, Goat (Farming), Warehouse, Sericulture (& Weaving), Green
+Taxi, Motorcaravan, Cinema Theatre, Sports & Wellness (Centre), Any Business
+Venture, Agro Tourism Villa, PRIME Tourism Vehicle, PRIME Agriculture
+Response Vehicle, PRIME Small Enterprise Empowerment / SEED. "What is the
+status distribution for Piggery?" names a sub-scheme, not a district, block
+or village — extract nothing.
+
 Examples:
 Question: "Tell me about total disbursement of Selsella across all financial years for MGNREGA."
 JSON: {{"block": "Selsella"}}
@@ -2020,6 +2231,10 @@ Question: "What is the total expenditure of West Garo Hills under PMAY-G?"
 JSON: {{"district": "West Garo Hills"}}
 Question: "how many job cards issued in Ri Bhoi"
 JSON: {{"district": "Ri Bhoi"}}
+Question: "What is the status distribution for Piggery?"
+JSON: {{}}
+Question: "How many applicants under Poultry are on hold?"
+JSON: {{}}
 Question: "show me MGNREGA spend"
 JSON: {{}}
 Question: "Compare the sanctioned amounts of Dambo Rongjeng and Samanda, the block, not the village"
@@ -2649,12 +2864,70 @@ async def resolve_entities(question: str, schemes: list[str],
     return {"resolved": resolved, "notes": notes, "display": display}
 
 
+_FOCUSPLUS_BENEFICIARY_QUALIFIER = re.compile(
+    r"\b(wom[ae]n|female|male|gender|farmer|occupation|status|pending|approved|"
+    r"rejected|verif\w*|tranch\w*|instal{1,2}ments?|batch\w*|legacy|93k|12\.5k|"
+    r"average|mean|\bper\b|percentage|per ?cent|compare\w*|\bvs\.?\b|versus|each|"
+    r"every|wise|breakdown|split|distribution|top\s*\d|highest|lowest|rank\w*)\b",
+    re.IGNORECASE,
+)
+
+
+def _focusplus_single_district_beneficiary_guard(
+        question: str, schemes: list[str], entity_result: dict, sql: str) -> str:
+    """User-directed exception (2026-09-13): "how many Focus Plus beneficiaries
+    in <one district>" must answer with ONE number, not the three-reading
+    ambiguity table (FOCUS PLUS RULES rule 6). The prose exception added to
+    schema_context.py doesn't reliably win against the concrete multi-column
+    worked example under LLM sampling — confirmed live, the generator kept
+    emitting the 3/4-column shape even with the exception text in-prompt and
+    the correctly-ranked single-column few-shot example alongside it.
+    Deterministic rewrite instead, scoped narrowly so every OTHER beneficiary
+    shape (statewide, "each district", a comparison, a gender/status/tranche/
+    batch-scoped question, or one with a specific year or tranche pinned) is
+    left completely alone — those still need their own, different SQL.
+
+    Updated 2026-09-13 (client UAT sheet, FOCUS-001): the original version of
+    this template used `COUNT(DISTINCT source_sl_no) WHERE batch_label = '93K'
+    AND NOT has_geo_conflict`, written before curated.fact_focus_plus_disbursement
+    grew the generated beneficiary_key column (batch_label || ':' || source_sl_no,
+    see semantic.column_catalog). That template was reproduced live against
+    megh_db and silently dropped every real beneficiary it wasn't built to see:
+    the entire 12.5K cohort (4,670 people in West Garo Hills alone — batch_label
+    = '93K' excludes them outright) and every has_geo_conflict row (136 more in
+    West Garo Hills) even though has_geo_conflict only means the source's block
+    name disagreed with the LGD roster for that village — the roster's district
+    is what v_focus_plus.lgd_district stores either way, so those rows belong in
+    the district count as much as any other row. beneficiary_key already spans
+    both cohorts as one identifier space, so neither filter is needed any more."""
+    if schemes != ["Focus Plus"]:
+        return sql
+    if not re.search(r"beneficiar\w*", question, re.IGNORECASE):
+        return sql
+    resolved = entity_result.get("resolved", {})
+    district = resolved.get("district")
+    if not district or resolved.get("district_list"):
+        return sql
+    if resolved.get("block") or resolved.get("village_code"):
+        return sql
+    if resolved.get("year_key") or resolved.get("tranche_label"):
+        return sql
+    if _FOCUSPLUS_BENEFICIARY_QUALIFIER.search(question):
+        return sql
+    return (
+        "SELECT COUNT(DISTINCT beneficiary_key) AS beneficiaries\n"
+        "FROM curated.v_focus_plus\n"
+        f"WHERE lgd_district = '{district}';"
+    )
+
+
 async def generate_sql(question: str, schemes: list[str], entity_result: dict) -> str:
     # The whole prompt — hand-written backbone + live schema + SME catalog +
     # prohibited joins + few-shot + resolved entities — is assembled in one place.
     prompt = prompt_builder.build_sql_prompt(question, schemes, entity_result)
     raw = await llm.call_sql_generator(prompt, guided={"guided_regex": _SQL_SHAPE_REGEX})
-    return _extract_sql(raw)
+    sql = _extract_sql(raw)
+    return _focusplus_single_district_beneficiary_guard(question, schemes, entity_result, sql)
 
 
 # The generator sometimes reads "in Meghalaya" as a place filter and invents a
@@ -2686,6 +2959,48 @@ def _uppercase_geo_literals(sql: str) -> str:
     if changed != sql:
         logger.info("normalised lgd_district/lgd_block literal(s) to upper-case for storage match")
     return changed
+
+
+# Client UAT sheet (FOCUS-018/019, 2026-09-13): "Give me the status breakdown
+# for [tranche]" / "for [batch]" came back GROUP BY focus_status,
+# verification_status even though schema_context.py rule 13 and the matching
+# focusplus_few_shot.yaml examples both say an unqualified status breakdown
+# means focus_status alone — verification_status is a near-constant single
+# value ("Approved" on every 12.5K row) that only adds noise. The prose rule
+# and the correctly-written few-shot examples exist and are scoped right; the
+# generator still occasionally copies the two-column GROUP BY from the
+# deliberately-different "what status values are recorded" enumeration
+# example once a tranche/batch filter is also in play — the same class of
+# prose-doesn't-reliably-win gap as _focusplus_single_district_beneficiary_guard
+# above. Deterministic strip instead of a repair round trip, since the fix
+# (drop one column) is unambiguous once the shape is detected.
+_VERIFICATION_MENTION = re.compile(r"verif\w*", re.IGNORECASE)
+_STATUS_ENUMERATE_AUDIT = re.compile(
+    r"what\s+\S+\s+status\s+values|which\s+\S+\s+status\s+values|"
+    r"status\s+values\s+are\s+recorded|what\s+status(?:es)?\s+(?:exist|are\s+there)",
+    re.IGNORECASE,
+)
+_GROUP_BY_COLS_RE = re.compile(r"\bGROUP BY\s+([^\n;]+)", re.IGNORECASE)
+
+
+def _focusplus_drop_unrequested_verification_status(question: str, schemes: list[str],
+                                                     sql: str) -> str:
+    if schemes != ["Focus Plus"]:
+        return sql
+    if _VERIFICATION_MENTION.search(question) or _STATUS_ENUMERATE_AUDIT.search(question):
+        return sql
+    m = _GROUP_BY_COLS_RE.search(sql)
+    if not m:
+        return sql
+    group_cols = [c.strip() for c in m.group(1).split(",")]
+    if "focus_status" not in group_cols or "verification_status" not in group_cols:
+        return sql
+    new_group_by = "GROUP BY " + ", ".join(c for c in group_cols if c != "verification_status")
+    sql = sql[:m.start()] + new_group_by + sql[m.end():]
+    sql = re.sub(r"\bverification_status\s*,\s*", "", sql, count=1)
+    sql = re.sub(r",\s*verification_status\b(?!\s*=)", "", sql, count=1)
+    logger.info("dropped unrequested verification_status column from a focus_status breakdown")
+    return sql
 
 
 # A `column "X" does not exist` error usually means the generator picked a view
@@ -2848,6 +3163,42 @@ def _genuine_zero_notes(sql: str) -> list[str]:
     return []
 
 
+def _sector_not_tracked_notes(rows: list[dict]) -> list[str]:
+    """CM Elevate scheme_specific ->> 'sector_id' rule 9b requires stating
+    plainly that sector isn't recorded for a scheme rather than reading a bare
+    sector_recorded=0 as "checked and found none" — but that instruction lives
+    in the SQL-generation prompt (schema_context.py), which compose_response
+    never sees. Without a note here, a row like {scheme_name: Piggery,
+    poultry_sector_applicants: 0, sector_recorded: 0, scheme_total: 1944} gets
+    composed as "Piggery has 0" — technically not wrong, but exactly the
+    misleading "checked and found none" reading rule 9b exists to avoid
+    (confirmed live 2026-09-13 UAT on "applicants under Piggery and Poultry
+    associated with poultry sector"). Detected generically from the result
+    shape (a sector_recorded column that's 0 in a row where some OTHER count
+    in that same row is non-zero) rather than a hardcoded scheme list, so it
+    keeps working if which schemes carry sector_id ever changes."""
+    notes: list[str] = []
+    for r in rows:
+        if not isinstance(r, dict) or "sector_recorded" not in r:
+            continue
+        if r.get("sector_recorded"):
+            continue
+        if any(k != "sector_recorded" and isinstance(v, (int, float)) and v
+               for k, v in r.items()):
+            name = r.get("scheme_name") or "this scheme"
+            notes.append(
+                f"sector_recorded is 0 for {name} in this result, with no sector "
+                f"value recorded for it at all in this scope. Say exactly this, as "
+                f"a plain fact alongside the other rows' real numbers: 'sector "
+                f"isn't tracked for {name}.' Do NOT phrase it as 'has 0', and do "
+                "NOT use hedge wording like 'doesn't cover', 'not covered', 'no "
+                "data' or 'not available' — this is one specific, known fact about "
+                "one row, not a reason to doubt or soften the OTHER rows' real, "
+                "reportable numbers in the same result."
+            )
+    return notes
+
+
 def _crore_conversion_for_single_village(entity_result: dict, sql: str) -> bool:
     """True when the SQL converts a MGNREGA money column to CRORE (÷100) while
     the question is scoped to a single village — a grain small enough that
@@ -2905,6 +3256,25 @@ def _village_code_as_geography_key(entity_result: dict, sql: str) -> "int | None
     return None
 
 
+# The SQL verifier (a small model) occasionally hallucinates that the
+# RESOLVED ENTITIES block it was just handed "is empty" even when
+# prompt_builder._entities_block plainly rendered entries into it — confirmed
+# live 2026-09-13: "How many Focus+ beneficiaries are there in wgh across all
+# financial years" resolved district = WEST GARO HILLS correctly, the verify
+# prompt genuinely contained "lgd_district = 'WEST GARO HILLS'" under
+# "RESOLVED ENTITIES — MANDATORY...", and the verifier still claimed the
+# block was empty on every one of 5 repeat calls with an unchanged prompt.
+# Each "repair" attempt then re-sent the same (correct) SQL, got the same
+# false complaint back, and after 4 attempts the whole question fell through
+# to the KB fallback instead of ever running the query. entity_result
+# ["resolved"] is ground truth this process built itself (not the model's
+# guess), so a claim that contradicts it is a verifier error to discard, not
+# a real Check 2 hit — unlike the case where resolved really is empty, which
+# this guard leaves alone.
+_VERIFIER_FALSE_EMPTY_ENTITIES = re.compile(
+    r"resolved entities\b[^.]{0,200}\bis empty\b", re.IGNORECASE)
+
+
 async def _verify_sql(question: str, schemes: list[str], entity_result: dict, sql: str) -> "str | None":
     """One short issue sentence if the semantic verifier (SQL_VERIFY_MODEL,
     qwen4-deploy — see app/config.py) flags this SQL as not actually
@@ -2931,7 +3301,13 @@ async def _verify_sql(question: str, schemes: list[str], entity_result: dict, sq
         return None
     if not data or data.get("ok", True):
         return None
-    return data.get("issue") or "the SQL verifier flagged this query as not answering the question"
+    issue = data.get("issue") or "the SQL verifier flagged this query as not answering the question"
+    if entity_result.get("resolved") and _VERIFIER_FALSE_EMPTY_ENTITIES.search(issue):
+        logger.warning(
+            "SQL verifier claimed RESOLVED ENTITIES is empty when resolved=%r says otherwise "
+            "— discarding as a known verifier hallucination: %s", entity_result["resolved"], issue)
+        return None
+    return issue
 
 
 async def execute_with_repair(question: str, schemes: list[str], entity_result: dict,
@@ -2940,6 +3316,7 @@ async def execute_with_repair(question: str, schemes: list[str], entity_result: 
     sql = initial_sql if initial_sql is not None else await generate_sql(question, schemes, entity_result)
     for attempt in range(max_repairs + 1):
         sql = _uppercase_geo_literals(sql)
+        sql = _focusplus_drop_unrequested_verification_status(question, schemes, sql)
         try:
             bad_code = _village_name_filter_instead_of_code(entity_result, sql)
             if bad_code is not None:
@@ -3214,12 +3591,20 @@ def _deterministic_answer(rows: list[dict]) -> str:
     """A plain, exact sentence from the rows — used only when the LLM composer
     keeps misquoting or dropping numbers."""
     if len(rows) == 1:
-        nums = _row_metrics(rows[0])
+        row = rows[0]
+        nums = _row_metrics(row)
+        # A single-row GROUP BY result (e.g. a category breakdown that happens
+        # to have exactly one value present, like verification_status =
+        # 'Approved' on every 12.5K row) still carries the category as a
+        # non-numeric column. Drop the number alone and the answer misreports
+        # a labelled breakdown as an unlabelled total.
+        labels = [str(v) for k, v in row.items() if v is not None and _as_number(v) is None]
+        prefix = ", ".join(labels) + ": " if labels else ""
         if len(nums) == 1:
             k, v = nums[0]
-            return f"{_fmt_num(v)} {k.replace('_', ' ')}."
+            return f"{prefix}{_fmt_num(v)} {k.replace('_', ' ')}."
         if len(nums) >= 2:
-            return "; ".join(f"{k.replace('_', ' ')}: {_fmt_num(v)}" for k, v in nums) + "."
+            return prefix + "; ".join(f"{k.replace('_', ' ')}: {_fmt_num(v)}" for k, v in nums) + "."
     return "Results — " + "; ".join(
         ", ".join(f"{k}: {v}" for k, v in r.items()) for r in rows[:5]
     )
@@ -3440,6 +3825,18 @@ Answer:"""
             logger.warning("compose_response: hedged over a %d-row list result %r — "
                            "deterministic list answer", len(rows), answer[:160])
             answer = _deterministic_list_answer(rows)
+        elif len(preview) >= 2 and any(
+            v not in (0, None) for r in preview for _k, v in _row_metrics(r)
+        ):
+            # A multi-row breakdown (e.g. GROUP BY category, COUNT(*)) that
+            # carries at least one real, non-zero metric — neither of the two
+            # branches above catches this shape (not a single row, and
+            # _is_plain_list_result excludes rows with numeric metrics), so a
+            # composer hedge here used to slip through unchecked while the
+            # chart/table built from the same rows showed real data.
+            logger.warning("compose_response: hedged over a %d-row breakdown %r — "
+                           "deterministic answer", len(preview), answer[:160])
+            answer = _deterministic_answer(preview)
     return answer
 
 
@@ -3550,6 +3947,13 @@ async def _answer_data(question: str, scope: "auth.UserScope | None" = None,
             entity_result["resolved"]["district_list_region"] = region["canonical"]
             entity_result["display"]["district"] = region["canonical"]
 
+    # "Give me an overall Focus+ data summary" — a genuinely whole-scheme
+    # question with no district/year/tranche to pin. Handled before the scope/
+    # year/tranche clarification gates below so it never gets mistaken for an
+    # aggregate question that merely forgot to name a scope.
+    if _focusplus_wants_overall_summary(question, schemes):
+        return await _focusplus_overall_summary_answer(schemes, entity_result)
+
     # Ask which district / block / village / year when an aggregate question
     # pins none of them — unless we're already resuming that very clarification
     # (a reply that still names no scope must not loop us back here).
@@ -3572,6 +3976,13 @@ async def _answer_data(question: str, scope: "auth.UserScope | None" = None,
             already_all_combined=bool((prior_resolved or {}).get("tranche_all_combined"))):
         raise _tranche_clarification(question)
 
+    # A specific non-Tranch-4 tranche plus a person-level column (status/
+    # gender/occupation/verification) can never match any row — that data
+    # exists only on the 12.5K cohort, which is entirely Tranch 4. Explain why
+    # instead of running SQL that is guaranteed to come back empty.
+    if _person_level_tranche_conflict(question, schemes, entity_result["resolved"]):
+        return _person_level_tranche_conflict_answer(question, schemes, entity_result)
+
     sql = await generate_sql(question, schemes, entity_result)
 
     # Authorization — role/scope vs. what the query actually asks for. Runs on the
@@ -3590,6 +4001,7 @@ async def _answer_data(question: str, scope: "auth.UserScope | None" = None,
     # composer corrects a false premise instead of repeating it as fact.
     notes = list(entity_result.get("notes") or [])
     notes.extend(_genuine_zero_notes(sql))
+    notes.extend(_sector_not_tracked_notes(rows))
     if settings.PREMISE_CHECK_ENABLED:
         try:
             notes.extend(premise_check.check_premises(question, rows))
