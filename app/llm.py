@@ -4,9 +4,12 @@ Shared OpenAI-compatible client for every model role.
 One module-level httpx.AsyncClient is reused across requests to avoid
 creating a new client and TLS handshake for every call.
 
-The client supports an optional custom CA bundle. If the configured
-CA bundle is missing, it falls back to the system CA bundle rather
-than crashing application startup.
+The client supports an optional custom CA bundle.
+
+SSL behavior:
+- If AI_MODEL_CA_BUNDLE_PATH is configured and exists, use it.
+- If a custom CA bundle is not configured, SSL verification is disabled
+  to support internal/self-signed model gateways.
 """
 
 import asyncio
@@ -18,6 +21,7 @@ from contextlib import asynccontextmanager
 import httpx
 
 from app.config import settings
+
 
 logger = logging.getLogger(__name__)
 
@@ -39,10 +43,9 @@ def _get_ssl_verify() -> str | bool:
     If AI_MODEL_CA_BUNDLE_PATH is configured and the file exists,
     use that CA bundle.
 
-    If it is configured but missing, log a warning and fall back
-    to normal system CA verification.
-
-    TLS verification is NEVER disabled automatically.
+    If the CA bundle is configured but missing, fall back to
+    SSL verification disabled so self-signed internal gateways
+    can still be reached.
     """
 
     ca_bundle = settings.AI_MODEL_CA_BUNDLE_PATH
@@ -59,19 +62,30 @@ def _get_ssl_verify() -> str | bool:
 
         logger.warning(
             "AI_MODEL_CA_BUNDLE_PATH is configured but the file does "
-            "not exist: %s. Falling back to system CA certificates.",
+            "not exist: %s. Falling back to verify=False for the "
+            "internal/self-signed AI model gateway.",
             ca_bundle,
         )
 
-    logger.info("Using system CA certificates for AI model HTTPS connections.")
+        return False
 
-    return True
+    logger.warning(
+        "No AI_MODEL_CA_BUNDLE_PATH configured. "
+        "Using verify=False for internal/self-signed AI model HTTPS connections."
+    )
+
+    return False
 
 
 async def init_client() -> None:
     """Initialize the shared HTTP client and model concurrency gate."""
 
     global _client, _gate
+
+    # Avoid creating the client twice.
+    if _client is not None:
+        logger.info("LLM HTTP client already initialized.")
+        return
 
     verify = _get_ssl_verify()
 
@@ -88,8 +102,10 @@ async def init_client() -> None:
     )
 
     logger.info(
-        "LLM HTTP client initialized. MODEL_MAX_CONCURRENCY=%s",
+        "LLM HTTP client initialized. "
+        "MODEL_MAX_CONCURRENCY=%s SSL_VERIFY=%s",
         settings.MODEL_MAX_CONCURRENCY,
+        verify,
     )
 
 
@@ -126,6 +142,7 @@ async def _slot():
             _gate.acquire(),
             timeout=settings.MODEL_QUEUE_TIMEOUT_SECONDS,
         )
+
     except asyncio.TimeoutError as e:
         raise ModelBusyError(
             "model gateway saturated — try again shortly"
@@ -133,6 +150,7 @@ async def _slot():
 
     try:
         yield
+
     finally:
         _gate.release()
 
@@ -409,6 +427,7 @@ async def call_reranker(
         return pairs
 
     except Exception as e:
+
         logger.warning(
             "Reranker route unavailable (%s) — "
             "falling back to prompt scoring",
@@ -445,6 +464,7 @@ async def call_reranker(
             )
 
         except Exception:
+
             scored.append(
                 (
                     i,

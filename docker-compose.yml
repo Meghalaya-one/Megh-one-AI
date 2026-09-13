@@ -20,7 +20,8 @@ services:
     env_file:
       - .env
     ports:
-      - "8300:8300"
+      - "127.0.0.1:8301:8300"
+        ## - "8300:8300"
     volumes:
       # Persist the JSONL audit mirror and uvicorn logs outside the container.
       - ./logs:/opt/meghalaya/logs
