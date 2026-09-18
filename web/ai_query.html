@@ -2002,7 +2002,14 @@ function pivotStackedBar(data, xKey, sKey, vKey) {
 function buildDynTable(data, fullWidth) {
   if (!data || !data.length) return '';
   const cols = Object.keys(data[0]);
-  const shown = data.slice(0, 100);
+  // Render every row the API returned. The 100-row slice that used to sit here
+  // silently truncated real results — a 146-village answer showed 100 and gave
+  // the user no way to reach the rest, even when they had explicitly asked for
+  // all of them (reported 2026-09-17). .rtwrap already scrolls (max-height
+  // 420px), so a long table costs height, not readability. The cap that still
+  // matters is the API's own (see `data` in app/pipeline.py), and the note
+  // below reports it whenever the result was actually trimmed.
+  const shown = data;
   let html = `<div class="rtwrap"><table class="rtbl"><thead><tr>` +
     cols.map(c => `<th>${escapeHTML(c.replace(/_/g,' '))}</th>`).join('') + `</tr></thead><tbody>` +
     shown.map(r => `<tr>` + cols.map(c => `<td>${escapeHTML(String(r[c] ?? '—'))}</td>`).join('') + `</tr>`).join('') +
@@ -2102,6 +2109,14 @@ function buildAnalytics(question, data, hintType) {
   if (!numCols.length) return { html: `<div class="analytics">${buildDynTable(data, true)}</div>`, init: () => {} };
 
   _chartIdx++;
+  // Freeze this build's index. _chartIdx is module-level and keeps counting,
+  // while init() runs LATER (deferred to requestAnimationFrame by addBotRich).
+  // Replaying a saved thread builds every turn first and only then fires those
+  // callbacks, so an init() that re-read _chartIdx looked for the LAST turn's
+  // canvas id — every earlier chart silently found no canvas and never drew.
+  // A live send has one turn, so the bug only ever showed in chat history
+  // (reported 2026-09-18).
+  const myIdx = _chartIdx;
   const lc = lblCols[0] || cols[0];
   const isTime = /month|period|year|date|trend/i.test(lc) || /year|month|trend/i.test(question);
   // A trend only reads correctly left-to-right. When the x column is ISO dates or plain
@@ -2115,7 +2130,7 @@ function buildAnalytics(question, data, hintType) {
     ? hintType : (isTime ? 'line' : isFew ? 'doughnut' : 'bar');
 
   if (hintType === 'grouped_bar') {
-    const cid = `dync_${_chartIdx}_g`;
+    const cid = `dync_${myIdx}_g`;
     const labels = data.map(r => String(r[lc]).length > 18 ? String(r[lc]).slice(0,16)+'…' : String(r[lc]));
     const datasets = numCols.map(nc => ({ label: nc.replace(/_/g,' '), values: data.map(r => parseFloat(r[nc]) || 0) }));
     const html = `<div class="analytics"><div class="dyn-grid single"><div class="dyn-chart-card">
@@ -2127,7 +2142,7 @@ function buildAnalytics(question, data, hintType) {
 
   if (hintType === 'stacked' && lblCols.length >= 2 && numCols.length >= 1) {
     const xKey = lblCols[0], sKey = lblCols[1], vKey = numCols[0];
-    const cid = `dync_${_chartIdx}_s`;
+    const cid = `dync_${myIdx}_s`;
     const { labels, datasets } = pivotStackedBar(data, xKey, sKey, vKey);
     const html = `<div class="analytics"><div class="dyn-grid single"><div class="dyn-chart-card">
       <div class="chd"><div class="chd-left"><span class="chd-dot"></span><span class="chd-title">${escapeHTML(vKey.replace(/_/g,' '))} by ${escapeHTML(xKey.replace(/_/g,' '))} &amp; ${escapeHTML(sKey.replace(/_/g,' '))}</span></div><span class="chd-pill">Stacked Bar</span></div>
@@ -2140,7 +2155,7 @@ function buildAnalytics(question, data, hintType) {
   const single = chartsToRender.length === 1;
   let html = `<div class="analytics"><div class="dyn-grid${single ? ' single' : ''}">`;
   chartsToRender.forEach((vc, i) => {
-    const cid = `dync_${_chartIdx}_${i}`;
+    const cid = `dync_${myIdx}_${i}`;
     html += `<div class="dyn-chart-card">
       <div class="chd"><div class="chd-left"><span class="chd-dot"></span><span class="chd-title">${escapeHTML(vc.replace(/_/g,' '))} by ${escapeHTML(lc.replace(/_/g,' '))}</span></div>
         <div class="qctog">
@@ -2156,7 +2171,7 @@ function buildAnalytics(question, data, hintType) {
 
   const init = () => {
     chartsToRender.forEach((vc, i) => {
-      const cid = `dync_${_chartIdx}_${i}`;
+      const cid = `dync_${myIdx}_${i}`;
       const labels = data.map(r => String(r[lc]).length > 18 ? String(r[lc]).slice(0,16)+'…' : String(r[lc]));
       const values = data.map(r => parseFloat(r[vc]) || 0);
       window._QD[cid] = { labels, values };

@@ -93,6 +93,12 @@ class Resolved:
     values: list[str] = field(default_factory=list)  # multi-valued resolves (house_status)
     display: str | None = None  # human-readable name for the answer ("West Garo Hills"),
     #                             as opposed to `canonical` which is the DB literal.
+    parent_district: str | None = None  # for a resolved BLOCK: the district it sits in,
+    #                             as the DB literal (UPPER). Every block entry in every
+    #                             *_entity_resolver.yaml carries `district:`; carrying it
+    #                             on the result is what lets the caller scope a block to
+    #                             its own district instead of the one another block in the
+    #                             same question named (see resolve_block_district).
 
 
 def fold(text: str) -> str:
@@ -105,6 +111,17 @@ def fold(text: str) -> str:
     t = re.sub(r"[-/()]", " ", t)
     t = re.sub(r"\s+", " ", t).strip()
     return t
+
+
+def _place_title(value: str) -> str:
+    """Title-case a place name without mangling a roman-numeral suffix that is
+    part of it: str.title() turns "NONGCHRAM (II)" into "Nongchram (Ii)", and
+    Meghalaya has NONGCHRAM (I) and NONGCHRAM (II) as two distinct villages in
+    one block (reported 2026-09-17). Any parenthesised run of roman numerals or
+    digits keeps its own casing."""
+    out = str(value or "").title()
+    return re.sub(r"\(([IVXLCDM\d]+)\)", lambda m: "(" + m.group(1).upper() + ")",
+                  out, flags=re.IGNORECASE)
 
 
 def _squash(folded: str) -> str:
@@ -575,11 +592,90 @@ def _db_form(canonical: str, dimension: str):
     return canonical
 
 
+def _parent_district(value: dict, dimension: str) -> "str | None":
+    """The DB literal (UPPER) for the district a catalogue entry sits in.
+    Only meaningful for blocks — every block entry in every scheme's
+    *_entity_resolver.yaml carries a `district:` key, stored Title Case there
+    ("West Khasi Hills") while dim_geography.lgd_district is UPPERCASE."""
+    if dimension != "block":
+        return None
+    d = value.get("district")
+    return str(d).strip().upper() if d else None
+
+
+def _resolve_in_catalog(values: list[dict], text: str, dimension: str,
+                        blocked: "set | None" = None) -> Resolved:
+    """The exact / alias / squash / fuzzy stages, run against ONE catalogue's
+    values. Split out of resolve_dimension so the same matching can be applied
+    to another scheme's catalogue when this scheme's is incomplete."""
+    folded_input = fold(text)
+    squashed_input = _squash(folded_input)
+
+    for v in values:                                   # stages 1 + 2
+        if folded_input in (fold(c) for c in _match_forms(v)):
+            return Resolved("resolved", dimension, text,
+                            canonical=_db_form(v["canonical"], dimension), confidence=1.0,
+                            display=_display_form(v["canonical"], dimension),
+                            parent_district=_parent_district(v, dimension))
+    for v in values:                                   # stage 3
+        if squashed_input in (_squash(fold(c)) for c in _match_forms(v)):
+            return Resolved("resolved", dimension, text,
+                            canonical=_db_form(v["canonical"], dimension), confidence=0.95,
+                            display=_display_form(v["canonical"], dimension),
+                            parent_district=_parent_district(v, dimension))
+
+    pool = {v["canonical"]: fold(v["canonical"]) for v in values}   # stage 6
+    matches = process.extract(folded_input, pool, scorer=fuzz.token_set_ratio, limit=2)
+    if matches:
+        (_folded, top_score, top_canon), *rest = matches
+        blocked = blocked or set()
+        if (folded_input, pool[top_canon]) in blocked or (pool[top_canon], folded_input) in blocked:
+            return Resolved("not_found", dimension, text,
+                            message=f"'{text}' does not match a known {dimension}")
+        if top_score >= _FUZZY_ACCEPT:
+            if top_score - (rest[0][1] if rest else 0) >= _FUZZY_RUNNER_UP_GAP:
+                v = next(v for v in values if v["canonical"] == top_canon)
+                return Resolved("resolved", dimension, text,
+                                canonical=_db_form(v["canonical"], dimension),
+                                confidence=top_score / 100,
+                                display=_display_form(v["canonical"], dimension),
+                                parent_district=_parent_district(v, dimension))
+            return Resolved("ambiguous", dimension, text,
+                            candidates=[{"canonical": m[2]} for m in matches],
+                            message=f"'{text}' could mean more than one {dimension}")
+    return Resolved("not_found", dimension, text, message=f"'{text}' is not a known {dimension}")
+
+
 def resolve_dimension(text: str, scheme: str, dimension: str) -> Resolved:
     """District/block/year — fully in-memory, stages 1/2/3/6."""
     values = _catalog.get(scheme, {}).get(dimension, [])
     if not values:
         return Resolved("not_found", dimension, text, message=f"no {dimension} catalogue for {scheme}")
+
+    # A per-scheme BLOCK catalogue can be incomplete where the live data is
+    # not: CM Elevate's lists 53 blocks while its own rows span 66, so 21
+    # blocks — 1,519 rows, including BATABARI, SIJU and MAWHATI — resolve as
+    # "not a C&RD block" and the block filter is dropped or a same-named
+    # village wins instead (measured 2026-09-18). Blocks are the SAME real
+    # administrative units across schemes, so a name any scheme's catalogue
+    # knows is a genuine block; only the per-scheme coverage differs. Fall
+    # back to the other catalogues rather than declaring it unknown.
+    if dimension == "block":
+        _direct = _resolve_in_catalog(values, text, dimension, _blocked.get(scheme))
+        if _direct.status != "not_found":
+            return _direct
+        for _other, _dims in _catalog.items():
+            if _other == scheme:
+                continue
+            _vals = _dims.get("block") or []
+            if not _vals:
+                continue
+            _hit = _resolve_in_catalog(_vals, text, dimension, _blocked.get(_other))
+            if _hit.status == "resolved":
+                logger.info("block %r resolved via %s's catalogue (missing from %s's)",
+                            text, _other, scheme)
+                return _hit
+        return _direct
 
     folded_input = fold(text)
     squashed_input = _squash(folded_input)
@@ -634,6 +730,28 @@ def resolve_dimension(text: str, scheme: str, dimension: str) -> Resolved:
             )
 
     return Resolved("not_found", dimension, text, message=f"'{text}' is not a known {dimension}")
+
+
+def block_parent_district(canonical: str, scheme: str = "") -> "str | None":
+    """Which district does this already-resolved block sit in? Returns the DB
+    literal (UPPER) or None when no catalogue knows the block.
+
+    Blocks are the same real administrative units across schemes, so the
+    preferred scheme's catalogue is consulted first and the others are used as
+    a fallback — exactly the coverage argument resolve_dimension already makes
+    for block NAMES (a per-scheme block list can be short while the live data
+    is not)."""
+    folded = fold(canonical)
+    if not folded:
+        return None
+    order = ([scheme] if scheme in _catalog else []) + [s for s in _catalog if s != scheme]
+    for s in order:
+        for v in _catalog.get(s, {}).get("block", []) or []:
+            if fold(v["canonical"]) == folded:
+                d = _parent_district(v, "block")
+                if d:
+                    return d
+    return None
 
 
 def _scannable_forms(value: dict) -> list[str]:
@@ -710,7 +828,176 @@ def lookup_geo_term(text: str) -> "dict | None":
     return None
 
 
-def scan_dimension(question: str, scheme: str, dimension: str) -> "Resolved | None":
+# ── Cross-dimension name collisions ─────────────────────────────────────────
+# Block, assembly-constituency and village names overlap massively in Meghalaya
+# (mgnrega_entity_resolver.yaml cross_dimension_collisions: 26 block names are
+# also AC names, 28 are also village names; districts are the only dimension
+# with zero collisions). A bare "Sohra" / "Mawlai" / "Pynursla" genuinely names
+# more than one KIND of place, and the right move — per that file's own hard
+# rule, "if more than one candidate survives with no way to separate them,
+# return status ambiguous and ask; do not pick the first row" — is to ask which
+# dimension is meant rather than silently resolving to whichever one the
+# mention-extractor happened to tag.
+#
+# The SME catalogue already declares this per entry as `also_a: [block,
+# village]`, but nothing ever read that field, so the collision was invisible to
+# the pipeline. This reads it, and ALSO verifies each claimed dimension against
+# the live catalogue — `also_a` is hand-maintained and can drift, and a
+# dimension that no longer resolves must not be offered as a chip that then
+# fails. A name present in several catalogues but missing from `also_a`
+# (declaration drift the other way) is still caught, because every dimension is
+# probed directly.
+_COLLISION_DIMENSIONS = ("district", "block", "assembly_constituency")
+# Fuzzy floor for "could this name ALSO be a <dimension>?" — see the docstring
+# of collides_across_dimensions for why this sits below _FUZZY_ACCEPT (90).
+_COLLISION_FUZZY_ACCEPT = 80
+
+
+# Blocks and assembly constituencies are the SAME real administrative units
+# whoever is asking: only per-scheme CATALOGUE COVERAGE differs. That coverage
+# is uneven in a way that silently disables collision detection — of the four
+# schemes only MGNREGA carries an assembly_constituency catalogue at all (CM
+# Elevate, PMAY-G and Focus Plus have none), and CM Elevate's block list is
+# missing 21 blocks its own rows span. A collision the asking scheme cannot
+# see is a collision the user is never asked about, which is strictly worse
+# than an extra chip: measured 2026-09-18, "applicants in mylliem under Green
+# Taxi and Warehouse Scheme" found no block/AC ambiguity under CM Elevate
+# (MGNREGA sees it plainly), so the name fell through to the village stage and
+# answered 0 against lgd_village_name — a confident false zero where the real
+# MYLLIEM block figure is 2.
+#
+# So probe the asking scheme first, then any other scheme that has the
+# dimension. Districts are excluded: they are a complete, collision-free
+# 12-name set in every catalogue, and the function already treats a district
+# hit as settling the level outright.
+_SHARED_ADMIN_DIMENSIONS = ("block", "assembly_constituency")
+
+
+def _collision_values(scheme: str, dim: str) -> list:
+    """Catalogue entries for `dim`, falling back to other schemes' catalogues
+    for the administrative dimensions every scheme shares."""
+    values = _catalog.get(scheme, {}).get(dim, [])
+    if values or dim not in _SHARED_ADMIN_DIMENSIONS:
+        return values
+    for _other, _dims in _catalog.items():
+        if _other == scheme:
+            continue
+        borrowed = _dims.get(dim) or []
+        if borrowed:
+            return borrowed
+    return []
+
+
+def collision_canonical_names(scheme: str, dimension: str) -> list[str]:
+    """Canonical names to scan the raw question with when deciding whether a
+    bare place name is level-ambiguous.
+
+    Same values collides_across_dimensions() itself matches against, so the
+    scan and the collision test agree: for the shared administrative
+    dimensions this falls back to another scheme's catalogue when the asking
+    scheme has none. canonical_names() deliberately keeps its literal "what
+    THIS scheme's catalogue holds" meaning for its other callers, so this is a
+    separate entry point rather than a change to it."""
+    return [str(v["canonical"]) for v in _collision_values(scheme, dimension)
+            if v.get("canonical")]
+
+
+def collides_across_dimensions(text: str, scheme: str,
+                               village_hit: bool = False) -> dict[str, str]:
+    """Which admin levels the bare name `text` could name, as
+    {dimension: canonical display name} in coarse-to-fine order ("district",
+    "block", "assembly_constituency", "village"). Empty when the name is not
+    level-ambiguous.
+
+    The canonical name matters as much as the level: it is what lets a caller
+    build a chip naming the REAL place ("Mawlai") rather than echoing the
+    user's typo ("malwai") back, so the resumed question resolves cleanly
+    instead of failing the exact-match stage again. The "village" entry maps
+    to "" — village is DB-backed and was asserted by the caller.
+
+    Matching is exact/alias/acronym first, then a fuzzy stage. The fuzzy stage
+    is REQUIRED for correctness here, not a nicety: `resolve_village` reaches
+    the DB through a trigram fallback that tolerates typos, so an exact-only
+    check on this side would be asymmetric — a misspelled name would match a
+    village but no block/constituency, the collision would go unseen, and the
+    typo would resolve silently to a village. That is exactly how "malwai" (a
+    typo of the Mawlai block/constituency) was answered as the village Mawlwai
+    on 2026-09-15, after the exact-only version of this function had already
+    fixed the identically-shaped "Sohra" bug.
+
+    The fuzzy floor (_COLLISION_FUZZY_ACCEPT, 80) is deliberately looser than
+    resolve_dimension's own accept floor (_FUZZY_ACCEPT, 90) because the two
+    answer different questions: resolve_dimension is deciding what a name IS
+    (a wrong answer there silently returns the wrong place, so it must be
+    strict), whereas this function only decides whether to ASK the user which
+    level they meant. A false positive here costs one extra clarification chip;
+    a false negative costs a confidently wrong answer. The same runner-up gap
+    rule as resolve_dimension still applies, so a name that is merely
+    near-equidistant from several catalogue entries ("tura") does not count as
+    a hit for that dimension.
+
+    `village_hit` is passed by the caller when village resolution already
+    produced a real candidate for this same text, so the village dimension
+    joins the list on the caller's evidence rather than being probed here.
+
+    Returns 2+ entries only when the name is genuinely ambiguous across
+    levels; fewer than 2 means there is nothing to ask about.
+    """
+    if not text or not str(text).strip():
+        return {}
+    hits: list[str] = []
+    _canonical_by_dim: dict[str, str] = {}
+    folded_input = fold(text)
+    squashed_input = _squash(folded_input)
+    for dim in _COLLISION_DIMENSIONS:
+        values = _collision_values(scheme, dim)
+        if not values:
+            continue
+        matched = False
+        for v in values:
+            forms = _match_forms(v)
+            if folded_input in (fold(c) for c in forms) or \
+                    squashed_input in (_squash(fold(c)) for c in forms):
+                hits.append(dim)
+                _canonical_by_dim[dim] = _display_form(v["canonical"], dim)
+                matched = True
+                break
+        if matched:
+            continue
+        # Fuzzy stage — same scorer and runner-up gap as resolve_dimension's
+        # stage 6, at the looser floor explained above.
+        pool = {v["canonical"]: fold(v["canonical"]) for v in values}
+        scored = process.extract(folded_input, pool, scorer=fuzz.token_set_ratio, limit=2)
+        if not scored:
+            continue
+        top_score = scored[0][1]
+        runner_up = scored[1][1] if len(scored) > 1 else 0
+        if top_score >= _COLLISION_FUZZY_ACCEPT and top_score - runner_up >= _FUZZY_RUNNER_UP_GAP:
+            hits.append(dim)
+            _canonical_by_dim[dim] = _display_form(scored[0][2], dim)
+    if village_hit and "village" not in hits:
+        hits.append("village")
+    # A district name is never level-ambiguous: the SME catalogue records
+    # districts as the one dimension with zero collisions
+    # (cross_dimension_collisions.why, "Districts are the only dimension with
+    # zero collisions"), and resolve_village's trigram fallback is loose enough
+    # (similarity > 0.4) to turn up SOME village for almost any input. Pausing
+    # on a plainly-named district because a weak village near-match exists
+    # would interrupt the single most common question shape in the product, so
+    # an exact district hit settles the level outright.
+    if "district" in hits:
+        return {}
+    if len(hits) < 2:
+        return {}
+    # Ordered coarse -> fine, so the caller's chips read in a sensible order.
+    # The village entry has no catalogue canonical (it is DB-backed and was
+    # asserted by the caller via village_hit) — the caller substitutes the
+    # user's own text there.
+    return {d: _canonical_by_dim.get(d, "") for d in hits}
+
+
+def scan_dimension(question: str, scheme: str, dimension: str, *,
+                   level_is_explicit: bool = False) -> "Resolved | None":
     """Deterministic backstop for the LLM mention-extractor: find a known
     <dimension> name sitting as a whole phrase in the raw question. Only meant
     to run when the extractor returned nothing for this dimension — the model
@@ -722,25 +1009,61 @@ def scan_dimension(question: str, scheme: str, dimension: str) -> "Resolved | No
     none), so a hit is safe to trust. Overlapping names ("West Garo Hills" is a
     substring of "South West Garo Hills") resolve to the LONGEST match. Blocks
     are deliberately not scanned — 26 of 56 block names are also assembly
-    constituencies or villages."""
-    if dimension != "district":
-        return None
-    values = _catalog.get(scheme, {}).get(dimension, [])
-    if not values:
+    constituencies or villages — scanning one off a bare name could silently
+    filter a village question to a same-named block.
+
+    That collision hazard only exists while the LEVEL is in doubt, so a block
+    scan is allowed when the caller has already established the question names
+    the level outright ("in shallang block" -> pipeline._explicit_level_in
+    returns 'block'). At that point "shallang" cannot be meant as a village or
+    a constituency, and refusing to scan just loses the filter: the extractor
+    returned {} for it on 5 of 5 calls (2026-09-18), the generator then guessed
+    an unvalidated literal off the raw text, and the verifier and the repair
+    loop fought over it until the question died. A bare name with no level word
+    still returns None here and goes to the clarification flow, which is what
+    the collision rule is actually protecting."""
+    if dimension == "block":
+        if not level_is_explicit:
+            return None
+    elif dimension != "district":
         return None
     padded = f" {fold(question)} "
-    best: tuple[int, str] | None = None
-    for v in values:
-        for form in _scannable_forms(v):
-            ff = fold(form)
-            if re.search(rf"(?<![A-Z0-9]){re.escape(ff)}(?![A-Z0-9])", padded):
-                if best is None or len(ff) > best[0]:
-                    best = (len(ff), v["canonical"])
-    if best is None:
+
+    def _scan(values: list) -> str | None:
+        """Longest whole-phrase catalogue name present in the question."""
+        best: tuple[int, str] | None = None
+        for v in values:
+            for form in _scannable_forms(v):
+                ff = fold(form)
+                if re.search(rf"(?<![A-Z0-9]){re.escape(ff)}(?![A-Z0-9])", padded):
+                    if best is None or len(ff) > best[0]:
+                        best = (len(ff), v["canonical"])
+        return best[1] if best else None
+
+    hit = _scan(_catalog.get(scheme, {}).get(dimension, []))
+
+    # Same per-scheme catalogue gap resolve_dimension() already works around:
+    # CM Elevate's block list is missing 21 blocks its own rows span, SHALLANG
+    # among them, so scanning only schemes[0] finds nothing and the backstop
+    # silently does not fire (measured 2026-09-18). Blocks are the same real
+    # administrative units across schemes, so a name any catalogue knows is a
+    # genuine block. Districts are a closed 12-name set present in every
+    # catalogue and keep the single-scheme scan.
+    if hit is None and dimension == "block":
+        for _other, _dims in _catalog.items():
+            if _other == scheme:
+                continue
+            hit = _scan(_dims.get("block") or [])
+            if hit is not None:
+                logger.info("block %r scanned from %s's catalogue (missing from %s's)",
+                            hit, _other, scheme)
+                break
+
+    if hit is None:
         return None
     return Resolved("resolved", dimension, question,
-                    canonical=_db_form(best[1], dimension), confidence=0.9,
-                    display=_display_form(best[1], dimension))
+                    canonical=_db_form(hit, dimension), confidence=0.9,
+                    display=_display_form(hit, dimension))
 
 
 # Words next to a region name that mean "give me the whole region", i.e. expand it to
@@ -796,6 +1119,14 @@ def detect_region(question: str, scheme: str) -> "dict | None":
     }
 
 
+def canonical_names(scheme: str, dimension: str) -> list[str]:
+    """Every canonical value name `scheme`'s catalogue holds for `dimension`,
+    in the YAML's declared order. Empty when the scheme or dimension has no
+    catalogue loaded (village is DB-backed and never appears here)."""
+    return [str(v["canonical"]) for v in _catalog.get(scheme, {}).get(dimension, [])
+            if v.get("canonical")]
+
+
 def all_districts(scheme: str) -> list[str]:
     """Every district `scheme`'s resolver catalog knows, canonical Title Case,
     in the YAML's declared order — the same names `detect_region` matches
@@ -823,6 +1154,100 @@ async def _activity_counts(codes: list[int]) -> dict[int, int]:
     rows = await fetch_rows(f"SELECT village_code, COUNT(*) AS n FROM ({union}) x GROUP BY village_code",
                              [codes])
     return {r["village_code"]: r["n"] for r in rows}
+
+
+async def village_names_exact(names: list[str]) -> dict[str, list[dict]]:
+    """For each candidate name, the villages whose canonical name or alias
+    matches it EXACTLY (case-insensitively). Names with no exact match are
+    absent from the result.
+
+    Exact-only by design — this backs a deterministic scan over raw question
+    text (see pipeline._scan_village_in_question), where the fuzzy trigram
+    stage resolve_village() uses would be actively dangerous: fragments of
+    ordinary phrases and of district names ("East", "Garo", "Hills") all
+    trigram-match some village or other, so a fuzzy scan would invent a village
+    filter for almost any question. An exact hit on a name the user actually
+    typed is a different and much stronger signal.
+
+    One round trip for all candidates rather than one per candidate."""
+    wanted = [str(n).strip() for n in (names or []) if str(n).strip()]
+    if not wanted:
+        return {}
+    try:
+        rows = await fetch_rows(
+            """
+            SELECT DISTINCT g.village_code, g.lgd_village_name, g.lgd_district,
+                   g.lgd_block, UPPER(x.name) AS matched
+            FROM unnest($1::text[]) AS x(name)
+            JOIN curated.dim_geography g
+              -- Compare with punctuation and spacing squashed out. "Exact" here
+              -- means the same NAME, not the same typing: a user writes
+              -- "william nagar(mb) - ward no.4" while storage holds
+              -- "William Nagar (MB) - Ward No.4" (note the space before the
+              -- bracket). A literal UPPER() equality missed that, the backstop
+              -- found nothing, and the truncated mention looped the
+              -- clarification forever (reported 2026-09-17). Squashing keeps
+              -- this strictly an exact-name test — it adds no fuzziness, it
+              -- only stops punctuation from deciding the match.
+              ON regexp_replace(UPPER(g.lgd_village_name), '[^A-Z0-9]', '', 'g')
+               = regexp_replace(UPPER(x.name),             '[^A-Z0-9]', '', 'g')
+            LIMIT 200
+            """,
+            [wanted],
+        )
+    except Exception as e:  # noqa: BLE001 — a backstop must never break a query
+        logger.warning("village_names_exact failed: %s", e)
+        return {}
+    out: dict[str, list[dict]] = {}
+    for r in rows:
+        out.setdefault(str(r["matched"]).upper(), []).append({
+            "village_code": r["village_code"],
+            "name": r["lgd_village_name"],
+            "district": r["lgd_district"],
+            "block": r["lgd_block"],
+        })
+    return out
+
+
+async def constituency_contents(ac_name: str) -> dict:
+    """What sits inside one assembly constituency, read live from the only
+    fact that records the dimension (curated.v_employment — see
+    data/schema/schema_for_developers.md; no other fact or scheme carries an
+    AC column at all).
+
+    Returns {"districts": [...], "blocks": [...], "villages": n}. Used to build
+    the drill-down chips offered after a user picks the constituency reading of
+    an ambiguous name, so those chips name areas that genuinely have rows for
+    THIS constituency rather than every block in the state.
+
+    An AC is an electoral boundary, not an administrative parent: 8 of
+    Meghalaya's 56 constituencies straddle two districts, so `districts` is
+    routinely longer than one entry and is worth offering as its own narrowing
+    step. Best-effort — any DB failure returns empty lists and the caller
+    simply offers no drill-down."""
+    try:
+        rows = await fetch_rows(
+            """
+            SELECT DISTINCT lgd_district, lgd_block, village_code
+            FROM curated.v_employment
+            WHERE UPPER(assembly_constituency_name) = UPPER($1)
+            """,
+            [ac_name],
+        )
+    except Exception as e:  # noqa: BLE001 — drill-down is an enhancement, never required
+        logger.warning("constituency_contents(%r) failed: %s", ac_name, e)
+        return {"districts": [], "blocks": [], "villages": 0}
+    districts, blocks, villages = [], [], set()
+    for r in rows:
+        d, b, v = r.get("lgd_district"), r.get("lgd_block"), r.get("village_code")
+        if d and d not in districts:
+            districts.append(d)
+        if b and b not in blocks:
+            blocks.append(b)
+        if v is not None:
+            villages.add(v)
+    return {"districts": sorted(districts), "blocks": sorted(blocks),
+            "villages": len(villages)}
 
 
 async def resolve_village(text: str, district: str | None = None, block: str | None = None) -> Resolved:
@@ -881,7 +1306,7 @@ async def resolve_village(text: str, district: str | None = None, block: str | N
         return Resolved(
             "resolved", "village", text, canonical=r["village_code"],
             confidence=0.9, message=f"{r['lgd_village_name']} ({r['lgd_district']})",
-            display=str(r["lgd_village_name"]).title(),
+            display=_place_title(r["lgd_village_name"]),
         )
 
     # Duplicate dim_geography rows for the same real-world village are common
@@ -913,7 +1338,7 @@ async def resolve_village(text: str, district: str | None = None, block: str | N
             return Resolved(
                 "resolved", "village", text, canonical=r["village_code"],
                 confidence=0.75, message=f"{r['lgd_village_name']} ({r['lgd_district']})",
-                display=str(r["lgd_village_name"]).title(),
+                display=_place_title(r["lgd_village_name"]),
             )
 
     return Resolved(

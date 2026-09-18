@@ -30,6 +30,8 @@ The repair prompt now carries the SAME schema + resolved-entities context as the
 first attempt (plus the failure), instead of the thin schema-only prompt used
 before — a repair most often needs exactly the entity block it was missing.
 """
+import re
+
 from app import schema_introspect
 from app.annotations import few_shot_examples, prohibited_joins_text
 from app.schema_context import build_schema_context
@@ -116,7 +118,19 @@ def _fewshot_block(schemes: list[str], question: str = "") -> str:
     return "\nEXAMPLES (verified SQL, and known-unanswerable questions):\n" + "\n\n".join(parts) + "\n"
 
 
-def _entities_block(entity_result: dict) -> str:
+def _focus_plus_only(schemes: "list[str] | None") -> bool:
+    """True when Focus Plus is the ONLY scheme in play.
+
+    Focus Plus maps its blocks on block_name_raw, not lgd_block — see the block
+    branch in _entities_block. Scoped to the single-scheme case on purpose: a
+    cross-scheme question also reads MGNREGA / PMAY-G / CM Elevate, whose block
+    column IS lgd_block, and pinning a Focus-Plus-only column there would break
+    the other side of the comparison."""
+    return list(schemes or []) == ["Focus Plus"]
+
+
+def _entities_block(entity_result: dict, question: str = "",
+                    schemes: "list[str] | None" = None) -> str:
     resolved = entity_result.get("resolved", {})
     notes = entity_result.get("notes", [])
     lines: list[str] = []
@@ -143,6 +157,8 @@ def _entities_block(entity_result: dict) -> str:
                 continue
             if k == "district_list_region":
                 continue  # rendered alongside district_list
+            if k == "block_list_districts":
+                continue  # rendered alongside block_list
             if k == "village_code":
                 lines.append(f"  village_code = {v!r}   -- do NOT filter on lgd_village_name instead")
             elif k == "district":
@@ -162,7 +178,26 @@ def _entities_block(entity_result: dict) -> str:
                         "named for comparison. Filter on ALL of them with IN and GROUP BY district "
                         "so each gets its own row in the result — do NOT sum them into one figure.")
             elif k == "block":
-                lines.append(f"  lgd_block = {v!r}   -- already uppercase, matches storage exactly")
+                if _focus_plus_only(schemes):
+                    # FOCUS PLUS ONLY: block_name_raw is the block column for
+                    # this scheme. lgd_block is NULL on 57,649 of 385,671 rows
+                    # (15%), hiding ₹18.01 crore of disbursement — Mylliem
+                    # loses 57% of its money, Rongram 50% — because those rows
+                    # were never mapped to the LGD registry. block_name_raw is
+                    # populated on every row. A block-level figure taken from
+                    # lgd_block therefore silently under-reports; measured
+                    # 2026-09-18. Stored Title Case ("Songsak"), NOT uppercase,
+                    # so the filter must be case-insensitive or it matches zero
+                    # rows.
+                    lines.append(
+                        f"  UPPER(block_name_raw) = {str(v).upper()!r}   -- Focus Plus maps "
+                        "blocks on block_name_raw; lgd_block is NULL on 15% of rows and "
+                        "silently drops that money. Filter and GROUP BY block_name_raw, and "
+                        "do NOT also filter lgd_block (ANDing them re-introduces the same "
+                        "15% loss). It is stored Title Case, so compare with UPPER(...).")
+                else:
+                    lines.append(
+                        f"  lgd_block = {v!r}   -- already uppercase, matches storage exactly")
             elif k == "block_list":
                 vals = v if isinstance(v, list) else [v]
                 quoted = ", ".join(f"'{s}'" for s in vals)
@@ -170,6 +205,20 @@ def _entities_block(entity_result: dict) -> str:
                     f"  lgd_block IN ({quoted})   -- the {len(vals)} blocks explicitly named "
                     "for comparison. Filter on ALL of them with IN and GROUP BY block so each "
                     "gets its own row in the result — do NOT sum them into one figure.")
+                # Blocks named together often sit in DIFFERENT districts
+                # (Shallang is West Khasi Hills, Batabari is West Garo Hills).
+                # Spell out each block's own district so the generator does not
+                # reach for a single lgd_district filter to cover the whole
+                # list — ANDing one district against blocks that sit outside it
+                # returns zero rows for those blocks.
+                _parents = resolved.get("block_list_districts") or {}
+                if _parents:
+                    pairs = ", ".join(f"{b} = {d}" for b, d in _parents.items())
+                    lines.append(
+                        f"      district of each block: {pairs}. These blocks span "
+                        "different districts, so do NOT add a single lgd_district "
+                        "filter alongside this IN-list — the block names already pin "
+                        "the geography. Mention each block's district in the answer.")
             elif k == "village_code_list":
                 vals = v if isinstance(v, list) else [v]
                 quoted = ", ".join(str(s) for s in vals)
@@ -185,6 +234,52 @@ def _entities_block(entity_result: dict) -> str:
                     "exists ONLY in mgnrega_employment. If the question also needs "
                     "expenditure, say that level isn't available there instead of silently "
                     "switching to a block/district filter.")
+                # An assembly constituency is an electoral boundary that CUTS
+                # ACROSS the administrative hierarchy — it is not a parent of
+                # the block, and neither filter implies the other. When both
+                # are resolved the user asked for the OVERLAP (a drill-down
+                # inside the constituency, see pipeline._ac_drilldown_
+                # clarification), so both must appear, ANDed. Spelled out
+                # because the generator otherwise reads two geography entities
+                # as alternatives and emits whichever it judges more specific
+                # — and a repair round then "fixes" the wrong one by dropping
+                # the other, which is how this question burned its whole
+                # repair budget and fell through to the KB fallback
+                # (confirmed live 2026-09-15).
+                if not resolved.get("block") and not resolved.get("district"):
+                    # An assembly constituency is an electoral boundary that
+                    # CUTS ACROSS blocks and districts — its name is very often
+                    # not a block name at all. The generator nevertheless
+                    # reaches for `lgd_block = '<that same name>'` alongside the
+                    # constituency filter, which ANDs two conditions that can
+                    # never both hold and returns a clean, confident ZERO
+                    # (confirmed live 2026-09-17: "which villages in Rangsakona
+                    # received employment in FY 2025-26" answered "no matching
+                    # records" — RANGSAKONA is an AC spanning the BETASING,
+                    # RERAPARA and RONGRAM blocks, and the real answer is 146
+                    # villages). Say so outright, since nothing in the resolved
+                    # entities tells the generator not to.
+                    lines.append(
+                        "      CONSTITUENCY ONLY: filter on assembly_constituency_name and "
+                        "NOTHING ELSE for geography. Do NOT add lgd_block, lgd_district or "
+                        "village_code conditions — an assembly constituency cuts across "
+                        "blocks and districts, so its name is usually NOT a block or "
+                        "district name, and ANDing one in matches zero rows and returns a "
+                        "false zero. Aggregate or list across the whole constituency.")
+                if resolved.get("block") or resolved.get("district"):
+                    _other = []
+                    if resolved.get("district"):
+                        _other.append(f"lgd_district = {resolved['district']!r}")
+                    if resolved.get("block"):
+                        _other.append(f"lgd_block = {resolved['block']!r}")
+                    lines.append(
+                        "      BOTH REQUIRED: keep this constituency filter AND "
+                        + " AND ".join(_other) +
+                        " in the same WHERE clause, joined with AND. The constituency is an "
+                        "electoral boundary that cuts across blocks/districts, so neither "
+                        "filter implies the other and the question asks for the rows where "
+                        "they overlap. Do NOT drop either one, and do NOT substitute one "
+                        "for the other.")
             elif k == "year_key":
                 lines.append(f"  year_key = {v!r}")
             elif k == "house_status":
@@ -270,7 +365,7 @@ def build_sql_prompt(question: str, schemes: list[str], entity_result: dict) -> 
         (catalog + "\n") if catalog else "",
         _prohibited_block(schemes),
         _fewshot_block(schemes, _fewshot_ranking_text(question, entity_result)),
-        _entities_block(entity_result),
+        _entities_block(entity_result, question, schemes),
         f"\nThe user's question is about: {', '.join(schemes)}.\n",
         f'\nQuestion: "{question}"\nSQL:',
     ])
@@ -282,7 +377,7 @@ def build_repair_prompt(question: str, schemes: list[str], entity_result: dict,
         build_schema_context(schemes), "\n\n",
         _live_schema_block(schemes),
         _prohibited_block(schemes),
-        _entities_block(entity_result),
+        _entities_block(entity_result, question, schemes),
         "\nThe previous query FAILED and must be corrected.\n",
         f"Error: {error}\n",
         (f"Hint: {extra_hint}\n" if extra_hint else ""),
@@ -408,7 +503,7 @@ def build_verify_prompt(question: str, schemes: list[str], entity_result: dict, 
     return "".join([
         _live_schema_block(schemes),
         _prohibited_block(schemes),
-        _entities_block(entity_result),
+        _entities_block(entity_result, question, schemes),
         "\n", _VERIFY_CALIBRATION, "\n",
         "\nCheck the SQL below against ONLY these four things:\n"
         "  1. Every PROHIBITED JOIN above — is one of them actually used?\n"

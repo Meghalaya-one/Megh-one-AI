@@ -111,12 +111,42 @@ _OFF_TOPIC = [
     r"\b(exam\s+result|admission|jee|neet|upsc|board\s+result)\b",
 ]
 
+# PERSONAL financial advice — "where should I invest my money", "best way to
+# invest 1 lakh", "how do I grow my savings". Its own bank, checked AHEAD of
+# the scheme-intent early exit: _SCHEME_STRONG counts a bare money unit
+# ("lakh", "crore") as scheme intent, so these were waved through to the
+# pipeline and collected the "which scheme?" picker instead of a refusal
+# (reported 2026-09-18). Every pattern is anchored on the ADVICE phrasing,
+# never on the money noun, so a real scheme question using the same units
+# ("total expenditure in lakh") is untouched.
+_MONEY_ADVICE = [
+    r"\b(?:where|how|what)\b[^?.!]{0,30}\b(?:should|can|do|would|could)\s+(?:i|we)\b"
+    r"[^?.!]{0,30}\b(?:invest|save|deposit|put)\b",
+    r"\b(?:best|safest|good)\s+(?:way|place|option|scheme)s?\s+to\s+"
+    r"(?:invest|save|deposit|park|grow)\b",
+    r"\b(?:invest|investing)\s+(?:my|our|his|her|their|the)?\s*(?:money|savings|funds|cash)\b",
+    r"\b(?:where|how)\s+to\s+(?:invest|save)\b",
+    r"\b(?:grow|double|multiply)\s+(?:my|our)\s+(?:money|savings|wealth)\b",
+]
+
+
 _CONFUSED = [
     r"^(i\s+don.?t\s+(know|understand)|huh|what\?|confused|i\s*m\s+confused|no\s+idea)[\s!.?]*$",
     r"^(help|help\s*me|i\s+need\s+help|guide\s*me|assist\s*me)[\s!.?]*$",
     r"^(hmm+|umm+|uh+|ok+|okay|k|kk|yeah|nah|sure|right|got\s*it|fine)[\s!.?]*$",
     r"^(start|begin|let.s\s*(start|begin|go)|go)[\s!.?]*$",
     r"^\?+$",
+    # "what should I do?" / "what do I ask?" / "where do I start?" — a user
+    # who wants to be pointed somewhere, not an off-topic question. These have
+    # no domain vocabulary, so before this they fell through to the step-6
+    # whitelist gate and got the blunt "I can only answer questions about those
+    # schemes" bounce, which reads as a refusal to someone asking for guidance
+    # (reported 2026-09-17). The _CONFUSED reply already says exactly what to
+    # try, and carries the starter chips.
+    r"^\W*what\s+(should|shall|can|do|would)\s+i\s+(do|ask|say|type|start\s+with|query)\b",
+    r"^\W*(where|how)\s+(do|should|can)\s+i\s+(start|begin)\b",
+    r"^\W*what\s*(next|now)\b[\s!.?]*$",
+    r"^\W*(give|show|suggest)\s+(me\s+)?(some\s+)?(examples?|suggestions?|ideas?|options?)\b",
 ]
 
 # Unmistakably-not-ours topics — blocked even if a place name (e.g. "Shillong")
@@ -232,6 +262,59 @@ _SCHEME_STRONG = [
 # ── Meta-conversation — about the chat itself, not the schemes ──────────────
 # These carry no scheme keyword by nature; let them reach the pipeline (a full
 # meta resolver is a pipeline TODO — for now they route like any other question).
+# ── "Can you actually answer?" — a capability question, not a request ───────
+# A user checking what the assistant is good for before committing to a real
+# question: "are you able to give answers?", "can you answer my questions?",
+# "if I ask about Meghalaya schemes, will you be able to answer?". These carry
+# no scheme vocabulary of their own (or name the schemes only in passing, as
+# the SUBJECT of the capability question rather than as something to query), so
+# before this they took one of two wrong paths, both reported 2026-09-17:
+#   * no domain word at all -> the step-6 whitelist gate -> the blunt "I can
+#     only answer questions about those schemes" bounce, which reads as a
+#     refusal to a question that was ABOUT that very capability; or
+#   * the words "Meghalaya"/"schemes" present -> straight down the DATA path
+#     -> the "Which scheme does your question concern?" pause, asking the user
+#     to pick a scheme for a question that isn't asking for any scheme's data.
+# The honest reply to all of them is a plain yes plus what's covered, so they
+# get their own bank rather than being bent into _IDENTITY (which answers "who
+# are you", a different question) or left to the LLM.
+_CAPABILITY = [
+    # "can/will/are you able to ... answer/help/tell/give"
+    r"\b(can|could|will|would|are)\s+(you|u)\s+(be\s+)?(able\s+to\s+)?"
+    r"(answer|reply|respond|help|assist|tell|give|provide|handle|do)\b",
+    r"\b(are|r)\s+(you|u)\s+(able|capable)\b",
+    r"\b(do|does)\s+(you|u)\s+(know|have|support|cover|handle)\b",
+    r"\bis\s+it\s+possible\s+(for\s+(you|u)\s+)?to\s+(answer|help|get|find|know)\b",
+    r"\b(you|u)\s+(can|could)\s+(answer|help|tell|give|provide)\b",
+    r"\bwhat\s+(kind|type|sort)s?\s+of\s+(questions?|queries|things|data)\b",
+    r"\bcan\s+i\s+(ask|get|know|find|query)\b",
+    r"\bhow\s+(accurate|reliable|correct|trustworthy)\s+(are|is)\b",
+]
+
+# A capability phrase wrapped around an ACTUAL request — "can you tell me the
+# total person-days in 2023-24?", "can you give me houses completed by
+# district?" — is a real question, not a capability check. Any concrete metric,
+# aggregate word, place or year makes it one, so it must reach the pipeline
+# normally. Kept narrow on purpose: the bare "questions"/"answers"/"data" of a
+# genuine capability check are NOT in here.
+_ASKS_FOR_A_FIGURE = re.compile(
+    # "tell me / explain / what is ... <scheme>" is a real KNOWLEDGE request,
+    # even though it opens with a capability phrase ("can you tell me about
+    # MGNREGA"). The scheme is the SUBJECT being asked about, not the topic of
+    # a can-you check.
+    r"\b(?:tell|explain|describe)\b[^?]{0,30}"
+    r"\b(?:mgnrega|mnrega|nrega|pmay|awaas|awas|focus\s*\+?|focusplus|"
+    r"cm\s*elevate|cmelevate)\b|"
+    r"\b(how\s+many|how\s+much|total|sum|count|number\s+of|average|avg|"
+    r"person[\s-]?days?|expenditure|spend(?:ing)?|spent|wages?|job\s?cards?|"
+    r"houses?|sanction\w*|complet\w*|disburs\w*|beneficiar\w*|applications?|"
+    r"breakdown|compare|comparison|list\s+of|top\s+\d|highest|lowest|"
+    r"by\s+(?:district|block|village|year)|district[\s-]?wise|block[\s-]?wise|"
+    r"eligib\w*|documents?\s+required|who\s+can\s+apply|how\s+(?:do|to)\s+i\s+apply|"
+    r"\bfy\s?20\d\d|\b20\d\d\b)\b",
+    re.IGNORECASE,
+)
+
 _META_CONV = [
     r"\b(my|your)\s+(first|last|previous|prior|earlier)\s+(question|query|message|answer)",
     r"what\s+did\s+(i|you)\s+(ask|say|answer|tell|reply)",
@@ -327,7 +410,8 @@ STARTERS = [
 ]
 
 # Which edge replies carry the starter chips (a plain "thanks" / "bye" should not).
-_STARTER_KINDS = {"greeting", "identity", "profanity", "silly", "off_topic", "confused"}
+_STARTER_KINDS = {"greeting", "identity", "capability", "money_advice", "profanity", "silly",
+                  "off_topic", "confused"}
 
 # One consistent line for every "that's not something I do" case — an unrelated
 # topic, a general-knowledge question, or a place outside Meghalaya. Callers past
@@ -352,6 +436,30 @@ _RESPONSES = {
         "and block breakdowns, and eligibility or how-to-apply questions for any of "
         "these schemes. Just ask in plain language."
     ),
+    # Answers the question that was actually asked — "can you?" — with a plain
+    # yes first, then what that covers. Deliberately NOT the _OUT_OF_SCOPE_REPLY
+    # ("I can only answer...", which reads as a refusal here) and not the
+    # "which scheme?" pause (nothing is being queried yet).
+    "capability": (
+        "Yes — that's exactly what I'm here for. I can answer questions about "
+        "Meghalaya's MGNREGA, PMAY-G, Focus Plus and CM Elevate schemes, in two ways: "
+        "the actual data (person-days, expenditure, houses sanctioned and completed, "
+        "Focus Plus disbursements, CM Elevate applications — by district, block, "
+        "village or financial year), and how the schemes work (eligibility, benefits, "
+        "documents, how to apply). Ask in plain language and I'll take it from there."
+    ),
+    # Personal financial advice. Says plainly that this is not what the
+    # assistant does — a generic "I can only answer questions about those
+    # schemes" never acknowledges that the question was about investing, and
+    # reads as if the request was simply not understood.
+    "money_advice": (
+        "I can't advise on investing or saving your own money — I'm not a financial "
+        "adviser, and that's outside what I do. I'm Megh One AI: I answer questions "
+        "about Meghalaya's MGNREGA, PMAY-G, Focus Plus and CM Elevate schemes — who "
+        "is eligible, what benefits they pay, how to apply, and the actual figures by "
+        "district, block or year. If you'd like to know what any of those schemes "
+        "offers, ask away."
+    ),
     "thanks": "You're welcome. Ask me anything else about MGNREGA, PMAY-G, Focus Plus or CM Elevate in Meghalaya.",
     "goodbye": "Thanks for using the Meghalaya scheme assistant. Come back any time.",
     "profanity": (
@@ -370,10 +478,179 @@ _RESPONSES = {
 }
 
 
-def _edge(kind: str) -> dict:
+# ── Scheme-specific capability reply ────────────────────────────────────────
+# "can I get MGNREGA data?" names ONE scheme, so answering with the full
+# four-scheme rundown — and then suggesting PMAY-G / Focus Plus / CM Elevate
+# starters — reads as if the question wasn't listened to (reported 2026-09-17).
+# When exactly one scheme is named, both the sentence and the chips narrow to
+# it; a question naming none, or several, keeps the general reply unchanged.
+_SCHEME_ALIASES = {
+    "MGNREGA": re.compile(r"\b(mgnrega|mnrega|nrega)\b", re.IGNORECASE),
+    "PMAY-G": re.compile(r"\b(pmay[\s-]?g?|awaas|awas)\b", re.IGNORECASE),
+    "Focus Plus": re.compile(r"\b(focus[\s-]?plus|focusplus)\b|focus\s*\+", re.IGNORECASE),
+    "CM Elevate": re.compile(r"\b(cm[\s-]?elevate|cmelevate)\b", re.IGNORECASE),
+}
+
+# What each scheme actually holds — the data side and the knowledge side — so
+# the narrowed reply stays concrete instead of a generic "yes I cover it".
+_SCHEME_CAPABILITY = {
+    "MGNREGA": (
+        "person-days, households and persons employed, job cards, 100-day "
+        "completions, and wage / material / total expenditure — by district, "
+        "block, village, assembly constituency or financial year"
+    ),
+    "PMAY-G": (
+        "houses sanctioned, completed and in progress, construction stage, "
+        "sanctioned and released amounts, and installments — by district, "
+        "block, village or financial year"
+    ),
+    "Focus Plus": (
+        "disbursements and amounts paid, beneficiaries, batches and tranches, "
+        "bank-wise payments, and the 12.5K cohort's status / gender / "
+        "occupation splits — by district, block, village or financial year"
+    ),
+    "CM Elevate": (
+        "applications across its 15 sub-schemes (piggery, poultry, tourism "
+        "vehicles, small enterprise and more), application mode, workflow "
+        "level and verification status — by district, block or sub-scheme"
+    ),
+}
+
+_SCHEME_STARTERS = {
+    "MGNREGA": [
+        "Total MGNREGA person-days in Meghalaya in 2023-24",
+        "MGNREGA expenditure by district",
+        "How many MGNREGA job cards were issued in Ri Bhoi?",
+        "Which block recorded the most MGNREGA person-days?",
+        "Who is eligible for MGNREGA?",
+    ],
+    "PMAY-G": [
+        "PMAY-G houses completed by district",
+        "How many PMAY-G houses were sanctioned in 2023-24?",
+        "PMAY-G amount released by district",
+        "How many PMAY-G houses are still in progress?",
+        "Who is eligible for PMAY-G?",
+    ],
+    "Focus Plus": [
+        "Focus Plus payments by batch",
+        "Total Focus Plus amount disbursed by district",
+        "How many Focus Plus beneficiaries are there?",
+        "Focus Plus disbursement by tranche",
+        "Who is eligible for Focus Plus?",
+    ],
+    "CM Elevate": [
+        "How many CM Elevate applications are on hold?",
+        "CM Elevate applications by sub-scheme",
+        "Which district has the most CM Elevate applications?",
+        "CM Elevate applications by district",
+        "Who is eligible for CM Elevate?",
+    ],
+}
+
+
+def _named_scheme(question: str) -> "str | None":
+    """The single scheme named in `question`, or None when it names none or
+    more than one (both of which want the general four-scheme reply)."""
+    hits = [name for name, rx in _SCHEME_ALIASES.items() if rx.search(question or "")]
+    return hits[0] if len(hits) == 1 else None
+
+
+def _capability_reply(scheme: str) -> str:
+    return (
+        f"Yes — I can answer {scheme} questions for Meghalaya. That covers the "
+        f"actual data ({_SCHEME_CAPABILITY[scheme]}), and how the scheme works "
+        "(eligibility, benefits, documents, how to apply). Ask in plain language "
+        "and I'll take it from there."
+    )
+
+
+# A yes/no question deserves a yes/no answer. "will you answer for West Bengal
+# data?" / "can you give Assam figures?" / "do you cover Delhi?" are all asking
+# whether the assistant CAN — so the reply has to open with "No", not with a
+# statement of scope that leaves the question hanging.
+_YES_NO_ASK = re.compile(
+    r"^\W*(?:can|could|will|would|do|does|are|is|shall|may)\b",
+    re.IGNORECASE,
+)
+
+
+# Places whose natural spelling isn't plain Title Case, plus the "not a place"
+# scopes (_OUT_OF_AREA also matches "all india" / "nationwide", which name a
+# COVERAGE rather than a state — "I don't hold data for All India" reads wrong).
+_PLACE_SPELLING = {
+    "usa": "the USA", "us": "the US", "uk": "the UK", "uae": "the UAE",
+    "ncr": "the NCR", "j&k": "Jammu & Kashmir",
+}
+_NATIONAL_SCOPE = {
+    "all india", "all-india", "pan india", "pan-india", "nationwide",
+    "national", "whole country", "entire country", "across india", "india",
+}
+
+
+def _title_place(place: str) -> str:
+    """'west bengal' -> 'West Bengal'; keeps acronyms and known spellings."""
+    p = str(place).strip().lower()
+    if p in _PLACE_SPELLING:
+        return _PLACE_SPELLING[p]
+    return " ".join(w if w.isupper() else w.capitalize() for w in str(place).split())
+
+
+def _out_of_area_reply(question: str, place: str) -> str:
+    """The off-topic reply, but naming the place the user actually asked about
+    and answering a yes/no question as one."""
+    national = str(place).strip().lower() in _NATIONAL_SCOPE
+    name = _title_place(place)
+    if national:
+        # "all India" / "nationwide" is a coverage, not a place — phrase it as
+        # a scope the assistant doesn't have rather than a missing state.
+        lead = ("No — I can't give all-India figures. " if _YES_NO_ASK.match(question or "")
+                else "I don't hold all-India figures. ")
+    elif _YES_NO_ASK.match(question or ""):
+        lead = f"No — I can't answer questions about {name}. "
+    else:
+        lead = f"I don't hold any data for {name}. "
+    return (
+        lead + "I'm Megh One AI, and I only cover Meghalaya's MGNREGA, PMAY-G, "
+        "Focus Plus and CM Elevate schemes — the data is Meghalaya's alone, so I "
+        "have nothing for other states or countries. If there's something you'd "
+        "like to know about these four schemes in Meghalaya, I can help with that."
+    )
+
+
+def _NAMES_UNSUPPORTED_SCHEME(question: str) -> bool:
+    """True when the text names a real government scheme this assistant doesn't
+    hold (PM-KISAN, Ujjwala, Jal Jeevan, …).
+
+    The catalogue of those lives in app.pipeline (_UNSUPPORTED_SCHEME), which
+    imports this module — so the import is done lazily, inside the call, to
+    avoid a cycle at module load. Any failure degrades to False, i.e. exactly
+    the behaviour before this check existed."""
+    try:
+        from app import pipeline as _pipeline
+
+        return _pipeline._unsupported_scheme_named(question) is not None
+    except Exception:  # noqa: BLE001 — never let this break edge detection
+        return False
+
+
+def _edge(kind: str, question: str = "", place: str = "") -> dict:
     out = {"type": kind, "response": _RESPONSES[kind]}
+    # A capability question that names ONE scheme gets that scheme's answer and
+    # that scheme's suggestions, rather than the whole catalogue.
+    scheme = _named_scheme(question) if kind == "capability" else None
+    if scheme:
+        out["response"] = _capability_reply(scheme)
+    # An out-of-area question gets the place it named, and a direct "No" when
+    # it was phrased as a yes/no question.
+    if place:
+        out["response"] = _out_of_area_reply(question, place)
+    # Any other refusal asked as a yes/no question ("will you answer questions
+    # about cricket?", "do you know about bitcoin?") gets the "No" prefixed, so
+    # the reply answers what was asked before stating what IS covered.
+    elif kind in ("off_topic", "silly") and _YES_NO_ASK.match(question or ""):
+        out["response"] = "No — that's outside what I cover. " + out["response"]
     if kind in _STARTER_KINDS:
-        out["suggestions"] = list(STARTERS)
+        out["suggestions"] = list(_SCHEME_STARTERS[scheme]) if scheme else list(STARTERS)
     return out
 
 
@@ -405,20 +682,68 @@ def detect_edge_case(question: str, has_context: bool = False) -> dict | None:
     # 0. Hard off-topic (weather, markets, sport, film) wins even over a place
     #    name — unless a scheme is actually named.
     if not _SCHEME_NAMED.search(ql) and any(re.search(p, ql) for p in _HARD_OFF_TOPIC):
-        return _edge("off_topic")
+        return _edge("off_topic", ql)
 
     # 0b. Out-of-area — anchored on a place outside Meghalaya (another state, a
     #     neighbouring city, "all-India", or a foreign country/continent).
     #     Beats the scheme-intent early exit, unless a Meghalaya place is named
     #     too ("Meghalaya vs Assam").
-    if (_OUT_OF_AREA.search(ql) or _FOREIGN_PLACE.search(ql)) and not _MEGHALAYA_PLACE.search(ql):
-        return _edge("off_topic")
+    _area = _OUT_OF_AREA.search(ql) or _FOREIGN_PLACE.search(ql)
+    if _area and not _MEGHALAYA_PLACE.search(ql):
+        # Name the place that was matched, and — when the user asked a yes/no
+        # question ("will you answer for West Bengal data?") — open with the
+        # "No" that actually answers it. The generic reply below states what
+        # the assistant covers but never responds to the question that was
+        # asked, which reads as evasive (reported 2026-09-17).
+        return _edge("off_topic", ql, place=_area.group(0))
+
+    # 0c. "Can you actually answer?" — a question ABOUT the assistant's
+    #     capability, not a request for data. Checked BEFORE the scheme-intent
+    #     exit below: "if I ask questions on Meghalaya schemes, will you be able
+    #     to give answers?" names the schemes, so step 1 would wave it through
+    #     to the DATA path, which then asks "which scheme?" for a question that
+    #     is not asking for any scheme's data (reported 2026-09-17). A message
+    #     that pairs a capability phrase with a REAL query ("can you tell me
+    #     MGNREGA person-days in 2023-24?") is excluded by the metric/aggregate
+    #     check, so those still route normally.
+    #     A capability phrase wrapped around an OFF-TOPIC subject ("can you help
+    #     me book a flight?", "will you answer questions about cricket?") is not
+    #     a capability check either — answering "Yes, that's what I'm here for"
+    #     to those is plainly wrong, so they fall through to the off-topic banks
+    #     below, which now answer them with a direct "No".
+    if (any(re.search(p, ql) for p in _CAPABILITY)
+            and not _ASKS_FOR_A_FIGURE.search(ql)
+            and not any(re.search(p, ql) for p in _SILLY)
+            and not any(re.search(p, ql) for p in _OFF_TOPIC)):
+        return _edge("capability", ql)
+
+    # 0d. Personal financial advice ("where should I invest my money one
+    #     lakh?"). Checked BEFORE the scheme-intent exit below, for the same
+    #     reason the out-of-area check is: _SCHEME_STRONG counts a bare money
+    #     unit — "lakh", "crore" — as proof of scheme intent, so this question
+    #     exited straight to the pipeline and came back with the "which scheme
+    #     does your question concern?" picker instead of being declined
+    #     (reported 2026-09-18). Anchored on the ADVICE phrasing, never on the
+    #     money noun, so "total expenditure in lakh" is unaffected. A question
+    #     that also names a scheme outright is left alone — "can MGNREGA wages
+    #     help me save" is a scheme question, however it is phrased.
+    if not _SCHEME_NAMED.search(ql) and any(re.search(p, ql) for p in _MONEY_ADVICE):
+        return _edge("money_advice", ql)
 
     # 1. Clear scheme intent → straight to the pipeline, skip every check.
     if any(re.search(p, ql) for p in _SCHEME_STRONG):
         return None
 
     # 2. Canned-reply banks, most specific first.
+    # An off-topic SUBJECT beats the conversational openers above it. "can you
+    # help me book a flight?" matches _IDENTITY's generic "can you help me"
+    # pattern, which would answer with the friendly capabilities rundown and
+    # never decline the thing actually asked for; the flight is what the
+    # message is about, so the off-topic banks take it first.
+    for bank, kind in ((_SILLY, "silly"), (_OFF_TOPIC, "off_topic")):
+        if any(re.search(p, ql) for p in bank):
+            return _edge(kind, ql)
+
     for bank, kind in (
         (_GREETINGS, "greeting"),
         (_IDENTITY, "identity"),
@@ -430,7 +755,7 @@ def detect_edge_case(question: str, has_context: bool = False) -> dict | None:
         (_CONFUSED, "confused"),
     ):
         if any(re.search(p, ql) for p in bank):
-            return _edge(kind)
+            return _edge(kind, ql)
 
     # 3. Meta-conversation ("what did I ask before?") → let the pipeline see it.
     if any(re.search(p, ql) for p in _META_CONV):
@@ -450,7 +775,17 @@ def detect_edge_case(question: str, has_context: bool = False) -> dict | None:
     #    This is what stops "what is elon musk?" from ever reaching a model.
     #    Skipped when there's a live prior scheme answer to be a follow-up to —
     #    see the has_context note in the docstring above.
+    # A question naming a real government scheme we simply don't hold ("what is
+    # PM Kisan Yojana?") has no MGNREGA/PMAY-G vocabulary either, so this gate
+    # bounced it with the blunt "I can only answer questions about those
+    # schemes" — which never says the subject IS a scheme, just not one of the
+    # four (reported 2026-09-18). Let it through: the pipeline's
+    # _unsupported_scheme_named check names the scheme, explains the gap and
+    # offers the four as one-tap chips. That is a far better answer than this
+    # gate can give, and it is still a canned reply — no model call.
+    if _NAMES_UNSUPPORTED_SCHEME(ql):
+        return None
     if not has_context and not any(re.search(w, ql) for w in _DOMAIN_WORDS):
-        return _edge("off_topic")
+        return _edge("off_topic", ql)
 
     return None

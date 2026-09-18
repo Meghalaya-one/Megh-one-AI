@@ -217,7 +217,16 @@ def catalog_block(schemes: list[str], *, max_terms: int = 24) -> str:
         for g in gloss[:max_terms]:
             tgt = g.get("maps_to_column") or g.get("maps_to_object") or ""
             tail = f"  -> {tgt}" if tgt else ""
-            lines.append(f"  \"{g['term']}\": {(g.get('definition') or '')[:180]}{tail}")
+            # Synonyms are the half that makes a term matchable: a glossary
+            # entry pointing at a column is only useful if the generator can
+            # recognise the user's phrasing for it ("as per the spreadsheet",
+            # "the raw block"). Carry them when the catalogue provides them.
+            syn = g.get("synonyms") or g.get("aliases") or ""
+            if isinstance(syn, (list, tuple)):
+                syn = ", ".join(str(s) for s in syn if s)
+            syn = f"  [also: {str(syn)[:160]}]" if str(syn).strip() else ""
+            lines.append(
+                f"  \"{g['term']}\": {(g.get('definition') or '')[:260]}{tail}{syn}")
 
     if _cache["metrics"]:
         lines.append("\nLIVE CATALOG — metric definitions (from semantic.metric_definitions):")
@@ -235,14 +244,39 @@ def catalog_block(schemes: list[str], *, max_terms: int = 24) -> str:
     # Scheme-specific traps first, shared dim_* notes after — so the max_terms
     # cap (below) trims generic geography/year notes before it ever trims a
     # scheme-specific one, regardless of which sorts first alphabetically.
-    cols = sorted(cols, key=lambda c: not _is_scheme_specific_table(c.get("table_name")))
+    # A data_quality_note is a trap that produces a WRONG NUMBER if unseen (a
+    # column whose twin holds an uncorrected value, a verbatim source
+    # misspelling, a case-sensitive literal). A plain `description` is only
+    # helpful context. Order notes ahead of descriptions so the max_terms cap
+    # trims the merely-useful before the load-bearing — otherwise a scheme with
+    # many documented columns can push its own traps out of the prompt
+    # entirely, which is how a "which block column?" distinction that IS
+    # documented in semantic.column_catalog can still fail to reach the
+    # generator (raised 2026-09-18).
+    cols = sorted(cols, key=lambda c: (not _is_scheme_specific_table(c.get("table_name")),
+                                       not (c.get("data_quality_note") or "").strip()))
     if cols:
         lines.append("\nLIVE CATALOG — column notes (from semantic.column_catalog):")
-        for c in cols[:max_terms]:
-            note = (c.get("data_quality_note") or c.get("description") or "").strip()
+        # The cap budgets DESCRIPTIONS only. Every data_quality_note for a
+        # scheme in play is emitted, however many there are: each one is a
+        # documented way to get a wrong number, so silently dropping the 25th
+        # defeats the point of reading the catalogue at all. Descriptions are
+        # nice-to-have context and stay capped.
+        _desc_budget = max_terms
+        for c in cols:
+            quality = (c.get("data_quality_note") or "").strip()
+            if not quality:
+                if _desc_budget <= 0:
+                    continue
+                _desc_budget -= 1
+            note = quality or (c.get("description") or "").strip()
             if note:
+                # Quality notes keep more room than descriptions: theirs is the
+                # text that names the other column, the trigger phrasing and the
+                # worked figures, and 280 chars routinely cut that mid-sentence.
+                limit = 600 if quality else 280
                 lines.append(
-                    f"  {c['table_schema']}.{c['table_name']}.{c['column_name']}: {note[:280]}")
+                    f"  {c['table_schema']}.{c['table_name']}.{c['column_name']}: {note[:limit]}")
 
     return ("\n".join(lines) + "\n") if lines else ""
 

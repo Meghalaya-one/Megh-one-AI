@@ -188,7 +188,22 @@ MGNREGA TABLES
 _MGNREGA_RULES = """
 MGNREGA RULES (breaking these produces a wrong number, not just an ugly query):
   1. NEVER join fact_mgnrega_employment to fact_mgnrega_expenditure directly (no shared grain).
-     For cross-KPI questions use curated.v_district_year_summary instead.
+     The two facts share NO measures: person_days / persons_employed /
+     households_employed / households_completed_100_days / job_cards_issued_total are on
+     curated.v_employment ONLY, while total_exp / unskilled_wage_exp /
+     semi_skilled_wage_exp / material_exp are on curated.v_expenditure ONLY. A question
+     wanting one from each ("compare expenditure and person-days in X") therefore cannot
+     be answered from a single view.
+       - At DISTRICT x YEAR grain: select both from curated.v_district_year_summary.
+       - At BLOCK or VILLAGE grain: v_district_year_summary has no block/village column,
+         so aggregate each fact in its own CTE with the SAME filters, then combine:
+           WITH emp AS (SELECT SUM(person_days) AS person_days FROM curated.v_employment
+                        WHERE lgd_block = '<BLOCK>' AND year_key = <YYYY>),
+                exp AS (SELECT SUM(total_exp) AS total_exp_lakh FROM curated.v_expenditure
+                        WHERE lgd_block = '<BLOCK>' AND year_key = <YYYY>)
+           SELECT exp.total_exp_lakh, emp.person_days FROM emp, exp
+         Use GROUP BY in each CTE plus a FULL OUTER JOIN on the grain columns only when a
+         per-block / per-village / per-year breakdown is asked for.
   2. Both MGNREGA facts are at source-row grain — always SUM ... GROUP BY, never read a row raw.
   3. job_cards_issued_total is a cumulative STOCK. Report ONE financial year, never a sum
      across years. It is still at source-row grain, so the figure for an area is
@@ -297,9 +312,28 @@ FOCUS PLUS TABLES
       member, in one tranche) — the finest grain in megh_db. 25 columns:
         focus_plus_fact_id, source_row_id, source_sl_no, year_key, financial_year,
         financial_year_short, geography_key, village_code, lgd_village_name, lgd_block,
-        lgd_district, on_roster, has_geo_conflict, batch_label, tranche_label,
-        amount_disbursed, gender, occupation, focus_status, verification_status,
-        member_id, pincode, entity_type, bank_name_raw, beneficiary_key
+        block_name_raw, lgd_district, on_roster, has_geo_conflict, batch_label,
+        tranche_label, amount_disbursed, gender, occupation, focus_status,
+        verification_status, member_id, pincode, entity_type, bank_name_raw,
+        beneficiary_key
+      BLOCK COLUMN — for Focus Plus, blocks are mapped on block_name_raw. USE IT.
+        block_name_raw  = THE block column for this scheme. Populated on all
+                          385,671 rows. Filter and GROUP BY this for every
+                          block-level figure (disbursement totals, beneficiary
+                          counts, per-block breakdowns, "which block ...").
+                          Stored Title Case ("Songsak", "Mylliem") — NOT
+                          uppercase, so compare case-insensitively:
+                          UPPER(block_name_raw) = 'SONGSAK'.
+        lgd_block       = the LGD-registry-mapped name, and it is INCOMPLETE:
+                          NULL on 57,649 rows (15%), hiding ₹18.01 crore of
+                          disbursement. Mylliem loses 57% of its money this way,
+                          Rongram 50%, Lawsohtun 66%. A block figure taken from
+                          lgd_block silently under-reports and looks perfectly
+                          plausible. Do NOT use it for a block filter or a block
+                          GROUP BY, and do NOT AND it with block_name_raw — that
+                          re-introduces the same 15% loss.
+      lgd_district and lgd_village_name do NOT have this problem (4 and 0 nulls
+      respectively) — this is specific to the block column.
       beneficiary_key is a GENERATED column (batch_label || ':' || source_sl_no) added
       2026-09-13 specifically to count beneficiaries correctly across both cohorts in one
       identifier space — see FOCUS PLUS RULES rule 6 below before writing any
@@ -411,6 +445,15 @@ FOCUS PLUS RULES (breaking these produces a wrong number, not just an ugly query
      code — flag any village- or block-level figure as provisional. dim_geography also
      holds wards (entity_type = 'Ward'); do not silently mix them into a "top villages"
      ranking.
+     BLOCKS ARE MAPPED ON block_name_raw FOR THIS SCHEME — use it for every
+     block filter and every block GROUP BY, with UPPER(block_name_raw) = '<BLOCK>'
+     (it is stored Title Case, so a bare equality against an uppercase literal
+     matches zero rows). lgd_block is NULL on 57,649 of 385,671 rows (15%) and
+     drops ₹18.01 crore of disbursement — Mylliem loses 57% of its money,
+     Rongram 50% — so a block figure read from lgd_block silently under-reports.
+     Do not AND the two columns together either; that re-creates the same loss.
+     District and village are unaffected — lgd_district / lgd_village_name are
+     effectively complete and stay the right columns for those levels.
      has_geo_conflict does NOT mean the stored lgd_district/lgd_block is wrong or
      unresolved — dim_geography.geo_conflict_note shows it flags rows where the Focus+
      source's own block name disagreed with the LGD roster; the roster's (authoritative)

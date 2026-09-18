@@ -20,6 +20,11 @@ from app.config import settings
 from app.db import UnsafeSQLError, run_readonly
 from app.entity_resolver import (
     all_districts,
+    block_parent_district,
+    canonical_names,
+    collides_across_dimensions,
+    collision_canonical_names,
+    constituency_contents,
     detect_region,
     lookup_geo_term,
     resolve_cm_scheme,
@@ -31,6 +36,7 @@ from app.entity_resolver import (
     resolve_village,
     scan_dimension,
     tranche_labels,
+    village_names_exact,
 )
 from app.schema_context import SCHEME_CATALOG, available_metrics_text
 from app.session_store import Session
@@ -892,10 +898,25 @@ def _unsupported_scheme_clarification(question: str, name: str) -> "Clarificatio
         {"label": "Compare across schemes",
          "question": f"{stem} across MGNREGA, PMAY-G, Focus Plus and CM Elevate"},
     ]
+    # Names the scheme asked for, says plainly that it is outside what is
+    # loaded, then points somewhere useful. Deliberately about SCHEME COVERAGE
+    # rather than "no data": the user asked about a real government scheme that
+    # simply isn't one of the four here, and "I don't have information about
+    # that" reads as though the assistant is broken rather than out of scope
+    # (reported 2026-09-18).
+    # Echo the scheme name back in a presentable form — the matched text is
+    # whatever the user typed ("ujjwala", "pm kisan"), and a reply that opens
+    # with a lowercase scheme name reads careless. An all-caps acronym
+    # ("PM-KISAN", "JJM") is already right and left alone.
+    _display = " ".join(w if w.isupper() else w.capitalize()
+                        for w in name.strip().split())
     return ClarificationNeeded(
-        f'I don\'t have any data for "{name.strip()}". Right now I only hold '
-        "four schemes — MGNREGA, PMAY-G, Focus Plus and CM Elevate. Pick one of those "
-        "and I'll answer.",
+        f"{_display} isn't one of the schemes I cover, so I can't answer questions "
+        "about it — not its rules, eligibility or its data. I cover four Meghalaya "
+        "schemes: MGNREGA (rural employment), PMAY-G (rural housing), Focus Plus "
+        "(farmer cash benefit) and CM Elevate (livelihood and enterprise support). "
+        "If one of those is what you need, pick it below and I'll take the question "
+        "from there.",
         options=options,
         rule="scheme-not-available",
     )
@@ -983,23 +1004,72 @@ _ADMIN_EXPENDITURE_REQUESTED = re.compile(
     r"\bprogramme\s+expenditure\b|\bprogram\s+expenditure\b",
     re.IGNORECASE,
 )
+# The MGNREGA wording says the figure is EMPTY rather than absent, because that
+# is what the data actually shows. curated.v_expenditure does expose
+# admin_total_exp, but it is non-zero on exactly ONE of its 18,818 rows (₹0.90
+# lakh, Alokdia / DEMDEMA block / FY 2023-24) against ₹362,866 lakh of total
+# expenditure — docs/schema_for_developers.md records it as "effectively
+# unpopulated". Saying it "isn't held" was misleading: a user who checks the
+# schema finds the column and reasonably concludes the assistant is wrong
+# (reported 2026-09-17, "admin expenditure in demdema"). Reporting the real
+# 0.00 would be worse — it reads as a measured finding rather than an empty
+# column — so the honest answer names the column, says it was never populated,
+# and offers the figures that were.
 _ADMIN_EXPENDITURE_NOT_HELD_TEXT = {
     "MGNREGA": (
-        "Administrative expenditure is deliberately excluded from MGNREGA reporting "
-        "here — only unskilled wage, semi-skilled wage, material and total expenditure "
-        "are held. Did you mean total expenditure instead?"
+        "MGNREGA's administrative expenditure column exists but was never populated "
+        "at ingest — it is zero on every row but one in the whole state, so there is "
+        "no real figure to report{scope}. The expenditure that IS recorded is "
+        "unskilled wage, semi-skilled wage, material and total. Did you mean total "
+        "expenditure instead?"
     ),
     "PMAY-G": (
-        "Administrative and programme expenditure are not held for PMAY-G — only the "
-        "per-house sanctioned and released amounts are. Did you mean amount released "
+        "Administrative and programme expenditure are not held for PMAY-G{scope} — only "
+        "the per-house sanctioned and released amounts are. Did you mean amount released "
         "instead?"
     ),
 }
 _ADMIN_EXPENDITURE_GENERIC_TEXT = (
-    "Administrative expenditure isn't held for querying in any of the schemes I "
-    "cover — MGNREGA reports only wage/material/total expenditure, and PMAY-G only "
-    "sanctioned and released amounts. Shall I answer using one of those instead?"
+    "There is no usable administrative-expenditure figure{scope} in any scheme I cover. "
+    "MGNREGA has the column but it was never populated (zero on every row but one "
+    "statewide), and PMAY-G records only sanctioned and released amounts. Shall I "
+    "answer using wage, material or total expenditure instead?"
 )
+
+
+# The place the question asked about, so the reply can say "…for Demdema"
+# rather than answering in the abstract. Deliberately a light touch: the name
+# is echoed back as the user typed it (title-cased), NOT resolved — this check
+# runs long before resolve_entities, and a refusal about an empty column is the
+# same refusal at any admin level, so there is nothing to disambiguate.
+_ADMIN_EXP_PREP = r"(?:in|for|at|of|under|from|within)"
+_ADMIN_EXP_PLACE_RE = re.compile(
+    rf"\b{_ADMIN_EXP_PREP}\s+(?:{_ADMIN_EXP_PREP}\s+)*"
+    r"(?P<name>[A-Za-z][A-Za-z.'-]*(?:\s+[A-Za-z][A-Za-z.'-]*){0,2})\s*[?.!]*\s*$",
+    re.IGNORECASE,
+)
+_ADMIN_EXP_NOT_A_PLACE = {
+    "mgnrega", "mnrega", "nrega", "pmay", "pmay g", "pmayg", "awaas", "awas",
+    "focus plus", "focusplus", "cm elevate", "cmelevate", "meghalaya",
+    "the state", "each district", "every district", "all districts",
+}
+
+
+def _admin_expenditure_scope(question: str) -> str:
+    """' in Demdema' when the question names a place, else ''."""
+    # Strip any scheme name first. "…for PMAY-G in Tura" otherwise lets the
+    # trailing-phrase match start at "PMAY-G" and produce "for Pmay-G In Tura",
+    # which also duplicates the scheme the sentence has already named.
+    text = question or ""
+    for rx in _SCHEME_NAME_PATTERN.values():
+        text = rx.sub(" ", text)
+    m = _ADMIN_EXP_PLACE_RE.search(re.sub(r"\s+", " ", text).strip())
+    if not m:
+        return ""
+    name = m.group("name").strip().rstrip(".,")
+    if name.lower() in _ADMIN_EXP_NOT_A_PLACE or len(name) < 3:
+        return ""
+    return f" in {name.title()}"
 
 
 def _admin_expenditure_clarification(question: str) -> "ClarificationNeeded":
@@ -1008,7 +1078,8 @@ def _admin_expenditure_clarification(question: str) -> "ClarificationNeeded":
         text = _ADMIN_EXPENDITURE_NOT_HELD_TEXT[schemes[0]]
     else:
         text = _ADMIN_EXPENDITURE_GENERIC_TEXT
-    return ClarificationNeeded(text, rule="column-not-held")
+    return ClarificationNeeded(text.format(scope=_admin_expenditure_scope(question)),
+                               rule="column-not-held")
 
 
 def _needs_scheme_clarification(question: str) -> bool:
@@ -1021,6 +1092,11 @@ def _needs_scheme_clarification(question: str) -> bool:
     if any(p.search(question) for p in _SCHEME_NAME_PATTERN.values()):
         return False
     if _EXPLICIT_BOTH.search(question):
+        return False
+    # A superlative asked ACROSS schemes ("which scheme spent the most?") names
+    # the scheme as its ANSWER — pausing to ask which scheme is meant would be
+    # asking the user for the thing they came to find out.
+    if _CROSS_SCHEME_SUPERLATIVE.search(question or ""):
         return False
     if _infer_scheme_from_terms(question) is not None:
         return False
@@ -1750,6 +1826,121 @@ LIMIT 1;
 """.strip()
 
 
+# ── "Which scheme has the highest spend?" — the scheme IS the answer ────────
+# A superlative asked ACROSS schemes ("which scheme paid out the most?", "the
+# scheme with the highest money spent") is answered by ranking the schemes
+# against each other. Asking "which scheme does your question concern?" first
+# is backwards — the scheme is the thing being asked for, not a filter the
+# user forgot (reported 2026-09-17: "what about the scheme with highest money
+# paid?" raised the four-way scheme pause instead of answering).
+#
+# _EXPLICIT_BOTH already recognises the phrasings that ask for every scheme
+# ("both schemes", "by scheme", "scheme-wise"), but not this superlative
+# shape, where the cross-scheme intent is carried by "which/what scheme" plus
+# a ranking word rather than by an "all/each" quantifier.
+_CROSS_SCHEME_SUPERLATIVE = re.compile(
+    r"\b(?:which|what)\s+scheme\b[^?.!]{0,60}\b"
+    r"(?:highest|lowest|most|least|maximum|minimum|greatest|biggest|largest|"
+    r"smallest|top|best|worst|more|less)\b|"
+    r"\b(?:highest|lowest|most|least|maximum|minimum|greatest|biggest|largest|"
+    r"smallest|top)\b[^?.!]{0,40}\bscheme\b|"
+    r"\bscheme\s+with\s+(?:the\s+)?(?:highest|lowest|most|least|maximum|minimum|"
+    r"greatest|biggest|largest|smallest|top)\b|"
+    r"\b(?:rank|compare)\s+(?:the\s+)?schemes\b",
+    re.IGNORECASE,
+)
+# The superlative has to be about MONEY for the ranking below to apply — a
+# "which scheme has the most applications" question is a different figure and
+# is left to normal SQL generation.
+_MONEY_SUPERLATIVE = re.compile(
+    r"\bmoney\b|\bamount\b|\bspend\w*\b|\bspent\b|\bexpenditure\b|\bpaid\b|"
+    r"\bpayment\w*\b|\bdisburs\w*\b|\breleas\w*\b|\bfunds?\b|\bcrore\b|\blakh\b|"
+    r"\bcost\b|\bbudget\b|\boutlay\b",
+    re.IGNORECASE,
+)
+
+
+def _wants_cross_scheme_money_ranking(question: str) -> bool:
+    """True when the question asks which scheme spent/paid the most — a
+    comparison ACROSS schemes whose answer names a scheme."""
+    q = question or ""
+    return bool(_CROSS_SCHEME_SUPERLATIVE.search(q) and _MONEY_SUPERLATIVE.search(q))
+
+
+# One query, every scheme that records money, each normalised to CRORE.
+# curated.v_cross_scheme_money_district_year is the sanctioned MGNREGA-vs-PMAY
+# comparison object (docs/DATA_MODEL.md); Focus Plus keeps its money on its own
+# view in RUPEES (/1e7 -> crore). CM Elevate is deliberately absent — it has no
+# money column of any kind (v_cm_elevate carries applications only), so it is
+# reported as "not held" rather than as a misleading zero.
+_CROSS_SCHEME_MONEY_SQL = """
+SELECT scheme_code AS scheme,
+       ROUND(SUM(amount_crore), 2) AS amount_crore,
+       MIN(measure_semantics) AS measure_semantics
+FROM curated.v_cross_scheme_money_district_year
+GROUP BY scheme_code
+UNION ALL
+SELECT 'Focus Plus' AS scheme,
+       ROUND(SUM(amount_disbursed) / 1e7, 2) AS amount_crore,
+       'amount disbursed to farmers (DBT), rupees' AS measure_semantics
+FROM curated.v_focus_plus
+ORDER BY amount_crore DESC
+""".strip()
+
+_SCHEME_DISPLAY_NAME = {"MGNREGA": "MGNREGA", "PMAY": "PMAY-G", "PMAY-G": "PMAY-G",
+                        "Focus Plus": "Focus Plus", "CM Elevate": "CM Elevate"}
+# Plain-English rendering of each scheme's measure_semantics. The stored strings
+# are written for the SQL prompt ("annual FLOW (lakh rupees)", "an EVENT, not a
+# clean annual flow") and read as database jargon in a chat bubble; the caveat
+# they carry is preserved in the closing paragraph either way.
+_MEASURE_PLAIN = {
+    "MGNREGA": "expenditure actually incurred",
+    "PMAY-G": "money released against sanctions",
+    "Focus Plus": "cash disbursed to farmers (DBT)",
+}
+
+
+async def _cross_scheme_money_answer(question: str) -> dict:
+    """Rank the schemes by money, deterministically. Built from the rows rather
+    than composed by the LLM, for the same reason as the Focus Plus overall
+    summary above: several figures of DIFFERENT kinds in one answer is exactly
+    where a composer misattributes numbers, and the measure_semantics caveat
+    must survive verbatim — docs/DATA_MODEL.md requires carrying it into any
+    cross-scheme money comparison, because MGNREGA's figure is expenditure
+    incurred while PMAY-G's is money released against sanctions."""
+    rows = await run_readonly(_CROSS_SCHEME_MONEY_SQL)
+    ranked = [r for r in rows if r.get("amount_crore") is not None]
+    if not ranked:
+        return {"route": "data", "intent": "DATA", "confidence": "low",
+                "answer": "I couldn't read the scheme spending figures just now.",
+                **_empty_data_fields()}
+    top = ranked[0]
+    top_name = _SCHEME_DISPLAY_NAME.get(str(top["scheme"]), str(top["scheme"]))
+    lines = [
+        f"{top_name} has the highest amount at ₹{float(top['amount_crore']):,.2f} crore. "
+        "Across every scheme that records money:"
+    ]
+    for r in ranked:
+        name = _SCHEME_DISPLAY_NAME.get(str(r["scheme"]), str(r["scheme"]))
+        lines.append(f"- **{name}** — ₹{float(r['amount_crore']):,.2f} crore "
+                     f"({_MEASURE_PLAIN.get(name, r['measure_semantics'])})")
+    lines.append(
+        "\nThese are not the same kind of figure, so treat the ranking as indicative "
+        "rather than like-for-like: MGNREGA's is expenditure actually incurred, PMAY-G's "
+        "is money released against sanctions, and Focus Plus's is cash disbursed to "
+        "farmers. CM Elevate records no payment of any kind — only applications — so it "
+        "cannot appear in a money comparison at all."
+    )
+    return {
+        "route": "data", "intent": "DATA", "confidence": "high",
+        "schemes": [_SCHEME_DISPLAY_NAME.get(str(r["scheme"]), str(r["scheme"])) for r in ranked],
+        "resolved_entities": {},
+        "sql": _CROSS_SCHEME_MONEY_SQL, "sql_query": _CROSS_SCHEME_MONEY_SQL,
+        "row_count": len(ranked), "rows": ranked, "data": ranked,
+        "answer": "\n".join(lines),
+    }
+
+
 def _focusplus_wants_overall_summary(question: str, schemes: list[str]) -> bool:
     return schemes == ["Focus Plus"] and bool(_FOCUSPLUS_OVERALL_SUMMARY_CUE.search(question or ""))
 
@@ -2134,10 +2325,67 @@ _GENERIC_PLACE_TERMS = {
 }
 
 
+# Real Meghalaya village names carry a parenthesised suffix that is part of the
+# name: "NONGCHRAM (I)", "NONGCHRAM (II)", "Existing site(Old House)". Stripping
+# trailing punctuation blindly removed the CLOSING paren while leaving the
+# opening one, so "NONGCHRAM (I)" became "NONGCHRAM (I" — which matches no
+# stored name exactly, stays permanently ambiguous, and makes the
+# village-disambiguation chip regenerate the identical question forever
+# (reported 2026-09-17: the pause repeated on every click). Strip only what is
+# genuinely punctuation around the name, and keep a closing bracket whenever it
+# balances an opening one still inside the value.
+_MENTION_EDGE_CHARS = "\"'`.,?!;: \t"
+
+
+def _drop_place_phrase(question: str, name: str) -> str:
+    """Remove "in <name>" from `question`, taking any part-marker suffix with
+    it. Stripping the bare name left an orphan fragment behind — dropping
+    "NONGSPUNG" from "... in NONGSPUNG - A, UMLING block, RI BHOI" produced
+    "... to be released - A, UMLING block, RI BHOI", which then read as a
+    brand-new question and sent the next few turns badly wrong (reported
+    2026-09-17). Also tidies a doubled comma left by the removal."""
+    out = re.sub(
+        rf"\s*\b(?:in|for|of|at|from|within)\s+{re.escape(name)}"
+        r"(?:\s*\([^)]{0,20}\)|\s*-\s*[A-Za-z0-9]{1,12})?",
+        "", question or "", count=1, flags=re.IGNORECASE)
+    out = re.sub(r"\s*,\s*,", ",", out)
+    return re.sub(r"\s{2,}", " ", out).strip().lstrip(",").strip()
+
+
+def _place_title(value: str) -> str:
+    """Title-case a place name without mangling a roman-numeral or acronym
+    suffix: str.title() turns "NONGCHRAM (II)" into "Nongchram (Ii)". Any
+    parenthesised run of roman numerals / digits is preserved as-is."""
+    out = str(value or "").title()
+    return re.sub(r"\(([IVXLCDM\d]+)\)", lambda m: "(" + m.group(1).upper() + ")",
+                  out, flags=re.IGNORECASE)
+
+
+def _strip_mention_punctuation(value: str) -> str:
+    v = (value or "").strip()
+    # Leading: brackets are never part of a name at the start.
+    v = v.lstrip(_MENTION_EDGE_CHARS + "([{")
+    # Trailing: drop plain punctuation always, but a bracket only when it is
+    # unbalanced (i.e. nothing opened it earlier in the value).
+    while v:
+        last = v[-1]
+        if last in _MENTION_EDGE_CHARS:
+            v = v[:-1]
+            continue
+        if last in ")]}":
+            opener = {")": "(", "]": "[", "}": "{"}[last]
+            if v.count(opener) >= v.count(last):
+                break            # balanced — "(I)" belongs to the name
+            v = v[:-1]
+            continue
+        break
+    return v.strip()
+
+
 def _clean_mention(value: str) -> str | None:
     """Normalise a raw mention; return None if it's a bare dimension word / the
     state name (i.e. not an actual place or period)."""
-    v = value.strip().strip("\"'`.,?!()[]").strip()
+    v = _strip_mention_punctuation(value)
     core = re.sub(r"^(the|a|an|this|that|each|every|all)\s+", "", v, flags=re.IGNORECASE).strip()
     if not core or core.lower() in _GENERIC_PLACE_TERMS:
         return None
@@ -2360,6 +2608,384 @@ def _village_chip_question(question: str, raw_text: str, candidate: dict) -> str
     return f"{pinned}, {candidate['block']} block, {candidate['district']}"
 
 
+# ── "Is that a village, a block, or a constituency?" ────────────────────────
+# Block / assembly-constituency / village names overlap massively in Meghalaya
+# (see entity_resolver.collides_across_dimensions and the
+# cross_dimension_collisions block in mgnrega_entity_resolver.yaml). A bare
+# "Sohra" is a real assembly constituency (AC 28, East Khasi Hills); it is NOT
+# a block and NOT a village, but "Sohrarim" IS a village, so the old flow —
+# extractor tags the bare name "block" -> no such block -> fall back to
+# resolve_village -> fuzzy-match Sohrarim -> answer — reported a specific
+# village's 643 beneficiaries as though the user had asked about Sohra
+# (reported 2026-09-15). Every level the name could mean is now offered as a
+# one-tap chip, and nothing is filtered until the user picks one.
+#
+# The chip question appends an explicit level word, which the resolvers and the
+# mention-extractor both already key on: the extractor's own prompt uses
+# "constituency"/"AC"/"assembly" to tag assembly_constituency, and the
+# block/village branches below check for a literal "block"/"village" word to
+# skip their own disambiguation. So a resumed chip resolves straight through
+# without re-triggering this pause.
+_DIM_CHIP_WORD = {
+    "district": "district",
+    "block": "block",
+    "assembly_constituency": "assembly constituency",
+    "village": "village",
+}
+_DIM_CHIP_LABEL = {
+    "district": "district",
+    "block": "C&RD block",
+    "assembly_constituency": "assembly constituency",
+    "village": "village",
+}
+
+
+def _dimension_collision_clarification(question: str, name: str,
+                                       dims: "dict[str, str]") -> "ClarificationNeeded":
+    """Ask which ADMIN LEVEL a bare, level-ambiguous place name refers to.
+
+    `dims` is {dimension: canonical display name} from
+    entity_resolver.collides_across_dimensions. Each chip substitutes that
+    canonical name for whatever the user typed, so a misspelling is corrected
+    at the same time as the level is chosen ("malwai" -> "Mawlai"); without
+    that substitution the resumed question carries the typo forward and fails
+    block/constituency resolution all over again, silently landing back on the
+    village. The village chip keeps the user's own text — village names are
+    DB-backed and resolved by their own branch."""
+    stem = question.strip().rstrip(" ?.")
+    options = []
+    for dim, canonical in dims.items():
+        shown = canonical or name
+        # Swap the typed name for the canonical one in the question itself.
+        if canonical and canonical.lower() != str(name).lower():
+            resumed = re.sub(re.escape(str(name)), canonical, stem, count=1,
+                             flags=re.IGNORECASE)
+        else:
+            resumed = stem
+        options.append({
+            "label": f"The {shown} {_DIM_CHIP_LABEL[dim]}",
+            "question": f"{resumed}, the {_DIM_CHIP_WORD[dim]}, not another area type",
+        })
+    labels = list(dims)
+    listed = ", ".join(_DIM_CHIP_LABEL[d] for d in labels[:-1]) + \
+        f" or {_DIM_CHIP_LABEL[labels[-1]]}"
+    return ClarificationNeeded(
+        f"“{name}” could refer to more than one kind of area in Meghalaya — the "
+        f"{listed}. These cover different places and give different numbers, so "
+        "please pick the one you mean.",
+        options=options,
+        rule="entity-ambiguous",
+    )
+
+
+# The level word a resumed collision chip (or the user, unprompted) put in the
+# question — "..., the assembly constituency, not another area type". When
+# present, the level is already settled and the collision gate must not fire
+# again; it also tells the branches below which dimension to force.
+_EXPLICIT_LEVEL_RE = {
+    "assembly_constituency": re.compile(
+        r"\b(assembly\s+constituenc\w*|constituenc\w*|\bAC\b|assembly|MLA)\b", re.IGNORECASE),
+    "block": re.compile(r"\bblock\b", re.IGNORECASE),
+    "village": re.compile(r"\bvillage\b", re.IGNORECASE),
+    "district": re.compile(r"\bdistrict\b", re.IGNORECASE),
+}
+
+
+# Assembly constituency is recorded on exactly ONE fact in the whole warehouse:
+# curated.fact_mgnrega_employment (surfaced as curated.v_employment, see
+# data/schema/schema_for_developers.md). It does not exist on MGNREGA
+# expenditure, nor on PMAY-G / Focus Plus / CM Elevate at all — the resolver
+# YAML says so outright ("expenditure: null — this dimension does not exist in
+# mgnrega_expenditure"). Offering "the X assembly constituency" as a chip for a
+# question about expenditure or houses would therefore invite the user to pick
+# a reading that can never be answered, so the chip is suppressed for those.
+#
+# The employment measures that DO carry it, per that same schema: person-days,
+# households/persons employed, job cards, 100-days completions, women
+# employment. Anything else on MGNREGA is expenditure-side.
+_AC_CAPABLE_METRIC = re.compile(
+    r"\bperson[\s-]?days?\b|\bjob\s?cards?\b|\bmuster\b|"
+    r"\b100[\s-]?days?\b|\bhundred\s+days?\b|"
+    r"\b(?:households?|persons?|people|women|men)\b[^?.!]{0,30}\b"
+    r"(?:employ\w*|work\w*|receiv\w*)\b|"
+    r"\bemploy\w*\b|\bbeneficiar\w*\b|\bworkers?\b",
+    re.IGNORECASE,
+)
+# Metric words that are unambiguously expenditure-side — no AC column exists
+# for these even within MGNREGA.
+_AC_INCAPABLE_METRIC = re.compile(
+    r"\bexpenditure\b|\bspend(?:ing)?\b|\bspent\b|\bwages?\b|\bwage\s+bill\b|"
+    r"\bmaterial\s+cost\b|\bamount\b|\bcost\b|\butili[sz]ation\b|"
+    r"\bhouses?\b|\bsanction\w*\b|\breleas\w*\b|\bdisburs\w*\b|"
+    r"\binstal{1,2}ments?\b|\bapplications?\b",
+    re.IGNORECASE,
+)
+
+
+def _ac_dimension_available(question: str, schemes: list[str]) -> bool:
+    """True when an assembly-constituency reading of a place name could
+    actually be queried for THIS question. False suppresses the AC chip."""
+    if (schemes or []) != ["MGNREGA"]:
+        return False
+    q = question or ""
+    # An explicit expenditure/housing metric rules it out even if an
+    # employment-ish word also appears ("wage employment expenditure").
+    if _AC_INCAPABLE_METRIC.search(q) and not _AC_CAPABLE_METRIC.search(q):
+        return False
+    if _AC_CAPABLE_METRIC.search(q):
+        return True
+    # No metric named at all ("figures for Sohra") — leave the reading open
+    # rather than silently dropping a valid choice.
+    return not _AC_INCAPABLE_METRIC.search(q)
+
+
+# ── Step 2 of the hierarchy: narrowing inside a chosen constituency ─────────
+# Once the user has said "I meant the constituency", they may still want only
+# part of it. An AC is an electoral boundary rather than an administrative
+# parent — 8 of the 56 straddle two districts — so the narrowing offered is
+# built from what that constituency ACTUALLY contains in the data
+# (entity_resolver.constituency_contents), never from a static hierarchy.
+#
+# The phrasing of each chip is what makes the next turn resolve cleanly: the
+# district/block chips keep the constituency name AND add the area, so the
+# question stays scoped to both; "the whole constituency" simply confirms.
+_AC_SCOPED_RE = re.compile(r",\s*within\s+the\s+", re.IGNORECASE)
+# The narrowing a resumed drill-down chip carries: ", within the <NAME>
+# <district|block> only". Read deterministically rather than left to the LLM
+# mention-extractor — the extractor has no reason to tag a second place name
+# in a question that already names a constituency, and when it doesn't, the
+# narrowing is silently lost and the answer covers the whole constituency
+# again (the very thing the user just declined).
+_AC_NARROW_RE = re.compile(
+    r",\s*within\s+the\s+(?P<name>.+?)\s+(?P<level>district|block)\s+only\b",
+    re.IGNORECASE,
+)
+
+
+def _ac_drilldown_clarification(question: str, ac_display: str,
+                                contents: dict) -> "ClarificationNeeded | None":
+    """Offer to narrow inside a just-chosen assembly constituency, or None when
+    there is nothing meaningful to narrow to."""
+    districts = contents.get("districts") or []
+    blocks = contents.get("blocks") or []
+    if not districts and not blocks:
+        return None
+    stem = question.strip().rstrip(" ?.")
+    options = [{"label": f"The whole {ac_display} constituency",
+                "question": f"{stem}, the whole constituency"}]
+    # A constituency spanning two districts is the one case where the district
+    # step is a real question rather than a formality.
+    if len(districts) > 1:
+        for d in districts:
+            options.append({
+                "label": f"Only the {str(d).title()} part",
+                "question": f"{stem}, within the {d} district only",
+            })
+    for b in blocks[:8]:
+        options.append({
+            "label": f"{str(b).title()} block",
+            "question": f"{stem}, within the {b} block only",
+        })
+    if len(options) < 2:
+        return None
+    where = (f"spans {len(districts)} districts and " if len(districts) > 1 else "covers ")
+    return ClarificationNeeded(
+        f"The {ac_display} assembly constituency {where}"
+        f"{len(blocks)} C&RD block(s), with {contents.get('villages', 0)} villages in the "
+        "employment data. Do you want the whole constituency, or just part of it?",
+        options=options,
+        rule="ac-narrow-scope",
+    )
+
+
+# ── Deterministic village backstop ──────────────────────────────────────────
+# scan_dimension() already backstops a district the LLM mention-extractor
+# dropped. Villages had no equivalent, and the extractor drops them too —
+# confirmed live 2026-09-15: "total beneficiaries in ASIMGRE for MGNREGA for
+# East Khasi Hills" came back {"district": "East Khasi Hills"} with ASIMGRE
+# missing entirely. With no village mention there is nothing to resolve, the
+# ambiguity check never runs, and the filter silently disappears: the query
+# counted the WHOLE district while the answer still said "for ASIMGRE".
+#
+# A village scan has to be much more careful than the district one. There are
+# ~6,000 villages and resolve_village()'s trigram stage matches loosely enough
+# that ordinary words — and fragments of district names like "East", "Garo",
+# "Hills" — all hit something. So this scan is doubly constrained:
+#   1. candidates come only from a place-preposition phrase ("in X", "for X",
+#      "of X"), the grammar that actually introduces a place; and
+#   2. a candidate must match a village name EXACTLY (village_names_exact),
+#      never fuzzily.
+# A name that is already a known district / block / constituency is skipped —
+# those dimensions own it, and the admin-level collision gate handles the
+# genuinely ambiguous ones.
+# The name may carry a parenthesised suffix that is PART of it — Meghalaya has
+# "NONGCHRAM (I)" and "NONGCHRAM (II)" as two distinct villages in the same
+# block. Without the optional "(...)" tail the scan proposes a bare "NONGCHRAM",
+# which matches no stored name exactly, so the backstop finds nothing and the
+# village filter is silently lost (reported 2026-09-17).
+# Candidate place phrases after a preposition. Deliberately tolerant on TWO
+# axes, because both were observed dropping a real village:
+#   CASE — users type lowercase ("in william nagar(mb) - ward no.4"). A
+#     capital-first pattern skipped those entirely, so the backstop never ran
+#     and the truncated extractor mention went unchallenged.
+#   SUFFIX CHAIN — a name can carry MORE THAN ONE part-marker:
+#     "William Nagar (MB) - Ward No.4" is a parenthesised marker AND a
+#     hyphenated one. Matching only the first stops at "William Nagar (MB)",
+#     which is ambiguous across 12 wards and loops the clarification forever
+#     (reported 2026-09-17).
+# Precision still comes from village_names_exact(): a candidate only counts
+# if it matches a stored village name EXACTLY, so a loose phrase costs one
+# lookup and nothing more.
+_PLACE_PREP_RE = re.compile(
+    r"\b(?:in|for|of|at|from|within|under)\s+"
+    r"(?P<name>[A-Za-z][A-Za-z.'-]*(?:\s+[A-Za-z][A-Za-z.'-]*){0,3}"
+    # A hyphenated marker is at most TWO short tokens ("- A", "- Ward No.4") —
+    # bounded so it cannot run on into the rest of the sentence ("- Ward No.4
+    # for CM Elevate"), which would never match a stored name.
+    r"(?:\s*\([A-Za-z0-9 .'-]{1,20}\)"
+    r"|\s*-\s*[A-Za-z0-9][A-Za-z0-9.']{0,11}(?:\s+[A-Za-z0-9][A-Za-z0-9.']{0,11})?"
+    r")"
+    r"{0,2})",
+)
+# Words that open a phrase without naming a place; a candidate that is only
+# these is never a village.
+_NOT_A_PLACE_WORD = {
+    "mgnrega", "mnrega", "nrega", "pmay", "pmayg", "awaas", "awas",
+    "focus", "focus plus", "focusplus", "cm", "cm elevate", "cmelevate",
+    "meghalaya", "fy", "financial", "financial year", "all", "each", "every",
+    "the", "a", "an", "this", "that", "total", "district", "block", "village",
+    "assembly", "constituency", "state", "india", "government", "scheme",
+}
+
+
+def _village_scan_candidates(question: str, scheme: str) -> list[str]:
+    """Names in `question` that could be a village the extractor missed."""
+    known: set[str] = set()
+    for dim in ("district", "block", "assembly_constituency"):
+        for n in canonical_names(scheme, dim):
+            known.add(n.strip().upper())
+    out: list[str] = []
+    # Lookahead so matches can OVERLAP: finditer consumes what it matches, so a
+    # phrase starting at an earlier preposition ("under goat farming scheme in")
+    # would swallow the "in" that introduces the real place and the village
+    # would never be scanned at all (reported 2026-09-17, lowercase "in william
+    # nagar(mb) - ward no.4"). Every preposition now gets its own attempt.
+    for m in re.finditer(rf"(?={_PLACE_PREP_RE.pattern})", question or "",
+                         re.IGNORECASE if _PLACE_PREP_RE.flags & re.IGNORECASE else 0):
+        raw = (m.group("name") or "").strip().rstrip(".,")
+        if not raw:
+            continue
+        # Try the longest phrase first, then progressively shorter prefixes, so
+        # "ASIMGRE for MGNREGA" still yields the bare "ASIMGRE".
+        words = raw.split()
+        for take in range(len(words), 0, -1):
+            cand = " ".join(words[:take]).strip()
+            low = cand.lower()
+            if len(cand) < 4 or low in _NOT_A_PLACE_WORD:
+                continue
+            if cand.upper() in known:
+                break        # a district/block/AC owns this name — not our job
+            if cand not in out:
+                out.append(cand)
+    return out
+
+
+async def _scan_village_in_question(question: str, scheme: str) -> "tuple[str, list[dict]] | None":
+    """(name, candidate villages) for a village named in the question that the
+    extractor dropped, or None. Exact matches only."""
+    cands = _village_scan_candidates(question, scheme)
+    if not cands:
+        return None
+    found = await village_names_exact(cands)
+    if not found:
+        return None
+    # Preserve the order the names appear in the question.
+    for c in cands:
+        hits = found.get(c.upper())
+        if hits:
+            return c, hits
+    return None
+
+
+def _canonical_in_question(question: str, scheme: str, dimension: str) -> "str | None":
+    """The catalogue name for `dimension` that appears verbatim in `question`,
+    or None. Used when resuming an admin-level collision chip: the chip put the
+    CANONICAL name into the question text, so reading it back from there is
+    more reliable than trusting the LLM extractor, which may still be echoing
+    the user's original typo. Longest match wins, so "North Tura" is not
+    shadowed by "Tura"."""
+    best: str | None = None
+    # collision_canonical_names, not canonical_names: for block / assembly
+    # constituency it falls back to another scheme's catalogue when the asking
+    # scheme has none, which is what lets the admin-level gate see an AC
+    # reading under CM Elevate (its catalogue has no AC dimension at all).
+    for canon in collision_canonical_names(scheme, dimension):
+        if re.search(rf"(?<![A-Za-z0-9]){re.escape(canon)}(?![A-Za-z0-9])",
+                     question or "", re.IGNORECASE):
+            if best is None or len(canon) > len(best):
+                best = canon
+    return best
+
+
+# A village-disambiguation chip appends its scope as ", <BLOCK> block,
+# <DISTRICT>" (see _village_chip_question). Those words name the CONTAINING
+# area, not the level the question is about — the question is about the
+# village. Left in place they make _explicit_level_in report "block", which
+# both suppresses the village backstop and lets the block slot win, so the chip
+# resolves to block grain and the village is lost (confirmed 2026-09-15 on the
+# ASIMGRE chips). Strip that trailing scope before detecting the level.
+# Matches only the village-chip scope tail: a block name (never the word "the")
+# followed by a district name, both in CAPS as _village_chip_question writes
+# them, at the very end. The admin-level CHOICE chip (", the block, not another
+# area type") does not match — it has "the" before "block" and trailing prose
+# after the second comma.
+_CHIP_SCOPE_SUFFIX_RE = re.compile(
+    r",\s*[A-Z][A-Za-z.'\- ]*\s+block\s*,\s*[A-Z][A-Za-z.'\- ]*\s*$")
+# The level phrase a disambiguation chip always carries. Its presence is what
+# marks a question as a chip resume, so the scope tail above is only stripped
+# then — never from an ordinary question that happens to end the same way.
+_CHIP_LEVEL_PHRASE_RE = re.compile(
+    r",\s*the\s+(?:village|block|district|assembly\s+constituency)\b", re.IGNORECASE)
+# "each village", "by block", "per district", "village-wise", "all villages" —
+# these name the GROUPING a breakdown is computed over, never the place the
+# question is scoped to. Removed before level detection so the surviving level
+# word (if any) is the one that actually names a place.
+_BREAKDOWN_LEVEL_PHRASE_RE = re.compile(
+    r"\b(?:by|per|each|every|all|across)\s+(?:the\s+)?"
+    r"(?:village|block|district|assembly\s+constituenc\w*|constituenc\w*)s?\b|"
+    r"\b(?:village|block|district)[\s-]?wise\b",
+    re.IGNORECASE,
+)
+
+
+def _explicit_level_in(question: str) -> "str | None":
+    """The admin level the question names outright, or None. Finest-first so a
+    question naming two levels ("village in X district") reports the one being
+    asked about rather than the containing area."""
+    q = question or ""
+    # Only strip the chip's scope tail when the question ALSO carries a chip's
+    # level phrase (", the village, not another area type"). A user-typed
+    # question can end in the same ", <NAME> block, <DISTRICT>" shape —
+    # "... , BATABARI block, WEST GARO HILLS" — and stripping that deleted the
+    # word "block" the user had explicitly written, so the level read as
+    # unstated and a same-named VILLAGE won instead (reported 2026-09-18: the
+    # BATABARI block question resolved to village 272854, 1 row, against 55 in
+    # the block).
+    if _CHIP_LEVEL_PHRASE_RE.search(q):
+        q = _CHIP_SCOPE_SUFFIX_RE.sub("", q)
+    # A BREAKDOWN phrase names the grouping, not the place being asked about:
+    # "in each village of Betasing block" asks for a per-village split OF THE
+    # BLOCK. Reading "village" as the stated level there made the block branch
+    # prefer a village reading and resolve a same-named village instead, so the
+    # query filtered one village while grouping by village — 0 rows against a
+    # real 6 (reported 2026-09-18). Drop the grouping words before detecting.
+    q = _BREAKDOWN_LEVEL_PHRASE_RE.sub(" ", q)
+    for dim in ("village", "assembly_constituency", "block", "district"):
+        if _EXPLICIT_LEVEL_RE[dim].search(q):
+            return dim
+    return None
+
+
 async def resolve_entities(question: str, schemes: list[str],
                             prior_resolved: "dict | None" = None,
                             village_hint: "str | None" = None) -> dict:
@@ -2406,6 +3032,175 @@ async def resolve_entities(question: str, schemes: list[str],
     # dimension. Handed to the response composer so it says "West Garo Hills",
     # not the "wgh" the user typed or the "WEST GARO HILLS" DB literal.
     display: dict[str, str] = {}
+
+    # The admin level the question states outright — either because the user
+    # said it ("the Sohra constituency") or because this is a resumed
+    # admin-level collision chip ("..., the assembly constituency, not another
+    # area type"). Computed HERE, before any per-dimension branch runs: the
+    # district branch below can resolve a name as a village on its own
+    # fall-through, so a guard placed later would come too late to stop it.
+    _stated_level = _explicit_level_in(question)
+
+    # A resumed collision chip states the level outright, but the LLM
+    # mention-extractor still has to notice and re-tag the name into the
+    # matching slot — the same extractor whose mis-tagging is what raised the
+    # pause to begin with. When the level is stated and the extractor put the
+    # name in a DIFFERENT slot, move it deterministically: the user has said
+    # which level they mean, so it is no longer the model's call. Runs before
+    # every resolution branch, so the name resolves at the chosen level and
+    # nowhere else.
+    # When the question states a level outright, that level is settled — put
+    # the place name there and clear every other place slot, so nothing
+    # downstream can re-resolve it somewhere else.
+    #
+    # The name is re-derived from the question TEXT rather than taken from the
+    # extractor. A resumed chip rewrites the question to carry the CANONICAL
+    # name ("...in MAWLAI..."), but the extractor frequently echoes the user's
+    # ORIGINAL typo back — often into the very slot the chip names
+    # ("block": "malwai" for the Mawlai-block chip). That value is present but
+    # unresolvable, so trusting it makes the branch fail and fall through to
+    # the village: the typo's own version of the bug this gate exists to stop.
+    if _stated_level in ("district", "block", "assembly_constituency", "village"):
+        _placed = None
+        if _stated_level == "village":
+            # Village is DB-backed — its own branch resolves it. Keep whatever
+            # name is already in hand (extractor value, else the hint).
+            _placed = mentions.get("village") or mentions.get("block")                 or mentions.get("district") or village_hint
+        else:
+            _placed = _canonical_in_question(question, schemes[0], _stated_level)
+            if not _placed:
+                # No catalogue name in the text — fall back to whatever the
+                # extractor found, but only if it resolves at this level.
+                for _slot in ("district", "block", "village", "assembly_constituency"):
+                    _v = mentions.get(_slot)
+                    if _v and resolve_dimension(
+                            str(_v), schemes[0], _stated_level).status == "resolved":
+                        _placed = str(_v)
+                        break
+        if _placed:
+            for _slot in ("district", "block", "village", "assembly_constituency"):
+                mentions.pop(_slot, None)
+            mentions[_stated_level] = _placed
+            logger.info("explicit level %r — placed %r, cleared other place slots",
+                        _stated_level, _placed)
+
+    # ── Admin-level collision gate ──────────────────────────────────────────
+    # Before resolving ANY single-name mention, check whether the bare name can
+    # name more than one KIND of area (block vs assembly constituency vs
+    # village vs district). This runs ahead of every per-dimension branch below
+    # on purpose: those branches each resolve one slot in isolation and cannot
+    # see that the same text also names a different level, which is how a bare
+    # "Sohra" (assembly constituency) ended up fuzzy-matched to the village
+    # Sohrarim and answered silently.
+    #
+    # Skipped when the question already names the level outright ("the Sohra
+    # constituency", or a resumed chip's "..., the assembly constituency, not
+    # another area type") — the level is settled, nothing to ask. Also skipped
+    # for a plural comparison ("districts"/"blocks" arrays), which name their
+    # own level by construction, and when a village_hint is carrying a
+    # just-resumed village-ambiguity choice.
+    if _stated_level is None and not village_hint \
+            and not mentions.get("districts") and not mentions.get("blocks"):
+        _scheme0 = schemes[0] if schemes else ""
+        # The gate can only examine names the extractor handed over, and the
+        # extractor drops a plainly-named place often enough to matter: it
+        # returned {} on 5 of 5 calls for "applicants in mylliem under Green
+        # Taxi CM Elevate and ware house Scheme" (2026-09-18), the lowercase
+        # name buried between two scheme names. With no mention there was
+        # nothing to test for ambiguity, the gate stayed silent, and the
+        # generator filtered lgd_village_name = 'MYLLIEM' — a confident false
+        # zero, where MYLLIEM is really a block (and an assembly constituency)
+        # holding 2 applicants for those two schemes.
+        #
+        # So when no place mention survived, scan the raw question for a
+        # catalogue name at either ambiguous level. This only ever ADDS a
+        # candidate to test; whether it actually pauses is still decided by
+        # collides_across_dimensions below, which needs 2+ readings.
+        if not any(mentions.get(s) for s in
+                   ("district", "block", "village", "assembly_constituency")):
+            _found = None
+            for _dim in ("block", "assembly_constituency"):
+                _found = _canonical_in_question(question, _scheme0, _dim)
+                if _found:
+                    mentions = {**mentions, _dim: _found}
+                    logger.info("admin-level gate: %r scanned from question text "
+                                "(extractor returned no place)", _found)
+                    break
+            # _canonical_in_question matches names VERBATIM, so a MISSPELLED
+            # place the extractor also dropped stayed invisible: "applicants in
+            # tikrikulla ..." (a typo of the TIKRIKILLA block) resolved no
+            # place at all, the generator passed the user's own spelling into
+            # `lgd_block = 'TIKRIKULLA'`, and the query returned a confident
+            # zero where the block really holds 243 applicants for those three
+            # schemes (2026-09-18). resolve_dimension and
+            # collides_across_dimensions both handle that typo; only the scan
+            # feeding them was exact-only.
+            #
+            # So fall back to the place-phrase candidates ("in <name>") and let
+            # the resolver's own fuzzy stage judge them. Whether this actually
+            # pauses is still decided by collides_across_dimensions below,
+            # which needs 2+ readings — this only supplies a name to test.
+            if not _found:
+                for _cand in _village_scan_candidates(question, _scheme0):
+                    for _dim in ("block", "assembly_constituency"):
+                        _r = resolve_dimension(_cand, _scheme0, _dim)
+                        if _r.status == "resolved":
+                            mentions = {**mentions, _dim: _cand}
+                            logger.info("admin-level gate: %r fuzzy-matched %s %r "
+                                        "(extractor returned no place)",
+                                        _cand, _dim, _r.canonical)
+                            _found = _cand
+                            break
+                    if _found:
+                        break
+        for _slot in ("district", "block", "village", "assembly_constituency"):
+            _name = mentions.get(_slot)
+            if not _name:
+                continue
+            # Every admin level this name resolves to. The in-memory catalogues
+            # (district / block / assembly_constituency) are checked exact +
+            # alias only — never fuzzy, or the gate would fire on almost every
+            # name. The village catalogue is DB-backed (curated.dim_geography)
+            # so it cannot be in that check; probe it here and pass the result
+            # in. That village half is what catches "Sohra": an exact
+            # assembly-constituency hit whose only competing reading is a
+            # village. Without it the AC hit stands alone, the gate stays
+            # quiet, and the old fall-through silently answers about the wrong
+            # place.
+            # The extractor routinely returns a TRUNCATED mention for a village
+            # whose name carries part-markers: "william nagar(mb) - ward no.4"
+            # comes back as "william nagar(mb)", which is ambiguous across 12
+            # wards and makes this gate ask a question the text already answers
+            # (reported 2026-09-17 — the pause repeated forever, the question
+            # growing each round). When the raw text contains a LONGER name
+            # that resolves to exactly one village, that is the real mention:
+            # nothing is ambiguous, so the gate must stand down.
+            _scanned = await _scan_village_in_question(question, _scheme0)
+            if _scanned and len(_scanned[1]) == 1 \
+                    and str(_name).strip().lower() in _scanned[0].strip().lower() \
+                    and len(_scanned[0]) > len(str(_name)):
+                logger.info("admin-level gate: %r is a truncation of %r, which resolves "
+                            "to one village — not ambiguous", _name, _scanned[0])
+                break
+            _vr_probe = await resolve_village(str(_name))
+            _dims = collides_across_dimensions(
+                str(_name), _scheme0,
+                village_hit=_vr_probe.status in ("resolved", "ambiguous"))
+            # Drop the assembly-constituency reading when this question's
+            # metric has no AC column to read (see _ac_dimension_available) —
+            # offering it would invite a choice that can never be answered.
+            # If that leaves fewer than two readings, there is nothing left to
+            # ask about and the remaining branches resolve it normally.
+            if "assembly_constituency" in _dims and not _ac_dimension_available(question, schemes):
+                _dims = {k: v for k, v in _dims.items() if k != "assembly_constituency"}
+                logger.info("admin-level collision on %r: AC reading suppressed "
+                            "(no constituency data for this metric)", _name)
+                if len(_dims) < 2:
+                    _dims = {}
+            if _dims:
+                logger.info("admin-level collision on %r: %s — asking", _name, list(_dims))
+                raise _dimension_collision_clarification(question, str(_name), _dims)
+            break
 
     district_canon = None
     if mentions.get("districts"):
@@ -2477,7 +3272,7 @@ async def resolve_entities(question: str, schemes: list[str],
                         options=options, rule="entity-ambiguous", village_hint=_mdist)
                 if _vr.status == "resolved":
                     resolved["village_code"] = _vr.canonical
-                    display["village"] = _vr.display or str(_mdist).title()
+                    display["village"] = _vr.display or _place_title(_mdist)
                 elif settings.OUT_OF_SCOPE_GUARD_ENABLED:
                     # Genuinely not a district, block, or village of ours — almost
                     # always a place in another state ("districts in Guwahati").
@@ -2553,10 +3348,63 @@ async def resolve_entities(question: str, schemes: list[str],
         if _block_canons:
             resolved["block_list"] = _block_canons
             display["block"] = " and ".join(_block_displays)
+            # A district named in the same breath as several blocks normally
+            # qualifies just ONE of them — it is there to separate a
+            # same-named block from its twin elsewhere ("BATABARI block, WEST
+            # GARO HILLS": Batabari exists in both South and West Garo Hills).
+            # ANDing that district against the WHOLE block list then silently
+            # deletes every block that legitimately sits somewhere else:
+            # "applicants in Shallang ... BATABARI block, WEST GARO HILLS"
+            # returned nothing for Shallang, because Shallang is a WEST KHASI
+            # HILLS block and `lgd_district = 'WEST GARO HILLS' AND lgd_block
+            # IN ('SHALLANG','BATABARI')` can never match it (reported
+            # 2026-09-18). Each block already knows its own district, so drop
+            # the standalone district filter whenever the named blocks do not
+            # all belong to it — the block names are the more specific filter
+            # and they carry their own geography.
+            _parents = {b: block_parent_district(b, schemes[0] if schemes else "")
+                        for b in _block_canons}
+            if district_canon:
+                _outside = [b for b, d in _parents.items()
+                            if d and d.upper() != str(district_canon).upper()]
+                if _outside:
+                    logger.info(
+                        "district %r dropped: blocks %s sit outside it (block list spans "
+                        "districts)", district_canon, _outside)
+                    resolved.pop("district", None)
+                    display.pop("district", None)
+                    district_canon = None
+            # Tell the generator which district each block belongs to, so a
+            # name that exists in two districts is still pinned to the right
+            # one rather than double-counted across both.
+            _known = {b: d for b, d in _parents.items() if d}
+            if _known:
+                resolved["block_list_districts"] = _known
         if _village_canons:
             resolved["village_code_list"] = _village_canons
             display["village"] = " and ".join(_village_displays)
-    elif mentions.get("block"):
+    elif mentions.get("block") or (
+            _explicit_level_in(question) == "block"
+            and not mentions.get("village") and not mentions.get("blocks")
+            and (_block_scan := scan_dimension(question, schemes[0], "block",
+                                               level_is_explicit=True)) is not None
+            and _block_scan.status == "resolved"):
+        # The extractor drops a plainly-named block just as it drops districts
+        # — "in shallang block under Piggery Scheme, PRIME ... (SEED) and
+        # Meghalaya Poultry Farming Scheme" returned {} on 5 of 5 calls
+        # (2026-09-18), the lowercase name buried between two long scheme
+        # names. With no resolved block the generator invented
+        # `lgd_block = 'SHALLANG'` off the raw text; the verifier demanded a
+        # `lgd_district = 'MEGHALAYA'` filter instead, the state-pseudo-row
+        # guard rejected that, the repair put it back, and the loop burned its
+        # budget and fell through to the KB fallback. The answer is a plain 45.
+        #
+        # Only runs when the question names the level outright, so a bare
+        # "Shallang" still reaches the village/AC clarification flow.
+        if not mentions.get("block"):
+            mentions = {**mentions, "block": _block_scan.canonical}
+            logger.info("resolve_entities: block backstop matched %r in question text",
+                        _block_scan.canonical)
         r = resolve_dimension(mentions["block"], schemes[0], "block")
         if r.status == "ambiguous":
             raise ClarificationNeeded(f"Which block is being referred to by “{mentions['block']}”?",
@@ -2568,7 +3416,22 @@ async def resolve_entities(question: str, schemes: list[str],
             # ambiguous. Silently answering at the block level here is exactly
             # the bug QA reported (bot picks village data for a block question,
             # or vice versa, without ever asking).
-            if not re.search(r"\bblock\b", question, re.IGNORECASE):
+            # Same truncation guard as the admin-level gate above: when the raw
+            # text carries a LONGER name than this mention and that longer name
+            # resolves to exactly one village, the mention is a fragment of it
+            # ("william nagar(mb)" from "william nagar(mb) - ward no.4"), not a
+            # genuine block-vs-village ambiguity. Resolve the village instead of
+            # asking a question the text already answers.
+            _longer = await _scan_village_in_question(question, schemes[0] if schemes else "")
+            if _longer and len(_longer[1]) == 1 \
+                    and str(mentions["block"]).strip().lower() in _longer[0].strip().lower() \
+                    and len(_longer[0]) > len(str(mentions["block"])):
+                _pick = _longer[1][0]
+                resolved["village_code"] = _pick["village_code"]
+                display["village"] = _place_title(_pick["name"])
+                logger.info("block mention %r is a truncation of village %r — resolved it",
+                            mentions["block"], _longer[0])
+            elif not re.search(r"\bblock\b", question, re.IGNORECASE):
                 _vcheck = await resolve_village(mentions["block"])
                 if _vcheck.status in ("resolved", "ambiguous"):
                     stem = question.strip().rstrip(" ?.")
@@ -2580,8 +3443,27 @@ async def resolve_entities(question: str, schemes: list[str],
                             {"label": f"The {mentions['block']} village", "question": f"{stem}, the village, not the block"},
                         ],
                         rule="entity-ambiguous")
-            resolved["block"] = r.canonical
-            display["block"] = r.display or str(r.canonical).title()
+            # Not when the mention turned out to be a truncated VILLAGE name
+            # (handled just above): village_code already pins the exact place,
+            # and adding the block it was a fragment of would filter a
+            # different, larger area alongside it.
+            if "village_code" not in resolved:
+                resolved["block"] = r.canonical
+                display["block"] = r.display or str(r.canonical).title()
+                # Same conflict as the block_list branch above, for one block:
+                # a district named alongside a block that provably sits in a
+                # DIFFERENT district makes `lgd_district = X AND lgd_block = Y`
+                # match zero rows. The block is the more specific filter and
+                # knows its own district, so keep the block and drop the
+                # contradicting district rather than answering "no records".
+                _bp = r.parent_district or block_parent_district(
+                    r.canonical, schemes[0] if schemes else "")
+                if _bp and district_canon and _bp.upper() != str(district_canon).upper():
+                    logger.info("district %r dropped: block %r sits in %r",
+                                district_canon, r.canonical, _bp)
+                    resolved.pop("district", None)
+                    display.pop("district", None)
+                    district_canon = None
         else:
             # The mention-extractor sometimes tags a full DISTRICT name as the
             # "block" when the question itself says "by block" right next to it
@@ -2621,8 +3503,21 @@ async def resolve_entities(question: str, schemes: list[str],
                 # same statewide candidate set the chip was meant to narrow,
                 # and raises the identical clarification forever (reported
                 # 2026-09-09, "nongthymmai" in EAST KHASI HILLS).
-                _vr = await resolve_village(mentions["block"], district=district_canon)
-                if _vr.status == "ambiguous":
+                #
+                # NOT when the user explicitly said "the block" (an admin-level
+                # choice chip, or their own wording): the whole point of that
+                # answer is that they do not want the village reading, so
+                # quietly resolving one anyway answers at a grain they just
+                # declined. Say the block doesn't exist instead.
+                if _stated_level == "block":
+                    notes.append(
+                        f"'{mentions['block']}' is not a C&RD block in this data — say so "
+                        "plainly. Do NOT answer using a village or district of the same "
+                        "name; the question asked specifically for the block.")
+                    _vr = None
+                else:
+                    _vr = await resolve_village(mentions["block"], district=district_canon)
+                if _vr is not None and _vr.status == "ambiguous":
                     # District scoping alone doesn't always get to one candidate
                     # (e.g. several distinctly-blocked villages share a name inside
                     # the same district). The chip that got us here already names
@@ -2643,7 +3538,7 @@ async def resolve_entities(question: str, schemes: list[str],
                     if len(_text_hits) == 1:
                         _pick = _text_hits[0]
                         resolved["village_code"] = _pick["village_code"]
-                        display["village"] = str(_pick["name"]).title()
+                        display["village"] = _place_title(_pick["name"])
                         _vr = None
                     else:
                         listed = ", ".join(
@@ -2661,7 +3556,7 @@ async def resolve_entities(question: str, schemes: list[str],
                     pass  # already resolved directly from the single text hit above
                 elif _vr.status == "resolved":
                     resolved["village_code"] = _vr.canonical
-                    display["village"] = _vr.display or str(mentions["block"]).title()
+                    display["village"] = _vr.display or _place_title(mentions["block"])
                 elif settings.OUT_OF_SCOPE_GUARD_ENABLED:
                     raise OutOfScope(f"block '{mentions['block']}' is not in Meghalaya")
                 else:
@@ -2676,6 +3571,51 @@ async def resolve_entities(question: str, schemes: list[str],
         if r.status == "resolved":
             resolved["assembly_constituency"] = r.canonical
             display["assembly_constituency"] = r.display or str(r.canonical).title()
+            # Step 2 of the hierarchy: having settled that this IS the
+            # constituency, offer to narrow inside it. Only when the question
+            # hasn't already narrowed itself — a resumed drill-down chip says
+            # "within the X block only" / "the whole constituency", and a
+            # question that independently names a district/block/village has
+            # answered this too. Best-effort: if the contents can't be read,
+            # the flow continues with the whole constituency, as before.
+            _already_narrowed = (
+                _AC_SCOPED_RE.search(question)
+                or re.search(r"\bwhole\s+constituency\b", question, re.IGNORECASE)
+                or any(resolved.get(k) for k in
+                       ("district", "district_list", "block", "block_list",
+                        "village_code", "village_code_list"))
+            )
+            _narrow = _AC_NARROW_RE.search(question)
+            if _narrow:
+                # A resumed drill-down chip — apply its district/block filter
+                # alongside the constituency, so the answer covers exactly the
+                # overlap the user asked for.
+                _lvl = _narrow.group("level").lower()
+                _nm = _narrow.group("name").strip()
+                _nr = resolve_dimension(_nm, schemes[0], _lvl)
+                if _nr.status == "resolved":
+                    _canon, _disp = _nr.canonical, _nr.display or str(_nr.canonical).title()
+                else:
+                    # These chips are built from values read live out of
+                    # curated.v_employment (constituency_contents), and the
+                    # YAML block catalogue does not necessarily list every one
+                    # of them. The value came from the database itself, so it
+                    # is a valid literal even when the catalogue has no entry
+                    # — use it rather than dropping the narrowing the user
+                    # explicitly picked. Storage is upper-case for both
+                    # lgd_district and lgd_block (docs/DATA_MODEL.md).
+                    _canon, _disp = _nm.upper(), _nm.title()
+                resolved[_lvl] = _canon
+                display[_lvl] = _disp
+                if _lvl == "district":
+                    district_canon = _canon
+                logger.info("AC drill-down: also filtering %s = %r", _lvl, _canon)
+            elif not _already_narrowed:
+                _contents = await constituency_contents(str(r.canonical))
+                _drill = _ac_drilldown_clarification(
+                    question, display["assembly_constituency"], _contents)
+                if _drill is not None:
+                    raise _drill
         else:
             # assembly_constituency data exists ONLY in mgnrega_employment (no
             # catalogue loaded for other schemes, or the name genuinely isn't
@@ -2724,7 +3664,109 @@ async def resolve_entities(question: str, schemes: list[str],
     # Prefer the current question's own village mention; fall back to the
     # remembered hint from a just-resumed village-ambiguity pause only when
     # this turn's extraction found no village at all (see the docstring above).
+    #
+    # A question that states a NON-village level outright ("..., the assembly
+    # constituency, not another area type" — a resumed admin-level collision
+    # chip) must not resolve a village at all: the pending village hint is
+    # stale in that case (it was remembered when the level was still open), and
+    # the block/district branches above have already placed the name at the
+    # level the user chose. Letting it through set village_code alongside the
+    # chosen level, which then filters the query down to one village even
+    # though the user explicitly asked for the constituency.
     _village_text = mentions.get("village") or village_hint
+    if _stated_level is not None and _stated_level != "village":
+        _village_text = None
+    # Deterministic backstop for a village the extractor dropped (see
+    # _scan_village_in_question). Only when NOTHING else already placed this
+    # turn's geography at village grain, and only when the question names no
+    # block/AC of its own for the same span — those dimensions own their names.
+    # Skipped when the question states a level of its own: either the user
+    # chose "village" (in which case the extractor's own mention already went
+    # down the normal village path above) or they chose a NON-village level,
+    # and filling a village in behind that choice would answer at a grain they
+    # explicitly declined.
+    if not _village_text and not resolved.get("village_code") \
+            and not resolved.get("village_code_list") and _stated_level is None:
+        _scanned = await _scan_village_in_question(question, schemes[0] if schemes else "")
+        if _scanned:
+            _vname, _vhits = _scanned
+            logger.info("village backstop: %r matched %d village(s) in the question text "
+                        "the extractor dropped", _vname, len(_vhits))
+            # Narrow by a district the question already pinned before deciding
+            # whether this is still ambiguous — "ASIMGRE ... for East Garo
+            # Hills" has exactly one ASIMGRE in that district.
+            # Narrow by a block the question already pinned first — it is the
+            # finer of the two scopes, and a resumed village chip names both
+            # ("..., SELSELLA block, WEST GARO HILLS"). Without this the
+            # district scope alone can still leave several same-named villages
+            # and the chip resolves only to block grain, losing the village.
+            _blk = resolved.get("block")
+            if _blk:
+                _by_block = [c for c in _vhits
+                             if str(c.get("block") or "").upper() == str(_blk).upper()]
+                if _by_block:
+                    _vhits = _by_block
+            if district_canon:
+                _scoped = [c for c in _vhits
+                           if str(c["district"]).upper() == str(district_canon).upper()]
+                if _scoped:
+                    _vhits = _scoped
+                elif _blk and len(_vhits) == 1:
+                    # The block filter already pinned exactly one village; the
+                    # district mismatch is just the stale one from the original
+                    # question, so let the block's own district stand.
+                    district_canon = _vhits[0]["district"]
+                    resolved["district"] = _vhits[0]["district"]
+                    display["district"] = str(_vhits[0]["district"]).title()
+                else:
+                    # The question named a district AND a village, but no
+                    # village of that name exists there ("ASIMGRE ... for East
+                    # Khasi Hills" — every ASIMGRE is in the Garo Hills). The
+                    # two filters contradict each other, so neither answering
+                    # district-wide (the old silent-drop bug, which reported a
+                    # whole district's figure as though it were the village's)
+                    # nor offering villages in OTHER districts is right. Say
+                    # so plainly instead.
+                    _dname = display.get("district") or str(district_canon).title()
+                    _elsewhere = ", ".join(sorted({str(c["district"]).title() for c in _vhits}))
+                    # Each village chip must drop the district the user named,
+                    # or the resumed question carries TWO conflicting districts
+                    # ("... for East Khasi Hills ..., SELSELLA block, WEST GARO
+                    # HILLS") and resolves to neither the village nor the right
+                    # district. Strip the original district phrase first, then
+                    # let _village_chip_question pin the village.
+                    _no_dist = re.sub(
+                        rf"\s*\b(?:in|for|of|at|from)\s+{re.escape(str(_dname))}\b",
+                        "", question, count=1, flags=re.IGNORECASE).strip()
+                    raise ClarificationNeeded(
+                        f"There is no village called “{_vname}” in {_dname}. "
+                        f"Villages with that name are in {_elsewhere}. Did you mean one of "
+                        f"those, or the whole of {_dname}?",
+                        options=[
+                            {"label": f"{c['name']} — {c['block']} block, {c['district']}",
+                             "question": _village_chip_question(_no_dist, _vname, c)}
+                            for c in _vhits[:5]
+                        ] + [{
+                            "label": f"All of {_dname}",
+                            "question": _drop_place_phrase(question, _vname),
+                        }],
+                        rule="entity-ambiguous")
+            if len(_vhits) == 1:
+                resolved["village_code"] = _vhits[0]["village_code"]
+                display["village"] = _place_title(_vhits[0]["name"])
+            else:
+                # Several real villages share this name — ask, never guess.
+                listed = ", ".join(
+                    f"{c['name']} in {c['block']} block ({c['district']})" for c in _vhits[:5])
+                raise ClarificationNeeded(
+                    f"“{_vname}” corresponds to more than one village: {listed}. "
+                    "Which of these is intended?",
+                    options=[
+                        {"label": f"{c['name']} — {c['block']} block, {c['district']}",
+                         "question": _village_chip_question(question, _vname, c)}
+                        for c in _vhits[:5]
+                    ],
+                    rule="entity-ambiguous", village_hint=_vname)
     if _village_text:
         r = await resolve_village(_village_text, district=district_canon,
                                    block=resolved.get("block"))
@@ -2766,7 +3808,7 @@ async def resolve_entities(question: str, schemes: list[str],
                         ],
                         rule="entity-ambiguous")
             resolved["village_code"] = r.canonical
-            display["village"] = r.display or str(_village_text).title()
+            display["village"] = r.display or _place_title(_village_text)
         else:
             notes.append(f"'{_village_text}' is not a known village — say so, do not filter on it.")
 
@@ -2934,6 +3976,118 @@ async def generate_sql(question: str, schemes: list[str], entity_result: dict) -
 # WHERE on a state pseudo-row that no fact row matches — the query then runs
 # clean but counts 0. Catch that shape and force one repair pass (the repair
 # prompt carries the "whole dataset is Meghalaya" rule, so it drops the filter).
+# An assembly constituency cuts ACROSS blocks and districts, so its name is
+# usually not a block/district name at all. When only the constituency was
+# resolved, the generator still reaches for `lgd_block = '<same name>'` next to
+# the AC filter — two conditions that can never both hold, giving a clean,
+# confident ZERO (confirmed live 2026-09-17: "which villages in Rangsakona
+# received employment in FY 2025-26" answered "no matching records"; RANGSAKONA
+# spans the BETASING, RERAPARA and RONGRAM blocks and the real answer is 146
+# villages). The prompt now warns against it (prompt_builder._entities_block),
+# but a prose rule doesn't reliably win under sampling — this catches the shape
+# deterministically, the same way the village_code guards above do.
+_AC_FILTER_RE = re.compile(r"\bassembly_constituency_name\b", re.IGNORECASE)
+# Matches the filter in every shape the generator writes it: a bare column, a
+# table-qualified one (dg.lgd_block), and either side wrapped in UPPER().
+_GEO_EQ_LITERAL_RE = re.compile(
+    r"(?:\w+\.)?\blgd_(?P<col>district|block)\b\s*\)?\s*(?:=|ILIKE)\s*"
+    r"(?:UPPER\s*\(\s*)?'(?P<val>[^']+)'",
+    re.IGNORECASE,
+)
+
+
+def _ac_with_invented_geo_filter(entity_result: dict, sql: str) -> "str | None":
+    """The geography literal a query added alongside an assembly-constituency
+    filter that entity resolution never produced, or None.
+
+    Only fires when the resolved entities carry an assembly_constituency and NO
+    district/block of their own — i.e. the filter cannot have come from
+    resolution, so the generator invented it from the question text."""
+    resolved = entity_result.get("resolved") or {}
+    if not resolved.get("assembly_constituency"):
+        return None
+    if resolved.get("district") or resolved.get("block") \
+            or resolved.get("district_list") or resolved.get("block_list"):
+        return None
+    if not _AC_FILTER_RE.search(sql or ""):
+        return None
+    m = _GEO_EQ_LITERAL_RE.search(sql or "")
+    return f"lgd_{m.group('col')} = '{m.group('val')}'" if m else None
+
+
+# MGNREGA's two facts have NO shared grain — both are at source-row level, many
+# rows per village-year on each side. Joining them directly (however sensible
+# the ON clause looks: year_key + lgd_block, or geography_key) is a cartesian
+# fan-out: every expenditure row pairs with every employment row for the same
+# area, and the SUMs come back multiplied. schema_context MGNREGA rule 1 has
+# always forbidden it, but the rule alone does not hold under sampling —
+# confirmed live 2026-09-17, "compare expenditure and person-days in RERAPARA":
+# the generator joined v_expenditure to v_employment and returned ₹367,647 lakh
+# / 109,448,220 person-days against a truth of ₹2,450.98 lakh / 986,020. That is
+# far more dangerous than the missing-column error it replaced, because it runs
+# clean and the numbers look plausible. The correct shape is one CTE per fact,
+# each aggregated independently, then combined.
+_MGNREGA_FACT_OBJECTS = (
+    "v_employment", "fact_mgnrega_employment",
+    "v_expenditure", "fact_mgnrega_expenditure",
+)
+_EMPLOYMENT_OBJ_RE = re.compile(r"\b(?:curated\.)?(?:v_employment|fact_mgnrega_employment)\b",
+                                re.IGNORECASE)
+_EXPENDITURE_OBJ_RE = re.compile(r"\b(?:curated\.)?(?:v_expenditure|fact_mgnrega_expenditure)\b",
+                                 re.IGNORECASE)
+_JOIN_RE = re.compile(r"\bJOIN\b", re.IGNORECASE)
+_CTE_RE = re.compile(r"^\s*WITH\b", re.IGNORECASE)
+
+
+def _mgnrega_facts_joined(sql: str) -> bool:
+    """True when the query JOINs the employment fact to the expenditure fact in
+    one statement — the fan-out shape rule 1 forbids.
+
+    The safe shapes name both objects too, but wrap each in its own aggregated
+    scope so anything joined afterwards is one row per side:
+      * a CTE per fact  (WITH emp AS (...), exp AS (...) SELECT ...), and
+      * an inline subquery per fact  (FROM (SELECT SUM(...) ...) exp CROSS JOIN
+        (SELECT SUM(...) ...) emp) — which is what the repair prompt actually
+        produces most often, and is equally correct.
+    Both are recognised by each fact object sitting inside a parenthesised
+    SELECT that aggregates. Only a bare top-level join of the two raw facts
+    multiplies, so only that is flagged."""
+    s = sql or ""
+    if not (_EMPLOYMENT_OBJ_RE.search(s) and _EXPENDITURE_OBJ_RE.search(s)
+            and _JOIN_RE.search(s)):
+        return False
+    if _CTE_RE.match(s.strip()):
+        return False
+    # Each fact reference that sits inside a parenthesised aggregating SELECT is
+    # already collapsed to one row; if BOTH are, nothing can fan out.
+    return not all(_fact_ref_is_aggregated(s, rx)
+                   for rx in (_EMPLOYMENT_OBJ_RE, _EXPENDITURE_OBJ_RE))
+
+
+_AGG_SELECT_RE = re.compile(r"\b(?:SUM|COUNT|AVG|MIN|MAX)\s*\(", re.IGNORECASE)
+
+
+def _fact_ref_is_aggregated(sql: str, obj_re: "re.Pattern") -> bool:
+    """True when every reference to this fact object lies inside a parenthesised
+    SELECT that aggregates — i.e. it contributes one row, not many."""
+    for m in obj_re.finditer(sql):
+        depth, start = 0, None
+        for i in range(m.start() - 1, -1, -1):   # walk back to the enclosing "("
+            c = sql[i]
+            if c == ")":
+                depth += 1
+            elif c == "(":
+                if depth == 0:
+                    start = i
+                    break
+                depth -= 1
+        if start is None:
+            return False                          # top-level reference
+        if not _AGG_SELECT_RE.search(sql[start:m.start()]):
+            return False                          # a plain subquery, not aggregated
+    return True
+
+
 _STATE_PSEUDO_FILTER = re.compile(
     r"entity_type\s*=\s*'\s*state\s*'"
     r"|lgd_(?:village_name|district|block)\s*(?:=|ilike)\s*'\s*%?\s*meghalaya\s*%?\s*'",
@@ -3020,11 +4174,68 @@ _COL_HOMES = {
 }
 
 
+# MGNREGA's two facts are separate objects with NO overlapping measures:
+# employment (person_days, persons_employed, households_employed,
+# households_completed_100_days, job_cards_issued_total) lives on
+# curated.v_employment; money (total_exp, unskilled_wage_exp,
+# semi_skilled_wage_exp, material_exp) lives on curated.v_expenditure. A
+# question that wants one of each ("compare expenditure and person-days in
+# RERAPARA") cannot be answered from a single view, and the generator reliably
+# tries anyway — selecting person_days off v_expenditure, which errors, and
+# then failing to recover because the generic missing-column hint only says
+# "select from an object that exposes every column" without explaining that no
+# such object exists at block grain (confirmed live 2026-09-17: the question
+# burned its whole repair budget and fell through to "couldn't build a working
+# query"). docs/schema_for_developers.md: v_district_year_summary is the only
+# sanctioned combined object, and it is district x year ONLY — so at block or
+# village grain the answer is two CTEs.
+_EMPLOYMENT_MEASURES = {
+    "person_days", "persons_employed", "households_employed",
+    "households_completed_100_days", "job_cards_issued_total",
+    "women_employment_provided",
+}
+_EXPENDITURE_MEASURES = {
+    "total_exp", "unskilled_wage_exp", "semi_skilled_wage_exp",
+    "material_exp", "tax_exp", "admin_total_exp",
+}
+
+
+def _mgnrega_split_fact_hint(col: str) -> "str | None":
+    """The recipe for combining MGNREGA employment and expenditure measures,
+    when the missing column is one that lives on the OTHER fact."""
+    if col in _EMPLOYMENT_MEASURES:
+        wanted, home, other = col, "curated.v_employment", "curated.v_expenditure"
+    elif col in _EXPENDITURE_MEASURES:
+        wanted, home, other = col, "curated.v_expenditure", "curated.v_employment"
+    else:
+        return None
+    return (
+        f'"{wanted}" lives on {home}, NOT on {other} — MGNREGA keeps employment and '
+        "expenditure in two separate facts that share no measures, so ONE view can "
+        "never supply both. To report a measure from each, aggregate them "
+        "independently and join the results:\n"
+        "  WITH emp AS (SELECT SUM(person_days) AS person_days FROM curated.v_employment "
+        "WHERE <same filters>),\n"
+        "       exp AS (SELECT SUM(total_exp) AS total_exp_lakh FROM curated.v_expenditure "
+        "WHERE <same filters>)\n"
+        "  SELECT exp.total_exp_lakh, emp.person_days FROM emp, exp\n"
+        "Put the SAME geography and year_key filters on BOTH CTEs. Add a GROUP BY plus a "
+        "FULL OUTER JOIN on the grain columns only if the question asks for a per-district "
+        "/ per-block / per-year breakdown. At DISTRICT x YEAR grain you may instead select "
+        "both measures directly from curated.v_district_year_summary, which already "
+        "combines the two facts; it has no block or village column, so it cannot be used "
+        "for a block- or village-level question."
+    )
+
+
 def _missing_column_hint(error: str) -> "str | None":
     m = _MISSING_COL_RE.search(error)
     if not m:
         return None
     col = m.group(1).split(".")[-1].lower()
+    split_fact = _mgnrega_split_fact_hint(col)
+    if split_fact:
+        return split_fact
     if col in ("scheme_key", "scheme_code"):
         # The generator added a scheme filter/join to a per-scheme object that
         # carries neither column. scheme_key / scheme_code live ONLY on
@@ -3135,6 +4346,18 @@ def _rowgrain_no_aggregate(question: str, sql: str) -> "str | None":
 
 _VILLAGE_CODE_FILTER_RE = re.compile(r"\bvillage_code\s*(?:=|IN)\s*", re.IGNORECASE)
 _VILLAGE_NAME_FILTER_RE = re.compile(r"\blgd_village_name\s*(?:=|ILIKE|IN)\s*", re.IGNORECASE)
+# The generator also substitutes the WRONG ADMIN LEVEL for a resolved village:
+# it writes lgd_block = 'NONGLADEW' or lgd_district = 'NONGLADEW' — a village
+# name placed in a block/district column. That matches zero rows and returns a
+# clean, confident 0 ("the data doesn't cover applicants in Nongladew") when the
+# village has 32 real records. Same root cause as the lgd_village_name case
+# above, and just as invisible: non-deterministic across runs, so the same
+# question answers district one time and block the next (reported 2026-09-17).
+_WRONG_LEVEL_FILTER_RE = re.compile(
+    r"(?:\w+\.)?\blgd_(?P<col>district|block)\b\s*\)?\s*(?:=|ILIKE|IN)\s*\(?\s*"
+    r"(?:UPPER\s*\(\s*)?'(?P<val>[^']+)'",
+    re.IGNORECASE,
+)
 _DIV_100_RE = re.compile(r"/\s*100\b")
 # CM Elevate's is_withdraw is a real, well-defined boolean column that is FALSE
 # on every one of the 8,543 rows today (schema_context.py rule 15) — a filtered
@@ -3234,6 +4457,43 @@ def _village_name_filter_instead_of_code(entity_result: dict, sql: str) -> "int 
     return code if _VILLAGE_NAME_FILTER_RE.search(sql) else None
 
 
+def _village_filtered_at_wrong_level(entity_result: dict, sql: str) -> "tuple[int, str] | None":
+    """(village_code, offending clause) when a resolved village is filtered as a
+    BLOCK or DISTRICT instead, else None.
+
+    Only fires when the literal is the village's OWN display name — a genuine
+    district scope alongside a village ("... in NONGLADEW, Ri Bhoi") is a real,
+    correct filter and must be left alone.
+
+    A correct `village_code` filter being present is NOT on its own a reason to
+    pass: the generator sometimes emits BOTH, ANDing a bogus
+    `lgd_block = '<village name>'` onto the right village_code. That still
+    matches zero rows, so the query returns a confident 0 for a village with
+    real records — confirmed live 2026-09-17 on "william nagar(mb) - ward
+    no.4", where village_code = 70675 was correct and the added
+    `lgd_block = 'WILLIAM NAGAR(MB)'` zeroed a true count of 1."""
+    resolved = entity_result.get("resolved") or {}
+    code = resolved.get("village_code")
+    if code is None:
+        return None
+    display = (entity_result.get("display") or {}).get("village")
+    if not display:
+        return None
+    # Compare with punctuation and spacing squashed out, and accept a PREFIX of
+    # the village name as well as the whole of it: the literal the generator
+    # writes is often the same truncation the extractor produced
+    # ("WILLIAM NAGAR(MB)" for the village "William Nagar (MB) - Ward No.4").
+    # It is still a village name sitting in a block/district column either way.
+    _squash = lambda t: re.sub(r"[^A-Z0-9]", "", str(t).upper())
+    want = _squash(display)
+    for m in _WRONG_LEVEL_FILTER_RE.finditer(sql or ""):
+        got = _squash(m.group("val"))
+        # Guard against a 1-2 character fragment matching by accident.
+        if got and len(got) >= 4 and want.startswith(got):
+            return code, f"lgd_{m.group('col').lower()} = '{m.group('val')}'"
+    return None
+
+
 def _village_code_as_geography_key(entity_result: dict, sql: str) -> "int | None":
     """The resolved village_code when the generated SQL filters `geography_key`
     directly to that same integer literal instead of `village_code` — a
@@ -3274,6 +4534,216 @@ def _village_code_as_geography_key(entity_result: dict, sql: str) -> "int | None
 _VERIFIER_FALSE_EMPTY_ENTITIES = re.compile(
     r"resolved entities\b[^.]{0,200}\bis empty\b", re.IGNORECASE)
 
+# Second known verifier false positive, same family as the one above. The
+# RESOLVED ENTITIES block renders an assembly-constituency filter in a
+# case-insensitive wrapper — UPPER(assembly_constituency_name) = UPPER('X') —
+# because the SME catalogue's spelling and the stored spelling can differ in
+# case. assembly_constituency_name is stored ALL CAPS
+# (mgnrega_entity_resolver.yaml: stored_case: ALL CAPS), so a generator that
+# writes the equivalent bare `assembly_constituency_name = 'X'` has produced a
+# query that selects exactly the same rows. The verifier nonetheless flags the
+# difference in FORM as a Check-2 entity mismatch (confirmed live 2026-09-15:
+# "…within the MAWLAI block only" — attempt 1 was flagged purely for dropping
+# the UPPER() wrapper). That rejection then feeds a repair prompt telling the
+# generator its entity filter is "missing", and the repair reliably "fixes" it
+# by dropping the OTHER filter instead, so every later attempt is flagged for a
+# genuinely missing entity and the whole question falls through to the KB
+# fallback ("couldn't build a working query").
+#
+# Only discarded when the column really is filtered to the resolved value in
+# the SQL — a genuinely absent filter still raises, which is the check's whole
+# purpose.
+_VERIFIER_CASE_FORM_COMPLAINT = re.compile(
+    r"\b(?:lowercase|uppercase|upper\(|case[- ]insensitive|verbatim|"
+    r"correct case)\b", re.IGNORECASE)
+
+
+def _verifier_complaint_is_cosmetic(issue: str, resolved: dict, sql: str) -> bool:
+    """True when the verifier's complaint is about the FORM of a filter that is
+    in fact present and correct in the SQL."""
+    if not _VERIFIER_CASE_FORM_COMPLAINT.search(issue or ""):
+        return False
+    ac = (resolved or {}).get("assembly_constituency")
+    if not ac:
+        return False
+    # The AC value is genuinely filtered on, in either form.
+    return bool(re.search(
+        rf"assembly_constituency_name\s*\)?\s*=\s*(?:UPPER\s*\(\s*)?'{re.escape(str(ac))}'",
+        sql or "", re.IGNORECASE))
+
+
+# Third known verifier false positive. When a village_code is resolved, the
+# RESOLVED ENTITIES block deliberately SUPPRESSES the district/block that
+# merely scoped the village lookup (prompt_builder._entities_block: they are
+# redundant with village_code, which already pins one exact row-set, and
+# rendering them as equally MANDATORY made the verifier demand filters the
+# generator was right to omit). The verifier nonetheless sometimes "quotes" a
+# district entity that was never in its prompt and rejects village-only SQL for
+# omitting it — confirmed live 2026-09-15 on "ASIMGRE ... for East Garo Hills",
+# where the block plainly contained only `village_code = 275373` yet the issue
+# read "RESOLVED ENTITIES block lists lgd_district = 'EAST GARO HILLS'".
+# Correct SQL is then repaired away and the question dies in the KB fallback.
+#
+# Discarded only when a village_code IS resolved AND the SQL genuinely filters
+# on it — i.e. exactly the shape where the suppressed district is redundant.
+_VERIFIER_SUPPRESSED_GEO_COMPLAINT = re.compile(
+    r"\b(?:lgd_district|lgd_block|district|block)\b[^.]{0,120}"
+    r"\b(?:missing|not present|omitted|absent|instead)\b|"
+    r"\b(?:missing|not present|omitted|absent)\b[^.]{0,120}"
+    r"\b(?:lgd_district|lgd_block|district|block)\b",
+    re.IGNORECASE,
+)
+
+
+def _verifier_wants_suppressed_geography(issue: str, resolved: dict, sql: str) -> bool:
+    """True when the verifier demands a district/block that _entities_block
+    intentionally left out because a resolved village_code supersedes it."""
+    code = (resolved or {}).get("village_code")
+    if code is None:
+        return False
+    if not _VERIFIER_SUPPRESSED_GEO_COMPLAINT.search(issue or ""):
+        return False
+    return bool(re.search(rf"\bvillage_code\s*(?:=|IN)\s*\(?\s*{re.escape(str(code))}\b",
+                          sql or "", re.IGNORECASE))
+
+
+# Fourth known verifier false positive. A financial year is stored by its START
+# year — FY 2023-24 IS year_key = 2023 (docs/DATA_MODEL.md; entity resolution
+# emits exactly that). The verifier repeatedly reads the "-24" half as the value
+# that should appear and flags correct SQL as using the wrong year: confirmed
+# live 2026-09-17 on "…in RERAPARA … for FY 2023-24", where SQL filtering
+# year_key = 2023 — matching the resolved entity verbatim — was rejected on 5 of
+# 5 calls ("the question asks for FY 2023-24, but the SQL filters on year_key =
+# 2023"). Every repair then re-sent the same correct query, the budget ran out,
+# and a perfectly answerable question died in the KB fallback.
+#
+# Discarded only when the SQL's year_key genuinely equals the resolved one, so a
+# real year mismatch still raises.
+_VERIFIER_YEAR_COMPLAINT = re.compile(r"\byear_key\b|\bfinancial year\b|\bfy\b", re.IGNORECASE)
+
+
+def _verifier_year_complaint_is_false(issue: str, resolved: dict, sql: str) -> bool:
+    """True when the verifier disputes the year but the SQL already filters on
+    exactly the resolved year_key."""
+    year = (resolved or {}).get("year_key")
+    if year is None:
+        return False
+    if not _VERIFIER_YEAR_COMPLAINT.search(issue or ""):
+        return False
+    filters = set(re.findall(r"\byear_key\s*=\s*(\d{4})\b", sql or ""))
+    return filters == {str(int(year))}
+
+
+# Fifth known verifier false positive, and the most clear-cut of the family: the
+# verifier states as fact that the WHERE clause "omits these filters entirely"
+# when the filters are sitting in it verbatim. Confirmed live 2026-09-18 on
+# "How many applicants are there in BATABARI under Agro Tourism Villa Scheme,
+# PRIME Small Enterprise Empowerment and Development (SEED) and Meghalaya
+# Poultry Farming Scheme, BATABARI block, WEST GARO HILLS": entity resolution
+# produced block=BATABARI + district=WEST GARO HILLS, the generator emitted
+#   AND lgd_block = 'BATABARI' AND lgd_district = 'WEST GARO HILLS'
+# and the verifier still returned "RESOLVED ENTITIES block lists lgd_block =
+# 'BATABARI' and lgd_district = 'WEST GARO HILLS', but the SQL WHERE clause
+# omits these filters entirely" on 10 of 10 calls. Each repair re-sent the same
+# correct SQL, the 3-repair budget ran out, and a question whose answer is a
+# plain 46 (SEED 43 + Poultry 2 + Agro Tourism Villa 1) died in the KB fallback
+# as "couldn't build a working query".
+#
+# Unlike the assembly-constituency guard above, this is not about the FORM of a
+# filter — the verifier is misreading a long multi-line WHERE clause and denying
+# a literal that is plainly there. So the test is the strongest one available:
+# discard the complaint only when EVERY resolved geography entity it names is
+# provably filtered on in the SQL. A genuinely missing filter still raises,
+# which keeps Check 2 doing its job.
+_VERIFIER_MISSING_GEO_COMPLAINT = re.compile(
+    r"\b(?:omits?|omitted|omitting|missing|absent|not present|no filter|lacks?|"
+    r"does not (?:include|filter|contain)|fails to (?:include|filter))\b",
+    re.IGNORECASE)
+
+# resolved-entity key -> the SQL column prompt_builder._entities_block renders
+# it as, which is the column the verifier names back in its complaint.
+_RESOLVED_GEO_COLUMNS = {
+    "district": "lgd_district",
+    "block": "lgd_block",
+    "assembly_constituency": "assembly_constituency_name",
+}
+
+
+def _sql_filters_on(sql: str, column: str, value: str) -> bool:
+    """True when `sql` constrains `column` to `value`, in any of the forms the
+    generator legitimately produces: bare equality, an UPPER()/LOWER() wrapper
+    on either side, or membership in an IN (...) list."""
+    val = re.escape(str(value))
+    col = re.escape(column)
+    # col = 'V'  |  UPPER(col) = 'V'  |  col = UPPER('V')
+    eq = (rf"(?:UPPER|LOWER)?\s*\(?\s*{col}\s*\)?\s*=\s*"
+          rf"(?:(?:UPPER|LOWER)\s*\(\s*)?'{val}'")
+    if re.search(eq, sql or "", re.IGNORECASE):
+        return True
+    # col IN ('A', 'V', ...) — the value must be one of the listed literals.
+    for m in re.finditer(
+            rf"(?:UPPER|LOWER)?\s*\(?\s*{col}\s*\)?\s+IN\s*\(([^)]*)\)",
+            sql or "", re.IGNORECASE):
+        if re.search(rf"'{val}'", m.group(1), re.IGNORECASE):
+            return True
+    return False
+
+
+def _verifier_missing_geo_is_false(issue: str, resolved: dict, sql: str) -> bool:
+    """True when the verifier claims resolved geography filters are absent but
+    every one it could be referring to is in fact present in the SQL."""
+    if not _VERIFIER_MISSING_GEO_COMPLAINT.search(issue or ""):
+        return False
+    # Restrict to the geography entities the complaint actually names, by
+    # column name or by value — so an unrelated grievance never trips this.
+    named = {}
+    for key, col in _RESOLVED_GEO_COLUMNS.items():
+        val = (resolved or {}).get(key)
+        if not val or not isinstance(val, str):
+            continue
+        if re.search(rf"\b{re.escape(col)}\b", issue or "", re.IGNORECASE) or \
+           re.search(re.escape(val), issue or "", re.IGNORECASE):
+            named[col] = val
+    if not named:
+        return False
+    return all(_sql_filters_on(sql, col, val) for col, val in named.items())
+
+
+# Sixth known verifier false positive: a scheme name containing an apostrophe.
+# In SQL a literal apostrophe is written doubled ('Chief Minister''s Green Taxi
+# Scheme'), which is the SAME string as the resolved entity once parsed. The
+# verifier reads the two spellings as different values and rejects correct SQL,
+# quoting the identical text on both sides of its own complaint — confirmed
+# live 2026-09-18 on "applicants in mylliem, the block ... under Green Taxi CM
+# Elevate and ware house Scheme", flagged on 8 of 8 calls with
+#   "RESOLVED ENTITIES block specifies scheme_name = 'Chief Minister''s Green
+#    Taxi Scheme' (verbatim), but the SQL filters on ... 'Chief Minister''s
+#    Green Taxi Scheme'"
+# The query is right and returns 2; only the verifier disagrees, so the repair
+# loop burned its budget and the question died in the KB fallback.
+#
+# Discarded only when un-doubling the SQL's apostrophes makes the resolved
+# value genuinely present — a real value mismatch still raises.
+_VERIFIER_VERBATIM_COMPLAINT = re.compile(
+    r"\bverbatim\b|\bexact(?:ly)?\b|\bdoes not match\b|\bmismatch\b|"
+    r"\bdiffer(?:ent|s)?\b|\bslightly different\b", re.IGNORECASE)
+
+
+def _verifier_apostrophe_complaint_is_false(issue: str, resolved: dict, sql: str) -> bool:
+    """True when the verifier disputes a resolved value that the SQL does carry,
+    differing only by SQL's doubled-apostrophe escaping."""
+    if not _VERIFIER_VERBATIM_COMPLAINT.search(issue or ""):
+        return False
+    # Only values that actually contain an apostrophe can hit this.
+    vals = [v for v in (resolved or {}).values() if isinstance(v, str) and "'" in v]
+    for v in (resolved or {}).values():
+        if isinstance(v, list):
+            vals.extend(x for x in v if isinstance(x, str) and "'" in x)
+    if not vals:
+        return False
+    unescaped = (sql or "").replace("''", "'")
+    return all(v in unescaped for v in vals)
+
 
 async def _verify_sql(question: str, schemes: list[str], entity_result: dict, sql: str) -> "str | None":
     """One short issue sentence if the semantic verifier (SQL_VERIFY_MODEL,
@@ -3307,6 +4777,31 @@ async def _verify_sql(question: str, schemes: list[str], entity_result: dict, sq
             "SQL verifier claimed RESOLVED ENTITIES is empty when resolved=%r says otherwise "
             "— discarding as a known verifier hallucination: %s", entity_result["resolved"], issue)
         return None
+    if _verifier_complaint_is_cosmetic(issue, entity_result.get("resolved") or {}, sql):
+        logger.warning(
+            "SQL verifier complained about the FORM of an assembly-constituency filter that "
+            "is present and correct — discarding as cosmetic: %s", issue)
+        return None
+    if _verifier_year_complaint_is_false(issue, entity_result.get("resolved") or {}, sql):
+        logger.warning(
+            "SQL verifier disputed the financial year when the SQL already filters on the "
+            "resolved year_key (a FY is stored by its START year) — discarding: %s", issue)
+        return None
+    if _verifier_apostrophe_complaint_is_false(issue, entity_result.get("resolved") or {}, sql):
+        logger.warning(
+            "SQL verifier disputed a value that differs only by SQL apostrophe escaping "
+            "('' is a literal ') — discarding: %s", issue)
+        return None
+    if _verifier_missing_geo_is_false(issue, entity_result.get("resolved") or {}, sql):
+        logger.warning(
+            "SQL verifier claimed the resolved geography filters are missing when the "
+            "SQL filters on every one of them verbatim — discarding: %s", issue)
+        return None
+    if _verifier_wants_suppressed_geography(issue, entity_result.get("resolved") or {}, sql):
+        logger.warning(
+            "SQL verifier demanded a district/block that the RESOLVED ENTITIES block "
+            "deliberately suppressed as redundant with village_code — discarding: %s", issue)
+        return None
     return issue
 
 
@@ -3326,6 +4821,27 @@ async def execute_with_repair(question: str, schemes: list[str], entity_result: 
                     "matching (storage keeps mixed/title case, not upper-case), so that filter can "
                     "silently match zero rows. Replace the lgd_village_name filter with "
                     f"village_code = {bad_code} exactly, and keep every other clause as it was."
+                )
+            wrong_level = _village_filtered_at_wrong_level(entity_result, sql)
+            if wrong_level is not None:
+                _code, _clause = wrong_level
+                if _VILLAGE_CODE_FILTER_RE.search(sql):
+                    # village_code is already correct — the bogus clause just
+                    # has to go, not be replaced.
+                    raise ValueError(
+                        f"this query already filters village_code = {_code} correctly, but it "
+                        f"ALSO filters {_clause} — a VILLAGE name placed in a block/district "
+                        "column, which matches no row and forces the whole query to 0 even "
+                        f"though village {_code} has real records. DELETE that clause entirely "
+                        "and keep village_code and every other filter exactly as they are."
+                    )
+                raise ValueError(
+                    f"the question resolved to village_code = {_code}, but this query filters "
+                    f"{_clause} — that is a VILLAGE name placed in a block/district column, so "
+                    "it matches zero rows and returns a confident 0 for a village that has "
+                    f"real records. Replace that clause with village_code = {_code} exactly "
+                    "(the curated view carries village_code as a direct column), and keep "
+                    "every other clause as it was."
                 )
             bad_geo_code = _village_code_as_geography_key(entity_result, sql)
             if bad_geo_code is not None:
@@ -3347,6 +4863,35 @@ async def execute_with_repair(question: str, schemes: list[str], entity_result: 
                     "misleading '0.00 crore'. Report the figure directly in LAKH instead (remove "
                     "the ÷100 conversion and the crore alias/label), and keep every other clause "
                     "as it was."
+                )
+            if _mgnrega_facts_joined(sql):
+                raise ValueError(
+                    "this query JOINs curated.v_employment to curated.v_expenditure "
+                    "directly. MGNREGA's two facts have no shared grain — both hold many "
+                    "rows per village-year — so that join fans out and every SUM comes back "
+                    "multiplied (a real 986,020 person-days became 109,448,220). Rebuild it "
+                    "with one CTE per fact, each aggregated on its own and carrying the SAME "
+                    "filters, then combine the aggregates:\n"
+                    "  WITH emp AS (SELECT SUM(person_days) AS person_days "
+                    "FROM curated.v_employment WHERE <filters>),\n"
+                    "       exp AS (SELECT SUM(total_exp) AS total_exp_lakh "
+                    "FROM curated.v_expenditure WHERE <filters>)\n"
+                    "  SELECT exp.total_exp_lakh, emp.person_days FROM emp, exp\n"
+                    "Add GROUP BY inside each CTE and FULL OUTER JOIN them on the grain "
+                    "columns only if a per-area or per-year breakdown was asked for. Keep "
+                    "every filter exactly as it was."
+                )
+            bad_geo = _ac_with_invented_geo_filter(entity_result, sql)
+            if bad_geo is not None:
+                raise ValueError(
+                    f"this query filters on the assembly constituency AND on {bad_geo}, but "
+                    "no district or block was resolved for this question — that geography "
+                    "filter was invented. An assembly constituency cuts ACROSS blocks and "
+                    "districts, so its name is usually not a block or district name, and "
+                    f"ANDing {bad_geo} with the constituency filter matches zero rows and "
+                    "returns a false zero. Remove that filter entirely and keep only "
+                    "assembly_constituency_name (plus year_key and the aggregation) exactly "
+                    "as they were."
                 )
             if _STATE_PSEUDO_FILTER.search(sql):
                 raise ValueError(
@@ -3618,11 +5163,13 @@ def _no_data_answer(schemes: list[str] | None, entities: dict[str, str] | None) 
     failed, when the honest answer is just that no records match the filters."""
     scope_bits = [v for v in (entities or {}).values() if v]
     scope = f" for {', '.join(scope_bits)}" if scope_bits else ""
-    msg = f"I couldn't find any matching records{scope} in the data available."
-    metrics = available_metrics_text(schemes or [])
-    if metrics:
-        msg += "\n\nData I do have here:\n" + metrics
-    return msg
+    # One sentence, nothing else. The full capability catalogue used to be
+    # appended here ("Data I do have here:" + every metric for the scheme),
+    # which buried a one-line fact under a ~10-line dump the user did not ask
+    # for and could not act on (reported 2026-09-18). An empty result answers
+    # the question asked; what else the dataset could report is a different
+    # question, and the NEXT STEPS chips already offer it.
+    return f"I couldn't find any matching records{scope} in the data available."
 
 
 def _is_plain_list_result(rows: list[dict]) -> bool:
@@ -3918,6 +5465,13 @@ async def _answer_data(question: str, scope: "auth.UserScope | None" = None,
 
     # Ask which scheme before doing anything expensive, when the question could
     # honestly mean either one. Guessing here is worse than a one-tap follow-up.
+    # "Which scheme paid out the most?" — the scheme is the ANSWER, not a
+    # missing filter, so this must run before the "which scheme?" pause below
+    # (which would otherwise ask the user to supply the very thing they asked
+    # for). Answered deterministically across every scheme that records money.
+    if _wants_cross_scheme_money_ranking(question):
+        return await _cross_scheme_money_answer(question)
+
     if _needs_scheme_clarification(question):
         raise _scheme_clarification(question)
 
@@ -4021,7 +5575,14 @@ async def _answer_data(question: str, scope: "auth.UserScope | None" = None,
         "sql_query": sql,
         "row_count": len(rows),
         "rows": rows[:20],
-        "data": rows[:200],
+        # The full result the query returned, for the table/chart renderer.
+        # Was capped at 200, which silently truncated a legitimate answer — a
+        # "which villages…" question over a constituency returns ~150 rows and
+        # the user has no way to reach the rest (reported 2026-09-17).
+        # run_readonly() already bounds every query at SQL_MAX_RESULT_ROWS
+        # (1000), so this is not an unbounded payload; `row_count` above stays
+        # the true total either way.
+        "data": rows,
         "answer": answer,
     }
 
@@ -4319,6 +5880,21 @@ async def _run_pipeline(question: str, session: "Session | None" = None,
     if _ADMIN_EXPENDITURE_REQUESTED.search(question):
         raise _admin_expenditure_clarification(question)
 
+    # 1e. Named a scheme we simply don't hold ("PM-KISAN", "Ujjwala", "Jal
+    #     Jeevan"). Checked HERE, before the DATA/KNOWLEDGE split, because the
+    #     question is just as often a KNOWLEDGE one ("what is PM Kisan
+    #     Yojana?") as a data one. The check used to live only inside
+    #     _answer_data, so a knowledge-shaped ask sailed past it into RAG,
+    #     found nothing — correctly, it isn't in the reference docs — and got
+    #     the flat "I don't have information about that for MGNREGA, PMAY-G,
+    #     Focus Plus or CM Elevate", which never says WHY or what to do next
+    #     (reported 2026-09-18). The clarification below names the scheme the
+    #     user asked for, says plainly that only four are loaded, and offers
+    #     them as one-tap chips.
+    _unsupported_named = _unsupported_scheme_named(question)
+    if _unsupported_named:
+        raise _unsupported_scheme_clarification(question, _unsupported_named)
+
     # 2. Route: number question or scheme-rules question?
     intent = await classify_intent(question)
 
@@ -4343,6 +5919,17 @@ async def _run_pipeline(question: str, session: "Session | None" = None,
         # a vague question came back "not covered" while quietly assuming
         # MGNREGA. Ask which of the four schemes instead, same one-tap chips
         # the DATA path already uses (see _needs_scheme_clarification).
+        # ...but a question that NAMES a scheme we don't recognise ("what is
+        # amma yedi scheme?") is not vague — the user was specific, we simply
+        # don't hold it. Asking "which scheme does your question concern?"
+        # there ignores what they actually asked; say plainly that it isn't
+        # one of the four (reported 2026-09-18).
+        if _kb_scheme is None and _names_unknown_scheme(question):
+            return {"route": "knowledge", "intent": "RAG", "confidence": "low", "sources": [],
+                    "answer": _knowledge_not_covered_answer(question, None),
+                    "rewritten_question": question if question != raw_question else None,
+                    "schemes": [],
+                    **_empty_data_fields()}
         if _kb_scheme is None and _needs_scheme_clarification(question):
             raise _scheme_clarification(question)
 
@@ -4363,8 +5950,7 @@ async def _run_pipeline(question: str, session: "Session | None" = None,
                     "answer": kb["answer"], "sources": kb["sources"],
                     **_empty_data_fields(), **base}
         return {"route": "knowledge", "intent": "RAG", "confidence": "low", "sources": [],
-                "answer": "I don't have information about that for MGNREGA, PMAY-G, "
-                          "Focus Plus or CM Elevate.",
+                "answer": _knowledge_not_covered_answer(question, _kb_scheme),
                 **_empty_data_fields(), **base}
 
     # 4. DATA -> NL->SQL. On a hard failure, try the KB once before giving up.
@@ -4417,6 +6003,85 @@ async def _run_pipeline(question: str, session: "Session | None" = None,
     except Exception as e:  # noqa: BLE001
         logger.warning("data path failed (%s) — trying KB fallback", e, exc_info=True)
         return await _data_path_kb_fallback(question)
+
+
+# "what is <something> scheme/yojana/mission?" — the user named a specific
+# programme by name. When it is none of our four and not in the known
+# unsupported catalogue either, it is still a NAMED ask, not a vague one, so it
+# must not get the "which scheme does your question concern?" pause.
+_NAMED_UNKNOWN_SCHEME_RE = re.compile(
+    r"\b(?:what|which|tell me about|explain|describe|about)\b[^?.!]{0,60}?"
+    r"\b(?P<name>[A-Za-z][\w'-]*(?:\s+[A-Za-z][\w'-]*){0,3})\s+"
+    r"(?:scheme|yojana|yojna|mission|abhiyaan?|programme|program)\b",
+    re.IGNORECASE,
+)
+# Words that make the phrase generic rather than a name ("what is THIS scheme",
+# "about the scheme"), so they must not count as naming one.
+_GENERIC_SCHEME_WORDS = {
+    "the", "this", "that", "a", "an", "any", "each", "every", "all", "these",
+    "those", "your", "which", "what", "some", "other", "another", "such",
+    "government", "govt", "state", "central", "rural", "welfare", "above",
+    # Verbs / fillers the opener can leave in the captured span ("what IS the
+    # scheme") — on their own they name nothing.
+    "is", "are", "was", "were", "do", "does", "did", "me", "about", "of",
+    "for", "in", "on", "it", "they", "you", "i", "we", "tell", "explain",
+    # Generic nouns a scheme question asks ABOUT, never the scheme's name
+    # ("what are the BENEFITS of the scheme").
+    "benefit", "benefits", "eligibility", "criteria", "document", "documents",
+    "purpose", "objective", "objectives", "feature", "features", "detail",
+    "details", "rule", "rules", "process", "procedure", "amount", "subsidy",
+}
+
+
+def _names_unknown_scheme(question: str) -> bool:
+    """True when the question names a specific scheme by name that is neither
+    one of our four nor in the unsupported catalogue."""
+    if _named_schemes(question) or _infer_scheme_from_terms(question):
+        return False                       # one of ours — nothing unknown here
+    if _unsupported_scheme_named(question):
+        return False                       # handled by its own, better reply
+    m = _NAMED_UNKNOWN_SCHEME_RE.search(question or "")
+    if not m:
+        return False
+    words = m.group("name").split()
+    if not words:
+        return False
+    # The scheme's NAME is the word immediately before "scheme"/"yojana"/… —
+    # "amma yedi scheme" names one, "the benefits of the scheme" does not.
+    # Testing the last word alone (rather than the whole captured span) keeps
+    # this from firing on any question that merely mentions a generic noun on
+    # its way to the word "scheme".
+    if words[-1].lower() in _GENERIC_SCHEME_WORDS:
+        return False
+    # A bare "<word> scheme" where that word is an ordinary English filler is
+    # still generic; require something that reads like a proper name.
+    return len(words[-1]) >= 3
+
+
+def _knowledge_not_covered_answer(question: str, scheme: "str | None") -> str:
+    """The reply when the knowledge base genuinely has nothing for a question.
+
+    The old text — "I don't have information about that for MGNREGA, PMAY-G,
+    Focus Plus or CM Elevate" — reads as a dead end: it never says whether the
+    SUBJECT is out of scope or the assistant simply failed, and offers nowhere
+    to go (reported 2026-09-18, "what is PM kisan yojana?"). A question that
+    named a scheme gets a scheme-scoped answer; one that named none is told
+    what IS covered."""
+    if scheme:
+        return (
+            f"I don't have that detail in the {scheme} reference material. I can "
+            f"cover {scheme}'s eligibility, benefits, documents and how to apply, "
+            "and its data by district, block, village or financial year — so it may "
+            "just be worth rephrasing. If you meant a different scheme, tell me which."
+        )
+    return (
+        "That isn't something I hold. I cover four Meghalaya schemes — MGNREGA "
+        "(rural employment), PMAY-G (rural housing), Focus Plus (farmer cash "
+        "benefit) and CM Elevate (livelihood and enterprise support) — both how "
+        "each one works and its actual data. If your question is about one of "
+        "those, name it and I'll answer; if it's about another scheme or another "
+        "state, that's outside what I can see."
+    )
 
 
 async def _data_path_kb_fallback(question: str) -> dict:
