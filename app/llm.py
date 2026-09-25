@@ -479,19 +479,57 @@ async def call_reranker(
     return scored
 
 
+# Codes this ASR deployment accepts (its own 400 enumerates them). Anything
+# else is a hard 400, so it is normalised to "en" rather than forwarded.
+_ASR_LANGUAGES = frozenset({
+    "af", "ar", "hy", "az", "be", "bs", "bg", "ca", "zh", "hr", "cs", "da",
+    "nl", "en", "et", "fi", "fr", "gl", "de", "el", "he", "hi", "hu", "is",
+    "id", "it", "ja", "kn", "kk", "ko", "lv", "lt", "mk", "ms", "mr", "mi",
+    "ne", "no", "fa", "pl", "pt", "ro", "ru", "sr", "sk", "sl", "es", "sw",
+    "sv", "tl", "ta", "th", "tr", "uk", "ur", "vi", "cy",
+})
+
+
+def _asr_language(language: str | None) -> str:
+    """A code the ASR will accept. Unknown/blank -> "en"."""
+    code = (language or "").strip().lower()
+    return code if code in _ASR_LANGUAGES else "en"
+
+
 async def call_asr(
     audio: bytes,
     filename: str = "audio.wav",
+    language: str = "en",
 ) -> str:
     """
     qwen3-asr via the gateway's OpenAI-compatible
     /audio/transcriptions route.
+
+    `language` is optional for this deployment — real speech transcribes
+    identically with and without it — but the web UI already sends the field,
+    so it is forwarded rather than silently dropped.
+
+    It is VALIDATED first, because the gateway rejects an unknown code outright
+    (`language=kha` -> 400 "Unsupported language") and that 400 surfaces as a
+    502 with no usable message. A hint the model does not need must never be
+    able to fail the call, so anything outside _ASR_LANGUAGES falls back to
+    "en". This matters for the Khasi/Garo UI options: they map to "en" today,
+    but the ASR has no code for either language.
     """
 
     if _client is None:
         raise RuntimeError(
             "llm client not initialized — call init_client() at startup"
         )
+
+    form = {
+        "model": settings.ASR_MODEL,
+        "language": _asr_language(language),
+    }
+    # Domain vocabulary (see settings.ASR_PROMPT). The caller must run the
+    # result through asr_guard.is_prompt_echo(): on silence the model repeats it.
+    if settings.ASR_PROMPT:
+        form["prompt"] = settings.ASR_PROMPT
 
     async with _slot():
 
@@ -500,9 +538,7 @@ async def call_asr(
             headers={
                 "Authorization": f"Bearer {settings.ASR_API_KEY}",
             },
-            data={
-                "model": settings.ASR_MODEL,
-            },
+            data=form,
             files={
                 "file": (
                     filename,

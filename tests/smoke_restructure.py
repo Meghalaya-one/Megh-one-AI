@@ -73,12 +73,12 @@ print(f"   POST /api/query -> {st}  route={res.get('route')}")
 print(f"   answer: {(res.get('answer') or '')[:90]}")
 print(f"   {ok(st==200 and res.get('answer'))}")
 
-print("11. CM ELEVATE MONEY REFUSAL (no money column exists — must refuse, not answer)")
+print("11. CM ELEVATE MONEY -> CM ELEVATE LEGACY (money lives in the sanction/disbursement data)")
 st, res = call("POST", "/api/query", tok, {"question": "what is the total amount disbursed under CM Elevate"})
 ans = (res.get("answer") or "")[:160]
 print(f"   POST /api/query -> {st}  route={res.get('route')}")
 print(f"   answer: {ans}")
-print(f"   {ok(st==200 and res.get('answer'))}  (manually confirm this REFUSES, not a fabricated figure)")
+print(f"   {ok(st==200 and res.get('answer'))}  (manually confirm schemes=['CM Elevate Legacy'] and a subsidy/loan/total split)")
 
 print("12. CM ELEVATE TIME REFUSAL (no date column exists — must refuse, not answer)")
 st, res = call("POST", "/api/query", tok, {"question": "show CM Elevate applications by month"})

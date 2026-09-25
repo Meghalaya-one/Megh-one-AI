@@ -45,43 +45,51 @@ ROLE_PERMISSIONS: dict[str, dict] = {
     # checks (an admin exploring data isn't 5.7's threat model) but stays
     # tenant-scoped for what they can see (conversations, audit, users).
     "super_admin": {
-        "granularity_cap": "village", "schemes": ["MGNREGA", "PMAY-G", "Focus Plus", "CM Elevate"],
+        "granularity_cap": "village", "schemes": ["MGNREGA", "PMAY-G", "Focus Plus", "CM Elevate", "Focus Legacy",
+                    "CM Elevate Legacy"],
         "geographies": "all", "is_admin": True, "cross_tenant": True,
     },
     "tenant_admin": {
-        "granularity_cap": "village", "schemes": ["MGNREGA", "PMAY-G", "Focus Plus", "CM Elevate"],
+        "granularity_cap": "village", "schemes": ["MGNREGA", "PMAY-G", "Focus Plus", "CM Elevate", "Focus Legacy",
+                    "CM Elevate Legacy"],
         "geographies": "all", "is_admin": True,
     },
     "admin": {
         "granularity_cap": "village",
-        "schemes": ["MGNREGA", "PMAY-G", "Focus Plus", "CM Elevate"],
+        "schemes": ["MGNREGA", "PMAY-G", "Focus Plus", "CM Elevate", "Focus Legacy",
+                    "CM Elevate Legacy"],
         "geographies": "all",
         "is_admin": True,
     },
     "state_officer": {
         "granularity_cap": "district",
-        "schemes": ["MGNREGA", "PMAY-G", "Focus Plus", "CM Elevate"],
+        "schemes": ["MGNREGA", "PMAY-G", "Focus Plus", "CM Elevate", "Focus Legacy",
+                    "CM Elevate Legacy"],
         "geographies": "all",
     },
     "district_officer": {
         "granularity_cap": "block",
-        "schemes": ["MGNREGA", "PMAY-G", "Focus Plus", "CM Elevate"],
+        "schemes": ["MGNREGA", "PMAY-G", "Focus Plus", "CM Elevate", "Focus Legacy",
+                    "CM Elevate Legacy"],
         "geographies": {"districts": [], "blocks": []},  # must be pinned per user
     },
     "block_officer": {
         "granularity_cap": "village",
-        "schemes": ["MGNREGA", "PMAY-G", "Focus Plus", "CM Elevate"],
+        "schemes": ["MGNREGA", "PMAY-G", "Focus Plus", "CM Elevate", "Focus Legacy",
+                    "CM Elevate Legacy"],
         "geographies": {"districts": [], "blocks": []},
     },
     "analyst": {
         "granularity_cap": "village",
-        "schemes": ["MGNREGA", "PMAY-G", "Focus Plus", "CM Elevate"],
+        "schemes": ["MGNREGA", "PMAY-G", "Focus Plus", "CM Elevate", "Focus Legacy",
+                    "CM Elevate Legacy"],
         "geographies": "all",
     },
     # No identity on the request -> this. Statewide aggregates only.
     "public": {
         "granularity_cap": "state",
-        "schemes": ["MGNREGA", "PMAY-G", "Focus Plus", "CM Elevate"],
+        "schemes": ["MGNREGA", "PMAY-G", "Focus Plus", "CM Elevate", "Focus Legacy",
+                    "CM Elevate Legacy"],
         "geographies": "all",
     },
 }

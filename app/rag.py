@@ -81,6 +81,61 @@ def _strip_heading(text: str) -> str:
     return _clean_for_display(text)
 
 
+# How each scheme is actually WRITTEN in its own reference docs, where that
+# differs from the label this system uses internally. Only Focus Legacy truly
+# needs it — "Focus Legacy" is our own disambiguation label (coined to separate
+# the producer-group scheme from Focus Plus) and appears NOWHERE in the SME
+# prose, which says "FOCUS" throughout. Told to answer only from the passages,
+# the composer then reports the scheme as "not mentioned" while sitting on the
+# right material. The others are listed so the note reads naturally for them
+# too, and so a future doc that prefers one spelling does not regress.
+_SCHEME_DOC_NAMES = {
+    "Focus Legacy": ("FOCUS", "the FOCUS scheme (Farmers' Collectivization for "
+                     "Upscaling Production and Marketing Systems), the Meghalaya "
+                     "producer-group scheme"),
+    "Focus Plus": ("FOCUS+", "FOCUS+, the Meghalaya farmer cash-benefit scheme"),
+    "CM Elevate": ("CM-ELEVATE", "CM-ELEVATE"),
+    "CM Elevate Legacy": ("CM-ELEVATE", "CM-ELEVATE, the Meghalaya programme — CM "
+                          "Elevate Legacy is its sanction and disbursement records and "
+                          "shares the programme's reference material with CM Elevate"),
+    "MGNREGA": ("MGNREGA", "MGNREGA"),
+    "PMAY-G": ("PMAY-G", "PMAY-G / PMAY-Gramin"),
+}
+
+
+def _naming_note(scheme: str | None) -> str:
+    """One line telling the composer that the passages ARE this scheme's own
+    material, under whatever name the documents happen to use. Empty when the
+    call is unscoped — we cannot assert whose material it is then."""
+    if not scheme:
+        return ""
+    doc_name, description = _SCHEME_DOC_NAMES.get(scheme, (scheme, scheme))
+    note = (
+        f'The passages below are the reference material for {scheme}. '
+        f'In those documents this scheme is written as "{doc_name}" '
+        f'({description}). '
+        f'"{scheme}" and "{doc_name}" are the SAME scheme — never say {scheme} '
+        f'is not mentioned, or that the documents describe a different scheme, '
+        f'merely because the passages use the other spelling.'
+    )
+    return note + "\n\n"
+
+
+# Schemes that are different DATASETS of one programme share ONE knowledge base.
+# CM Elevate (applications) and CM Elevate Legacy (sanctions and disbursements)
+# are both the CM-ELEVATE programme: its eligibility, benefits, sub-schemes and
+# application process are the same whichever dataset a user is looking at, so
+# both read the same reference docs — stored under "CM Elevate" (kb_ingest folds
+# a Legacy-tagged doc into that tag too). The vector filter is an exact match,
+# so every retrieval goes through kb_scheme(). Every other scheme maps to itself.
+_KB_SCHEME_ALIAS = {"CM Elevate Legacy": "CM Elevate"}
+
+
+def kb_scheme(scheme: str | None) -> str | None:
+    """The knowledge-base tag a scheme's reference material is stored under."""
+    return _KB_SCHEME_ALIAS.get(scheme, scheme) if scheme else scheme
+
+
 async def retrieve(question: str, scheme: str | None = None) -> list[dict]:
     """Return the reranked, score-filtered candidate chunks, best first.
     `scheme`, when given, restricts retrieval to that scheme's chunks."""
@@ -89,7 +144,8 @@ async def retrieve(question: str, scheme: str | None = None) -> list[dict]:
     except Exception as e:  # noqa: BLE001
         logger.warning("rag.retrieve: embedding failed — %s", e)
         return []
-    candidates = await vectorstore.search(vecs[0], top_k=settings.RAG_TOP_K, scheme=scheme)
+    candidates = await vectorstore.search(vecs[0], top_k=settings.RAG_TOP_K,
+                                          scheme=kb_scheme(scheme))
     if not candidates:
         return []
 
@@ -110,9 +166,12 @@ async def retrieve(question: str, scheme: str | None = None) -> list[dict]:
     return reranked or candidates[: settings.RAG_RERANK_TOP_N]
 
 
-async def answer_from_kb(question: str, scheme: str | None = None) -> dict | None:
-    """Answer a scheme-knowledge question, or None if the KB doesn't cover it."""
-    chunks = await retrieve(question, scheme=scheme)
+async def answer_from_kb(question: str, scheme: str | None = None,
+                         retrieval_query: str | None = None) -> dict | None:
+    """Answer a scheme-knowledge question, or None if the KB doesn't cover it.
+    `retrieval_query`, when given, is embedded for retrieval in place of the
+    question (the answer is still written to `question`)."""
+    chunks = await retrieve(retrieval_query or question, scheme=scheme)
     if not chunks:
         return None
 
@@ -130,7 +189,7 @@ async def answer_from_kb(question: str, scheme: str | None = None) -> dict | Non
 
     if top_score >= settings.RAG_MEDIUM_CONFIDENCE:
         context = "\n\n---\n\n".join(_strip_heading(c["text"]) for c in chunks)
-        prompt = f"""Answer the question using ONLY the reference passages below. If they do
+        prompt = f"""{_naming_note(scheme)}Answer the question using ONLY the reference passages below. If they do
 not contain the answer, say "That isn't covered in the scheme reference material."
 Do not invent numbers, dates, or amounts. No Markdown headings ("#", "##", "###").
 
@@ -195,11 +254,19 @@ async def answer_from_kb_multi(question: str, schemes: list[str]) -> dict | None
     material can come back "not covered" simply because its chunks never made
     the cut. Retrieve each named scheme separately instead, then compose one
     answer that addresses every scheme that had material."""
-    per_scheme: dict[str, list[dict]] = {}
+    # Schemes sharing one knowledge base (CM Elevate + CM Elevate Legacy) are
+    # retrieved ONCE, under one header naming both — retrieving per scheme
+    # would put the same passages in twice and invite two identical answers.
+    groups: dict[str, list[str]] = {}
     for s in schemes:
-        chunks = await retrieve(question, scheme=s)
+        groups.setdefault(kb_scheme(s), []).append(s)
+    per_scheme: dict[str, list[dict]] = {}
+    covered: set[str] = set()
+    for kb, members in groups.items():
+        chunks = await retrieve(question, scheme=kb)
         if chunks:
-            per_scheme[s] = chunks[:4]  # cap per scheme so the composer isn't flooded
+            per_scheme[" / ".join(members)] = chunks[:4]  # cap so the composer isn't flooded
+            covered.update(members)
 
     if not per_scheme:
         return None
@@ -243,7 +310,7 @@ Answer:"""
         if not cleaned:
             return None
 
-    missing = [s for s in schemes if s not in per_scheme]
+    missing = [s for s in schemes if s not in covered]
     if missing:
         cleaned += ("\n\nI don't have reference material covering this for "
                     f"{', '.join(missing)}.")

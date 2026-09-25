@@ -1,0 +1,29 @@
+No.,Use Cases,Example Bot Query
+TC-01,Understand the FOCUS scheme,“What is the FOCUS scheme in Meghalaya?”
+TC-02,Understand the scheme objective,“What is the main objective of FOCUS?”
+TC-03,Understand beneficiary eligibility,“Who can benefit under the FOCUS scheme?”
+TC-04,Understand Producer Groups,“What is the role of Producer Groups under FOCUS?”
+TC-05,Understand financial assistance,“What type of financial assistance is provided under FOCUS?”
+TC-06,Understand scheme support provided to Producer Groups,“What kind of support does FOCUS provide to Producer Groups?”
+TC-07,Understand fund distribution,“How is financial assistance distributed under FOCUS?”
+TC-08,Understand scheme coverage,“How many Producer Groups have been covered under FOCUS?”
+TC-09,Get a scheme overview for official briefing,“Give me a short overview of FOCUS that I can use for an official briefing.”
+TC-10,Identify total beneficiaries in the FOCUS scheme,“How many total beneficiaries are available under the FOCUS scheme?”
+TC-11,Identify unique Producer Groups,“How many unique Producer Groups are present under FOCUS scheme?”
+TC-12,Identify duplicate Producer Groups,“Are there any duplicate Producer Groups there?”
+TC-13,Search for a Producer Group by name,“Is there any Producer Group named Nongstoin PG?”
+TC-14,Check the number of members in a Producer Group,“How many members are there in [pg_name]?”
+TC-15,Identify Producer Groups based on member count,"""List top [number] PGs which has more than [member_number] of members."""
+TC-16,Calculate the total number of Producer Group members,“What is the total number of PG members recorded till now?”
+TC-17,Calculate total Producer Group members by district,“What is the total number of PG members in [district]?”
+TC-18,Calculate the total amount disbursed by district,"""What is the total amount disbursed for [district]?"""
+TC-19,Identify Producer Groups based on disbursed amount,“Which Producer Groups received more than ₹[amount]?”
+TC-20,Retrieve remittances within a specific date range,“Show me all remittances made between April and June 2025.”
+TC-21,Calculate monthly remittance amounts by financial year,“How much was remitted during each month for financial year [year]?”
+TC-22,Identify beneficiary records by financial year,“How many records of beneficiaries are available for each financial year?”
+TC-23,Calculate total remittance for a financial year,“What was the total amount remitted in FY 2024-25?”
+TC-24,Compare total remittances between financial years,“Compare the total remittance between FY 2023-24 and FY 2024-25.”
+TC-25,Count Producer Groups by district,“How many Producer Groups are mapped to each district?”
+TC-26,Count Producer Groups by block within a district,“How many Producer Groups are mapped to each block for [district]?”
+TC-27,Identify Producer Groups mapped to a village,“Which Producer Groups are mapped to [village_name] village?”
+TC-28,Count Producer Groups by constituency,“How many Producer Groups are mapped to [constituency_name]?”

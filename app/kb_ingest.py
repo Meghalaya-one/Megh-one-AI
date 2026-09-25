@@ -40,6 +40,10 @@ _SOURCES = [
     ("reference/focusplus_general_faq.md", "Focus Plus"),
     ("reference/cmelevate_complete_reference.md", "CM Elevate"),
     ("reference/cmelevate_general_faq.md", "CM Elevate"),
+    # Delivered with this casing/naming; kept verbatim rather than renamed so the
+    # paths still match what the SMEs handed over.
+    ("reference/FOCUS_legacy_Complete_Reference.md", "Focus Legacy"),
+    ("reference/FOCUS_LEGACY_FAQ.md", "Focus Legacy"),
 ]
 
 # Scraped encyclopedic / official background, dropped into data/web/*.md by
@@ -50,33 +54,82 @@ _WEB_DIR = "web"
 
 _CHUNK_SIZE = 1500
 
-_SCHEME_TAG = re.compile(r"<!--\s*scheme:\s*([A-Za-z0-9-]+)\s*-->", re.IGNORECASE)
+# Spaces and dots are allowed: the three newest schemes are multi-word
+# ("Focus Legacy", "Focus Plus", "CM Elevate"), and the original
+# `[A-Za-z0-9-]+` silently refused to match any of them — so an explicitly
+# tagged doc fell through to filename-guessing or the unqueryable "GENERAL".
+_SCHEME_TAG = re.compile(r"<!--\s*scheme:\s*([A-Za-z0-9.\- ]+?)\s*-->", re.IGNORECASE)
+
+# Whatever the tag or the filename produced -> the scheme's canonical spelling,
+# which is what every retrieval filter matches on (vectorstore.search uses an
+# exact MatchValue). Keyed case-insensitively so "focus legacy", "FOCUS LEGACY"
+# and "Focus Legacy" all land on the same tag.
+_CANONICAL_SCHEME = {
+    "mgnrega": "MGNREGA", "nrega": "MGNREGA",
+    "pmay": "PMAY-G", "pmay-g": "PMAY-G", "pmayg": "PMAY-G", "pmay-gramin": "PMAY-G",
+    "pmay-u": "PMAY-U", "pmay-urban": "PMAY-U",
+    "focus plus": "Focus Plus", "focus+": "Focus Plus", "focusplus": "Focus Plus",
+    "focus legacy": "Focus Legacy", "focuslegacy": "Focus Legacy",
+    "cm elevate": "CM Elevate", "cmelevate": "CM Elevate", "cm-elevate": "CM Elevate",
+    # CM Elevate Legacy is the same CM-ELEVATE programme's sanction and
+    # disbursement DATA; its reference material is the programme's, shared with
+    # CM Elevate (see rag.kb_scheme). A doc tagged for it lands in that one
+    # knowledge base rather than a second, disjoint namespace.
+    "cm elevate legacy": "CM Elevate", "cmelevate legacy": "CM Elevate",
+    "cmelevatelegacy": "CM Elevate", "cm-elevate legacy": "CM Elevate",
+    "cm elevate disbursement": "CM Elevate",
+}
 
 
 def _web_sources() -> list[tuple[str, str]]:
-    """(relative_path, scheme) for every data/web/*.md. Scheme comes from a
-    `<!-- scheme: X -->` comment, else the filename, else 'GENERAL'."""
+    """(relative_path, scheme) for every data/web/*.md, tagged with the scheme's
+    CANONICAL spelling. Scheme comes from a `<!-- scheme: X -->` comment, else
+    the filename.
+
+    A file we cannot place is SKIPPED, not ingested under a placeholder label:
+    every retrieval path filters on an exact scheme name, so a chunk tagged
+    anything else (the old 'GENERAL') can never be returned by a scoped search
+    and only wastes an embedding. Skipping it logs a warning naming the file, so
+    an untagged doc is a visible problem rather than a silently dead one."""
     web = _DATA_PART / _WEB_DIR
     if not web.is_dir():
         return []
     out: list[tuple[str, str]] = []
     for p in sorted(web.glob("*.md")):
-        scheme = "GENERAL"
+        raw = ""
         try:
             head = p.read_text(encoding="utf-8")[:2000]
             m = _SCHEME_TAG.search(head)
             if m:
-                scheme = m.group(1).upper()
-            elif "PMAY" in p.name.upper():
-                scheme = "PMAY-G"
-            elif "MGNREGA" in p.name.upper() or "NREGA" in p.name.upper():
-                scheme = "MGNREGA"
-            elif "FOCUS" in p.name.upper():
-                scheme = "Focus Plus"
-            elif "ELEVATE" in p.name.upper() or "CMELEVATE" in p.name.upper():
-                scheme = "CM Elevate"
+                raw = m.group(1).strip()
+            else:
+                name = p.name.upper()
+                # "LEGACY" is tested before the bare "FOCUS": both Focus schemes
+                # carry that word, and the qualifier is what tells them apart.
+                if "PMAY" in name:
+                    raw = "PMAY-G"
+                elif "MGNREGA" in name or "NREGA" in name:
+                    raw = "MGNREGA"
+                # Covers CM Elevate Legacy files too — both CM Elevate datasets
+                # share one knowledge base (see _CANONICAL_SCHEME).
+                elif "ELEVATE" in name:
+                    raw = "CM Elevate"
+                elif "LEGACY" in name:
+                    raw = "Focus Legacy"
+                elif "FOCUS" in name:
+                    raw = "Focus Plus"
         except OSError:
             pass
+
+        scheme = _CANONICAL_SCHEME.get(raw.lower().replace("_", " ").strip())
+        if not scheme:
+            logger.warning(
+                "kb_ingest: skipping %s — no scheme could be determined (add a "
+                "'<!-- scheme: Focus Legacy -->' comment); an untagged doc is not "
+                "retrievable by any scheme-scoped search",
+                p.name,
+            )
+            continue
         out.append((f"{_WEB_DIR}/{p.name}", scheme))
     return out
 
@@ -207,10 +260,29 @@ async def ingest_kb(force: bool = False) -> dict:
         return {"ingested": 0, "skipped": True, "reason": "no sources"}
 
     existing = await vectorstore.collection_count()
+    want_schemes = {c["scheme"] for c in chunks}
     if not force and existing >= int(len(chunks) * 0.9):
-        logger.info("kb_ingest: collection already holds %d points (~%d expected) — skipping",
-                    existing, len(chunks))
-        return {"ingested": 0, "skipped": True, "points": existing}
+        # The count alone only says the collection is roughly the right SIZE,
+        # which is not the same as it holding the right CONTENT. A scheme added
+        # to data/ but never ingested answers "not covered" for every question
+        # forever, and a count-based check cannot see it whenever the new
+        # scheme is under 10% of the corpus (measured: 18 chunks or fewer on top
+        # of the existing 170 never trips the threshold). Confirm every scheme
+        # the sources produce is actually PRESENT before trusting the skip.
+        have_schemes = await vectorstore.distinct_schemes()
+        missing = want_schemes - have_schemes
+        if missing:
+            logger.warning(
+                "kb_ingest: collection holds %d points but is MISSING %s — "
+                "rebuilding (a scheme with no points answers 'not covered' for "
+                "every question)",
+                existing, ", ".join(sorted(missing)),
+            )
+        else:
+            logger.info("kb_ingest: collection already holds %d points (~%d expected) "
+                        "covering %s — skipping",
+                        existing, len(chunks), ", ".join(sorted(have_schemes)))
+            return {"ingested": 0, "skipped": True, "points": existing}
 
     n_docs = len(_SOURCES) + len(_web_sources())
     logger.info("kb_ingest: embedding %d chunks from %d docs", len(chunks), n_docs)

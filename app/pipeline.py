@@ -8,6 +8,7 @@ either grows a lot.
 import asyncio
 import itertools
 import json
+import functools
 import logging
 import numbers
 import re
@@ -15,7 +16,7 @@ import re
 import httpx
 from rapidfuzz import fuzz
 
-from app import auth, context_manager, edge, followups, llm, premise_check, prompt_builder, rag
+from app import annotations, auth, context_manager, edge, followups, llm, premise_check, prompt_builder, rag
 from app.config import settings
 from app.db import UnsafeSQLError, run_readonly
 from app.entity_resolver import (
@@ -60,6 +61,23 @@ _DATA_HINTS = re.compile(
     # nouns, not process words, so adding them carries the same low
     # misroute risk as "person-days"/"expenditure" above.
     r"beneficiar\w*|disburs\w*|"
+    # EXISTENCE / NAME-LOOKUP questions. "Is there any Producer Group named as
+    # Sakania PG?" is a lookup against stored records (the SME use-case bank
+    # lists it as answer_route: sql, TC-13) but carries NO counting word, so it
+    # matched no DATA cue above and fell through to the LLM classifier, which
+    # called it KNOWLEDGE and answered from the reference docs — "no mention of
+    # a specific Producer Group named ... in the provided reference material",
+    # true of the prose and irrelevant to the question (reported 2026-09-22).
+    # The naming word is what keeps these narrow: "is there any eligibility
+    # criteria" names nothing and is still KNOWLEDGE.
+    r"\b(?:is|are)\s+there\s+(?:any|a|an)\b[^?]{0,60}?"
+    r"\b(?:named|called|by the name of|with (?:the )?name)\b|"
+    r"\bproducer[\s-]?groups?\s+(?:named|called)\b|"
+    # Same lookup shape using the "PG" abbreviation, which is what users
+    # actually type: "is there any pg group with name sakania?", "pg named X".
+    # The optional "group" covers the redundant-but-common "pg group".
+    r"\bpgs?(?:\s+group)?\s+(?:named|called|with (?:the )?name)\b|"
+    r"\b(?:find|search for|look up|lookup)\s+(?:the\s+|a\s+)?producer[\s-]?group\b|"
     # "How did people apply to CM Elevate?" asks for the recorded
     # application_mode breakdown (online vs cmconnectcenter — a real, answerable
     # count), not the application PROCESS ("how do I apply", "how to apply",
@@ -115,6 +133,23 @@ _BREAKDOWN_CUE = re.compile(r"\b(split|breakdown|distribution)\b", re.IGNORECASE
 # _BREAKDOWN_CUE does.
 _METRIC_WHATIS_CUE = re.compile(
     r"\bwhat (?:is|was|are|were)\b.{0,40}\b(average|avg|mean|total|sum|number|count)\b",
+    re.IGNORECASE,
+)
+
+# The opposite collision: programme-design questions that happen to contain a
+# DATA cue. "Who are the intended beneficiaries of CM-ELEVATE?" trips
+# "beneficiar\w*", and "What is the target number of entrepreneurs under
+# CM-ELEVATE?" trips _METRIC_WHATIS_CUE ("what is … number"), so both went down
+# the data path — one answered "the data doesn't cover the intended
+# beneficiaries", the other asked "which area / year?" for a policy target and
+# never stated it (CM Elevate Legacy use-case QA, TC-03 / TC-08, 2026-09-25).
+# Who a scheme is FOR and what it AIMS at are design facts in the reference
+# docs, never a computed figure — the qualifiers below are what keep this
+# narrow ("how many beneficiaries" and "beneficiaries by district" stay DATA).
+_PROGRAMME_DESIGN_CUE = re.compile(
+    r"\b(?:intended|target(?:ed)?|eligible)\s+(?:beneficiar\w*|groups?|entrepreneurs?)\b|"
+    r"\btarget(?:ed)?\s+(?:number|figure|count)\s+of\b|"
+    r"\b(?:entrepreneur|employment|job|outreach)[\s-]+(?:reach\s+)?targets?\b",
     re.IGNORECASE,
 )
 
@@ -183,10 +218,26 @@ _SCHEME_SWAP_FOLLOWUP = re.compile(
     r"switch to|change to|with)?\s*"
     r"(?:mgnrega|mnrega|nrega|pmay[\s-]?g?|awaas?|awas|"
     r"focus[\s-]?plus|focus\s*\+|focusplus|"
-    r"cm[\s-]?elevate|cmelevate)"
+    # Focus Legacy, and a BARE "focus" — which names neither Focus scheme, so
+    # _scheme_swap_rewrite substitutes the word "Focus" and the normal "which
+    # Focus?" pause asks. Without these, "for focus" after a CM Elevate answer
+    # went to the LLM rewrite, which kept CM Elevate and re-answered it.
+    r"focus[\s-]?legacy|focuslegacy|focus|"
+    r"cm[\s-]?elevate(?:[\s-]?legacy)?|cmelevate(?:[\s-]?legacy)?)"
     r"\s*(?:instead|now|then|scheme)?\s*[?.!]*\s*$",
     re.IGNORECASE,
 )
+# "same for the remaining schemes" / "give same like for other schemes" / "what
+# about the rest of the schemes" — the previous question, asked of every scheme
+# it did NOT name. "all schemes" asks it of every scheme. Left to the LLM
+# rewrite, "remaining schemes" after a CM Elevate answer became "the remaining
+# CM Elevate schemes" (its sub-schemes) and the same answer came back again.
+_REST_OF_SCHEMES = re.compile(
+    r"\b(?:remaining|other|rest\s+of\s+(?:the\s+)?)\s*schemes?\b|"
+    r"\ball\s+(?:the\s+)?other\s+schemes?\b|\ball\s+(?:the\s+)?(?:others|remaining)\b",
+    re.IGNORECASE,
+)
+_ALL_SCHEMES_FOLLOWUP = re.compile(r"\ball\s+(?:the\s+)?(?:\w+\s+)?schemes\b", re.IGNORECASE)
 
 
 # A follow-up fragment ("and for 2024-25?", "how launched it?") only means
@@ -195,6 +246,12 @@ _SCHEME_SWAP_FOLLOWUP = re.compile(
 # query — e.g. "how launched it?" right after "what is elon musk?" was being
 # turned into a data question. So the previous turn must be one of these.
 _ANTECEDENT_ROUTES = ("data", "knowledge")
+# An explicit pointer back to the previous turn's area inside a name lookup.
+_NAME_LOOKUP_BACKREF = re.compile(
+    r"\b(?:in|within|from|of|under)\s+(?:that|this|the\s+same)\s+"
+    r"(?:block|district|village|area|constituency|place)\b|"
+    r"\b(?:in\s+)?there\s*[?.!]*\s*$|\bsame\s+(?:block|district|village|area)\b",
+    re.IGNORECASE)
 _CONTEXTLESS_REF = re.compile(r"\b(it|its|that|those|these|them|they|this(?:\s+one)?)\b", re.IGNORECASE)
 
 
@@ -211,6 +268,20 @@ def looks_like_followup(question: str) -> bool:
     # names a scheme.
     if _SCHEME_SWAP_FOLLOWUP.match(q):
         return True
+    # "same for the remaining schemes" — names no scheme of its own, so it
+    # only means something against the previous question.
+    if _REST_OF_SCHEMES.search(q) and not _mentions_scheme(q):
+        return True
+    # "pick any scheme and explain" — its answer depends on what THIS
+    # conversation has already covered, so it must never be served from the
+    # shared response cache (which skips follow-ups).
+    if _is_scheme_pick_request(q):
+        return True
+    # A recommendation may draw the user's profile from earlier turns, and a
+    # "why did you choose X?" is about the previous answer — both depend on
+    # this conversation, so neither may be served from the shared cache.
+    if _WHY_CHOICE.search(q) or _is_recommendation_request(q):
+        return True
     if _FOLLOWUP_LEAD.search(q):
         return True
     # A question that names its own scheme outright is self-anchoring, same as
@@ -222,6 +293,16 @@ def looks_like_followup(question: str) -> bool:
     # scheme in full. _mentions_scheme covers all four schemes without having
     # to keep two scheme-name lists in sync.
     if _mentions_scheme(q):
+        return False
+    # "is there any producer group named Sakania PG?" — a NAME LOOKUP is
+    # self-contained: a group name identifies the group statewide. The "there"
+    # of "is there" tripped _FOLLOWUP_PRONOUN, the rewrite glued on the previous
+    # turn's place ("...named Sakania PG in Betasing block"), and the lookup
+    # answered a false "no such group" for a group that exists in East Khasi
+    # Hills (reported live 2026-09-25). Only an explicit pointer back ("in that
+    # block", "...named X there?") keeps it a follow-up.
+    if (_PG_NAMED_ENTITY.search(q) or _GROUP_NAME_LOOKUP.search(q)) \
+            and not _NAME_LOOKUP_BACKREF.search(q):
         return False
     if _FOLLOWUP_PRONOUN.search(q) and not _STANDALONE_ANCHOR.search(q):
         return True
@@ -242,7 +323,11 @@ def _scheme_swap_rewrite(prev_question: str, followup: str) -> "str | None":
         return None
     target = next((name for name, pat in _SCHEME_NAME_PATTERN.items()
                    if pat.search(followup)), None)
-    if not target or not prev_question:
+    # A bare "focus" names neither Focus scheme: carry the word itself into the
+    # question, so the "which Focus?" pause (_is_ambiguous_focus) asks rather
+    # than this rewrite guessing one.
+    label = target or ("Focus" if _BARE_FOCUS_WORD.search(followup or "") else None)
+    if not label or not prev_question:
         return None
     out = prev_question
     replaced = False
@@ -250,14 +335,59 @@ def _scheme_swap_rewrite(prev_question: str, followup: str) -> "str | None":
         if name == target:
             continue
         if pat.search(out):
-            out = pat.sub(target, out)
+            out = pat.sub(label, out)
             replaced = True
     if not replaced:
-        if _SCHEME_NAME_PATTERN[target].search(out):
+        if target and _SCHEME_NAME_PATTERN[target].search(out):
             return out  # previous question was already about the target scheme
-        out = f"{out.rstrip(' ?.')} for {target}"
+        out = f"{out.rstrip(' ?.')} for {label}"
     out = re.sub(r"\s+,", ",", out).strip()
     logger.info("follow-up scheme-swap: %r + %r -> %r", prev_question, followup, out)
+    return out
+
+
+def _rest_of_schemes_rewrite(prev: "object", followup: str) -> "str | None":
+    """Deterministic rewrite for "same for the remaining / other / all schemes":
+    the previous question with its scheme replaced by the list of schemes it
+    asks about. None when the follow-up is not that shape, names a scheme
+    itself, or the previous question named no scheme to swap out.
+
+    On a KNOWLEDGE antecedent, schemes that share one knowledge base
+    (rag.kb_scheme — CM Elevate and CM Elevate Legacy) count once: after a CM
+    Elevate "how to apply", CM Elevate Legacy is not a "remaining" scheme with
+    different material, and listing it would repeat the same answer."""
+    f = (followup or "").strip()
+    if not f or len(f.split()) > 12 or _mentions_scheme(f):
+        return None
+    rest = bool(_REST_OF_SCHEMES.search(f))
+    every = not rest and bool(_ALL_SCHEMES_FOLLOWUP.search(f))
+    if not (rest or every):
+        return None
+    prev_q = getattr(prev, "question", "") or ""
+    prev_named = [s for s, pat in _SCHEME_NAME_PATTERN.items() if pat.search(prev_q)]
+    if not prev_named:
+        return None
+    knowledge = getattr(prev, "route", "") == "knowledge"
+    key = rag.kb_scheme if knowledge else (lambda s: s)
+    done = {key(s) for s in prev_named} if rest else set()
+    targets: list[str] = []
+    for s in SCHEME_CATALOG:
+        if key(s) in done:
+            continue
+        done.add(key(s))
+        targets.append(s)
+    if not targets:
+        return None
+    names = targets[0] if len(targets) == 1 else ", ".join(targets[:-1]) + " and " + targets[-1]
+    # Mark every old scheme mention first, then put the list in at the first
+    # mark only — substituting the list directly would let a later pattern
+    # match a name INSIDE the list just inserted ("CM Elevate") and delete it.
+    out = prev_q
+    for s in prev_named:
+        out = _SCHEME_NAME_PATTERN[s].sub("\x00", out)
+    out = out.replace("\x00", names, 1).replace("\x00", "")
+    out = re.sub(r"\s+([,?.])", r"\1", re.sub(r"\s{2,}", " ", out)).strip()
+    logger.info("follow-up rest-of-schemes: %r + %r -> %r", prev_q, followup, out)
     return out
 
 
@@ -274,6 +404,9 @@ async def rewrite_followup(question: str, prev: "object", extra_context: str = "
     every existing caller is unaffected."""
     if not settings.FOLLOWUP_REWRITE_ENABLED or prev is None:
         return question
+    rest = _rest_of_schemes_rewrite(prev, question)
+    if rest:
+        return rest
     swap = _scheme_swap_rewrite(getattr(prev, "question", "") or "", question)
     if swap:
         return swap
@@ -392,7 +525,34 @@ _SCHEME_NAME_PATTERN = {
     "MGNREGA": re.compile(r"\bmgnrega\b|\bmnrega\b|\bnrega\b", re.IGNORECASE),
     "PMAY-G": re.compile(r"\bpmay[\s-]?g?\b|\bawa+s?\b", re.IGNORECASE),
     "Focus Plus": re.compile(r"\bfocus[\s-]?plus\b|\bfocus\s*\+|\bfocusplus\b", re.IGNORECASE),
-    "CM Elevate": re.compile(r"\bcm[\s-]?elevate\b|\bcmelevate\b", re.IGNORECASE),
+    # The lookarounds keep "CM Elevate Legacy" / "CM Elevate Disbursement" /
+    # "Legacy CM Elevate" from ALSO reading as the applications dataset — that is
+    # the other scheme below, and matching both turned a single-scheme question
+    # into a two-scheme comparison.
+    "CM Elevate": re.compile(
+        r"(?<!legacy )(?<!legacy-)\bcm[\s-]?elevate\b(?![\s-]*(?:legacy|disbursements?)\b)|"
+        r"(?<!legacy )(?<!legacy-)\bcmelevate\b(?![\s-]*(?:legacy|disbursements?)\b)",
+        re.IGNORECASE),
+    # CM Elevate Legacy is the SANCTION-AND-DISBURSEMENT dataset (DB name: CM
+    # Elevate Disbursement), NOT the CM Elevate applications dataset. The two share
+    # the name and no key (cmelevatelegacy_entity_resolver.yaml
+    # scheme.disambiguation). Only a qualified form names it here; a bare "CM
+    # Elevate" that carries money / year / lender vocabulary is re-pointed to it
+    # by _pin_cm_elevate_dataset() before routing.
+    "CM Elevate Legacy": re.compile(
+        r"\bcm[\s-]?elevate[\s-]*(?:legacy|disbursements?)\b|"
+        r"\bcmelevate[\s-]*(?:legacy|disbursements?)\b|"
+        r"\blegacy[\s-]+cm[\s-]?elevate\b|\belevate[\s-]?legacy\b",
+        re.IGNORECASE),
+    # Focus Legacy is the producer-group scheme, NOT Focus Plus. The two share the
+    # word "Focus" and nothing else (no shared key; Focus Plus holds no
+    # producer-group column at all — focuslegacy_entity_resolver.yaml
+    # scheme.disambiguation). Both patterns demand a qualifier, so a BARE "focus"
+    # matches neither and falls through to the "which Focus?" ask below.
+    "Focus Legacy": re.compile(
+        r"\bfocus[\s-]?legacy\b|\bfocuslegacy\b|\blegacy[\s-]?focus\b|"
+        r"\bold[\s-]?focus\b|\bfocus[\s-]?pg\b|\bpg[\s-]?focus\b",
+        re.IGNORECASE),
 }
 # Fuzzy fallback for a scheme name the exact regex above misses because it's
 # misspelled ("manrega", "pamay") — mirrors the RapidFuzz tolerance
@@ -402,13 +562,16 @@ _SCHEME_NAME_PATTERN = {
 _SCHEME_FUZZY_ALIASES = {
     "MGNREGA": ["mgnrega", "mnrega", "nrega"],
     "PMAY-G": ["pmay", "pmayg", "awaas", "awas"],
-    # "focus" alone, not just "focusplus" — a typo of the short form ("facus",
-    # "focas", "fokus") is 5 chars against a 9-char target and never clears
-    # the 80% ratio bar without it (fuzz.ratio("facus","focusplus") == 57 vs
-    # fuzz.ratio("facus","focus") == 80), so "what facus+" fell through to the
-    # generic capability blurb instead of routing to Focus Plus.
-    "Focus Plus": ["focus", "focusplus"],
+    # NOTE: the bare "focus" alias used to live here, so a typo of the short form
+    # ("facus", "fokus") still routed to Focus Plus. It was REMOVED when Focus
+    # Legacy landed: with two live Focus schemes a bare or misspelled "focus"
+    # identifies neither, and guessing Focus Plus would answer a producer-group
+    # question from a partition that holds no producer groups at all. Such a
+    # question now reaches _focus_ambiguity_clarification() instead.
+    "Focus Plus": ["focusplus"],
     "CM Elevate": ["cmelevate"],
+    "Focus Legacy": ["focuslegacy"],
+    "CM Elevate Legacy": ["cmelevatelegacy"],
 }
 _FUZZY_SCHEME_ACCEPT = 80
 
@@ -427,6 +590,7 @@ def _fuzzy_named_schemes(question: str) -> list[str]:
 _SCHEME_CANONICAL_SPELLING = {
     "MGNREGA": "MGNREGA", "PMAY-G": "PMAY-G",
     "Focus Plus": "Focus Plus", "CM Elevate": "CM Elevate",
+    "Focus Legacy": "Focus Legacy", "CM Elevate Legacy": "CM Elevate Legacy",
 }
 
 
@@ -451,6 +615,11 @@ def _correct_scheme_spelling(question: str) -> str:
     # into "CM CM Elevate" (and worse on a second pass, e.g. a resumed
     # clarification chip, into "CM CM CM Elevate").
     _already_named = {s for s, pat in _SCHEME_NAME_PATTERN.items() if pat.search(question)}
+    # "CM Elevate Legacy" already contains the "CM Elevate" words, but the CM
+    # Elevate pattern deliberately does not match it — so without this the lone
+    # word "Elevate" would be "corrected" into "CM CM Elevate Legacy".
+    if "CM Elevate Legacy" in _already_named:
+        _already_named.add("CM Elevate")
 
     def _sub(m: "re.Match") -> str:
         word = m.group(0)
@@ -545,7 +714,10 @@ _PMAY_ONLY_TERMS = re.compile(
 _FOCUSPLUS_ONLY_TERMS = re.compile(
     r"\bfocus[\s-]?plus\b|\bfocus\s*\+|\bfocusplus\b|"
     r"\btranche?s?\b|"
-    r"\bproducer group\b|\bproducer-group\b|\bproducer groups\b|"
+    # "producer group" is NOT here — see _FOCUSLEGACY_ONLY_TERMS. It belongs to
+    # Focus Legacy, whose grain IS the producer group; Focus Plus holds no such
+    # column and focusplus_classification_rules.yaml refuses the question
+    # outright (condition producer_group_requested).
     r"\bmeghalayaone\b|\bmbda\b|\bmeghalaya basin development\b|"
     r"\bfocus\+?\s*card\b|\b93k\b|\b12\.5k\b",
     re.IGNORECASE,
@@ -556,7 +728,8 @@ _FOCUSPLUS_ONLY_TERMS = re.compile(
 # out — they read as generic status words, so an unnamed question using only
 # those still asks "which scheme?".
 _CMELEVATE_ONLY_TERMS = re.compile(
-    r"\bcm[\s-]?elevate\b|\bcmelevate\b|"
+    r"\bcm[\s-]?elevate\b(?![\s-]*(?:legacy|disbursements?)\b)|"
+    r"\bcmelevate\b(?![\s-]*(?:legacy|disbursements?)\b)|"
     r"\bpiggery\b|\bpoultry\b|\bgoat farming\b|\bwarehouse scheme\b|"
     r"\bsericulture\b|\bmotorcaravan\b|\bagro tourism villa\b|"
     r"\bprime small enterprise\b|\bprime tourism vehicle\b|"
@@ -580,6 +753,116 @@ _CMELEVATE_ONLY_TERMS = re.compile(
 )
 
 
+# Focus Legacy is the legacy producer-group disbursement programme. Its grain IS
+# the producer group, so producer-group vocabulary belongs here and nowhere else
+# (Focus Plus has no such column at all). "pg"/"pgs" are claimed as whole words —
+# the resolver's own disambiguation rule names them as forcing the Focus Legacy
+# reading — but "member"/"disbursement"/"payment"/"amount" are deliberately left
+# out: they are shared vocabulary, so an unnamed question using only those still
+# asks "which scheme?".
+_FOCUSLEGACY_ONLY_TERMS = re.compile(
+    r"\bfocus[\s-]?legacy\b|\bfocuslegacy\b|\blegacy[\s-]?focus\b|\bold[\s-]?focus\b|"
+    r"\bproducer[\s-]?groups?\b|\bpgs?\b|\bpg[\s-]?ids?\b|"
+    r"\bpg[\s-]?members?\b|\bpg[\s-]?names?\b|\bpg[\s-]?scheme\b|"
+    r"\bpg[\s-]?focus\b|\bpg[\s-]?lamp\b|\bpg[\s-]?existing\b|"
+    r"\bfocus[\s-]?\(?addnl\)?\b|\bfocus additional\b|"
+    r"\blamp societ(?:y|ies)\b",
+    re.IGNORECASE,
+)
+
+
+# ── The two CM Elevate datasets ─────────────────────────────────────────────
+# "CM Elevate" names TWO schemes that share nothing but the name
+# (cmelevatelegacy_entity_resolver.yaml scheme.disambiguation):
+#   * CM Elevate        — 15-scheme APPLICATIONS (curated.v_cm_elevate): status,
+#                         on hold, verification, applicant type, gender. No money,
+#                         no dates.
+#   * CM Elevate Legacy — 13-scheme SANCTION-AND-DISBURSEMENT records
+#                         (curated.v_cm_elevate_disbursement): sanctioned amount,
+#                         subsidy / loan / total disbursed, lender, financial year.
+# The resolver's rule: a bare "CM Elevate" is settled by a field that exists in
+# only one of them. Money, a financial year, a lender or a desanction exist only
+# in Legacy, so they pin it there — answering them from the applications data
+# could only ever refuse. Application-workflow words pin the other one. With
+# neither, the bare name keeps its long-standing meaning (the applications data).
+#
+# Words that name CM Elevate Legacy on their own, with no "CM Elevate" at all.
+_CMELEVATELEGACY_ONLY_TERMS = re.compile(
+    r"\bcm[\s-]?elevate[\s-]*(?:legacy|disbursements?)\b|"
+    r"\bcmelevate[\s-]*(?:legacy|disbursements?)\b|"
+    r"\blegacy[\s-]+cm[\s-]?elevate\b|\belevate[\s-]?legacy\b|"
+    r"\blifcom\b|\bloan[\s-]?entit(?:y|ies)\b|\blenders?\b|"
+    r"\bdesanction\w*|\bde-sanction\w*|\bbank[\s-]?sanctioned\b|"
+    r"\bcommon facility cent(?:er|re)\b",
+    re.IGNORECASE,
+)
+# Vocabulary only the sanction-and-disbursement dataset can answer. Consulted
+# ONLY once a question is already a CM Elevate question (named, or via a
+# sub-scheme word such as "piggery"), so generic money words are safe here.
+_CMELEVATELEGACY_FORCING = re.compile(
+    r"\bdisburs\w*|\bsanction\w*|\bsubsid(?:y|ies)\b|\bloans?\b|\bgrants?\b|"
+    r"\bamounts?\b|\bmoney\b|\bfunds?\b|\brupees?\b|\bcrores?\b|\blakhs?\b|\brs\.?\s*\d|"
+    r"\bpaid\b|\bpayments?\b|\breleased\b|\bentitlement\b|\butili[sz]ation\b|"
+    # NOT a bare "pending": in the applications data "pending" means on hold
+    # (data_verified = 'On Hold'). Only the money reading forces Legacy.
+    r"\binstal{1,2}ments?\b|\btranch\w*|\bpending\s+(?:amount|money|disburs\w*)|"
+    r"\bpending\s+to\s+be\s+(?:paid|disbursed|released)\b|\byet\s+to\s+be\s+(?:paid|disbursed)\b|"
+    r"\brefused\b|\brefusals?\b|\bduplicates?\b|\bdesanction\w*|"
+    r"\blifcom\b|\blenders?\b|\bloan[\s-]?entit(?:y|ies)\b|"
+    r"\bfinancial\s+years?\b|\bfy\s*\d{2}|\b20\d\d\s*[-/]\s*\d{2,4}\b|\byear[\s-]?wise\b",
+    re.IGNORECASE,
+)
+# Vocabulary only the APPLICATIONS dataset holds. Any of these keeps a bare
+# "CM Elevate" on that dataset even when a money word is also present.
+_CMELEVATE_APPLICATIONS_ONLY = re.compile(
+    r"\bon[\s-]?hold\b|\bverif\w*|\bdata[\s_-]?verified\b|\bwithdraw\w*|"
+    r"\bapplicant[\s_-]?categor\w*|\bapplication[\s_-]?mode\b|\bonline\b|"
+    r"\bcm\s*connect\w*|\bcurrent[\s_-]?level\b|\bfile[\s_-]?status\b|"
+    r"\bapplication[\s_-]?status\b|\bstatus[\s-]?wise\b|\brequest[\s_-]?ids?\b|"
+    r"\bgender\b|\bsector\b|\bregistered\b|\bunregistered\b|\bprime small enterprise\b|"
+    r"\bseed\b|\bgreen taxi\b|\bcinema\b|\bagro tourism villa\b",
+    re.IGNORECASE,
+)
+
+
+def _prefers_cm_elevate_legacy(question: str) -> bool:
+    """A CM Elevate question whose vocabulary only the sanction-and-disbursement
+    dataset can answer (and none that only the applications dataset holds)."""
+    q = question or ""
+    if _CMELEVATE_APPLICATIONS_ONLY.search(q):
+        return False
+    return bool(_CMELEVATELEGACY_FORCING.search(q) or _CMELEVATELEGACY_ONLY_TERMS.search(q))
+
+
+def _pin_cm_elevate_dataset(question: str) -> str:
+    """Re-point a bare "CM Elevate" at CM Elevate Legacy when the question asks
+    for something only that dataset holds ("total amount disbursed under CM
+    Elevate", "CM Elevate loans by lender", "CM-ELEVATE records in FY 2024-25").
+
+    Done ONCE, on the question text, before routing — the same way a misspelled
+    scheme name is corrected — so every later pattern check (scheme shortcut,
+    clarification gates, follow-ups, the chips) sees one consistent scheme
+    instead of each re-deciding. The rewritten question is returned to the user
+    as `rewritten_question`, so the reading is visible, not silent."""
+    q = question or ""
+    if not q or _SCHEME_NAME_PATTERN["CM Elevate Legacy"].search(q):
+        return q
+    if not _SCHEME_NAME_PATTERN["CM Elevate"].search(q):
+        return q
+    if not _prefers_cm_elevate_legacy(q):
+        return q
+    out = _SCHEME_NAME_PATTERN["CM Elevate"].sub("CM Elevate Legacy", q)
+    logger.info("CM Elevate dataset pinned to Legacy: %r -> %r", q, out)
+    return out
+
+
+def _unpin_cm_elevate(question: str) -> str:
+    """Undo _pin_cm_elevate_dataset. The pin only ever writes "CM Elevate
+    Legacy" into a question that named no Legacy form itself, so every
+    occurrence came from the pin and reverts cleanly."""
+    return re.sub(r"\bCM Elevate Legacy\b", "CM Elevate", question or "")
+
+
 def _infer_scheme_from_terms(question: str) -> list[str] | None:
     """A single scheme implied by scheme-specific vocabulary, or None if the
     question could plausibly mean more than one."""
@@ -589,8 +872,19 @@ def _infer_scheme_from_terms(question: str) -> list[str] | None:
             ("PMAY-G", _PMAY_ONLY_TERMS),
             ("Focus Plus", _FOCUSPLUS_ONLY_TERMS),
             ("CM Elevate", _CMELEVATE_ONLY_TERMS),
+            ("Focus Legacy", _FOCUSLEGACY_ONLY_TERMS),
+            ("CM Elevate Legacy", _CMELEVATELEGACY_ONLY_TERMS),
         ) if rx.search(question)
     ]
+    # A CM Elevate sub-scheme word ("piggery", "dairy") belongs to BOTH CM
+    # Elevate datasets. When the rest of the question asks for money, a year or
+    # a lender, only CM Elevate Legacy can answer it — settle on that one rather
+    # than reading the pair as ambiguous (or sending a money question to the
+    # dataset that has no money column).
+    if "CM Elevate" in hits and _prefers_cm_elevate_legacy(question):
+        hits = [h for h in hits if h != "CM Elevate"]
+        if "CM Elevate Legacy" not in hits:
+            hits.append("CM Elevate Legacy")
     return hits if len(hits) == 1 else None
 
 
@@ -627,14 +921,75 @@ def _scheme_clarification(question: str) -> "ClarificationNeeded":
          "question": _scheme_option_question(stem, "Focus Plus")},
         {"label": "CM Elevate (livelihood / enterprise schemes)",
          "question": _scheme_option_question(stem, "CM Elevate")},
+        {"label": "Focus Legacy (producer group payments)",
+         "question": _scheme_option_question(stem, "Focus Legacy")},
+        {"label": "CM Elevate Legacy (sanctions & disbursements)",
+         "question": _scheme_option_question(stem, "CM Elevate Legacy")},
         {"label": "Compare across schemes",
-         "question": f"{stem} across MGNREGA, PMAY-G, Focus Plus and CM Elevate"},
+         "question": (f"{stem} across MGNREGA, PMAY-G, Focus Plus, CM Elevate, "
+                      f"Focus Legacy and CM Elevate Legacy")},
     ]
     return ClarificationNeeded(
-        "Which scheme does your question concern — MGNREGA, PMAY-G, Focus Plus, or "
-        "CM Elevate? Please select one, or choose to compare across schemes.",
+        "Which scheme does your question concern — MGNREGA, PMAY-G, Focus Plus, "
+        "CM Elevate, Focus Legacy, or CM Elevate Legacy? Please select one, or choose "
+        "to compare across schemes.",
         options=options,
         rule="scheme-not-specified",
+    )
+
+
+# ── "Focus" alone: which of the TWO Focus schemes? ──────────────────────────
+# Two live schemes answer to the word "Focus" and they share NOTHING but the name:
+# Focus Legacy pays PRODUCER GROUPS (Rs 5,000 per member), Focus Plus pays
+# INDIVIDUAL BENEFICIARIES, there is no key between them, and Focus Plus holds no
+# producer-group column at all. focuslegacy_entity_resolver.yaml's own
+# scheme.disambiguation rule is explicit that a bare "Focus" with no forcing word
+# must be ASKED, not guessed — guessing answers a producer-group question from a
+# partition that cannot answer it (or vice versa) and reads as authoritative.
+#
+# This is a TWO-way ask, not the generic five-way one: the user has already told
+# us it's a Focus question, so re-offering MGNREGA / PMAY-G / CM Elevate would
+# throw that away.
+_BARE_FOCUS_WORD = re.compile(r"\bfocus\b", re.IGNORECASE)
+
+
+def _is_ambiguous_focus(question: str) -> bool:
+    """The question says "Focus" but nothing that pins WHICH Focus scheme."""
+    q = question or ""
+    if not _BARE_FOCUS_WORD.search(q):
+        return False
+    # Either scheme named outright (or by its own qualified alias) — settled.
+    if _SCHEME_NAME_PATTERN["Focus Plus"].search(q):
+        return False
+    if _SCHEME_NAME_PATTERN["Focus Legacy"].search(q):
+        return False
+    # A forcing word from either side's own vocabulary — also settled.
+    if _FOCUSLEGACY_ONLY_TERMS.search(q) or _FOCUSPLUS_ONLY_TERMS.search(q):
+        return False
+    return True
+
+
+def _focus_ambiguity_clarification(question: str) -> "ClarificationNeeded":
+    stem = question.strip().rstrip(" ?.")
+    # Replace the bare "Focus" in place rather than appending, so the resumed
+    # question reads naturally and re-resolves cleanly on the next turn
+    # ("total focus disbursement" -> "total Focus Legacy disbursement").
+    def _swap(name: str) -> str:
+        swapped = _BARE_FOCUS_WORD.sub(name, stem, count=1)
+        return swapped if swapped != stem else f"{stem} for {name}"
+
+    return ClarificationNeeded(
+        "Two different schemes are called Focus, and they hold different things — "
+        "Focus Legacy pays PRODUCER GROUPS (one payment per group, Rs 5,000 per "
+        "member), while Focus Plus pays INDIVIDUAL farmers directly. Which one do "
+        "you mean?",
+        options=[
+            {"label": "Focus Legacy (producer group payments)",
+             "question": _swap("Focus Legacy")},
+            {"label": "Focus Plus (individual farmer cash benefit)",
+             "question": _swap("Focus Plus")},
+        ],
+        rule="focus-scheme-ambiguous",
     )
 
 
@@ -670,6 +1025,507 @@ def _cm_scheme_group_clarification(question: str, group: dict) -> "Clarification
     )
 
 
+# ── CM Elevate Legacy: "Sericulture" — spinning, weaving, or both? ──────────
+# Sericulture is TWO stored schemes whose names differ by one space before the
+# bracket, and an exact match on the wrong spelling returns zero rows silently
+# (cmelevatelegacy_classification_rules.yaml sericulture_spelling_ambiguous; the
+# prompt-layer bank's clarification K03). A bare "sericulture" is asked, never
+# guessed; "both" is taken at its word.
+_CM_LEGACY_SERICULTURE = ("Meghalaya Sericulture & Weaving Scheme (spinning)",
+                          "Meghalaya Sericulture & Weaving Scheme(weaving)")
+_SERICULTURE_WORD = re.compile(r"\bsericulture\b|\bsilk\b", re.IGNORECASE)
+_SERICULTURE_SIDE = re.compile(r"\bspinning\b|\bweaving\b|\bhandloom\b", re.IGNORECASE)
+_SERICULTURE_BOTH = re.compile(
+    r"\bboth\b|\ball\s+(?:the\s+)?sericulture\b|\bsericulture\s+schemes\b|"
+    r"\b(?:together|combined|separately)\b",
+    re.IGNORECASE)
+
+
+def _cm_legacy_sericulture_choice(question: str) -> "list[str] | str | None":
+    """Both Sericulture literals when the question asks for both, "ask" when it
+    names Sericulture without saying which, else None (resolve normally)."""
+    q = question or ""
+    if not _SERICULTURE_WORD.search(q) or _SERICULTURE_SIDE.search(q):
+        return None
+    if _SERICULTURE_BOTH.search(q):
+        return list(_CM_LEGACY_SERICULTURE)
+    return "ask"
+
+
+def _cm_legacy_sericulture_clarification(question: str) -> "ClarificationNeeded":
+    stem = question.strip().rstrip(" ?.")
+
+    def _swap(repl: str) -> str:
+        new = _SERICULTURE_WORD.sub(repl, stem, count=1)
+        return new if new != stem else f"{stem} — {repl}"
+
+    return ClarificationNeeded(
+        "Sericulture is recorded as two separate schemes — spinning and weaving. "
+        "Which did you mean, or both?",
+        options=[
+            {"label": "Spinning", "question": _swap("Sericulture spinning")},
+            {"label": "Weaving", "question": _swap("Sericulture weaving")},
+            {"label": "Both, shown separately",
+             "question": _swap("both Sericulture schemes (spinning and weaving)")},
+        ],
+        rule="sericulture-spelling-ambiguous",
+    )
+
+
+# ── CM Elevate Legacy: questions the data cannot answer ─────────────────────
+# Each pattern is a refusal class from the prompt-layer bank (refusal_code),
+# worded by the bank's own reviewed text via annotations.refusal_reason. Checked
+# deterministically before SQL generation: the generator can only emit a SELECT,
+# so left to it these came back as an improvised figure or a bare "not
+# available" with no reason. The patterns are deliberately narrow — the bank's
+# re-verification found four over-broad refusal triggers (a relative "who", the
+# word "individual", "overview", "focus") and each is avoided here.
+_CM_LEGACY_NOT_HELD = (
+    # SANCTION_RATE, NOT_SANCTIONED and CONSTITUENCY used to be refused here.
+    # All three are answerable from the view (2026-09-25 use-case QA): the rate is
+    # COUNT(sanctioned_amount) / COUNT(*) with a caveat about the separate
+    # applications dataset, "not sanctioned" is the records with no sanctioned
+    # amount, and constituency comes through the dim_geography join. The few-shot
+    # bank (X01 / X02 / X07 / X08) teaches the SQL instead.
+    ("APPLICANT_NAME", re.compile(
+        r"^\W*(?:who|whose)\b|"
+        r"\bwho\s+(?:got|received|has|had|took)\s+the\s+(?:most|maximum|highest|largest|biggest)\b|"
+        r"\bnames?\s+of\s+(?:the\s+)?(?:\w+\s+)?(?:beneficiar\w*|applicants?|recipients?|"
+        r"people|persons?|entrepreneurs?)\b|"
+        r"\b(?:beneficiary|applicant)\s+names?\b|\bname\s+list\b",
+        re.IGNORECASE)),
+    ("MONTHLY", re.compile(
+        r"\bmonth[\s-]?wise\b|\bmonthly\b|\bby\s+month\b|\bper\s+month\b|\beach\s+month\b|"
+        r"\bquarter(?:ly|[\s-]?wise)?\b",
+        re.IGNORECASE)),
+    ("APPLICANT_TYPE", re.compile(
+        r"\bindividuals?\s+(?:vs\.?|versus|or|and)\s+groups?\b|\bgroup\s+applicants?\b|"
+        r"\bshgs?\b|\bself[\s-]?help\s+groups?\b|\b(?:un)?registered\s+groups?\b|"
+        r"\bapplicant\s+type\b",
+        re.IGNORECASE)),
+    ("REPAYMENT", re.compile(r"\brepa(?:id|y|ying|yments?)\b|\bloan\s+recovery\b|"
+                             r"\bdefault(?:ed|ers?)\b", re.IGNORECASE)),
+    ("DEMOGRAPHICS", re.compile(
+        r"\bwom[ae]n\b|\bfemale\b|\bmale\b|\bgender\b|\bcaste\b|\bsc\s*/?\s*st\b|"
+        r"\bscheduled\s+(?:caste|tribe)s?\b|\bage[\s-]?(?:group|wise)\b|\bminorit(?:y|ies)\b",
+        re.IGNORECASE)),
+    ("BANK_SANCTIONED_SHARE", re.compile(
+        r"\bbank[\s-]?sanctioned\b|\bbank(?:'s)?\s+(?:share|contribution)\b|"
+        r"\bdid\s+the\s+bank\s+contribute\b",
+        re.IGNORECASE)),
+    ("TARGETS", re.compile(r"\btargets?\b|\bbudget(?:ed|s)?\b|\ballocations?\b",
+                           re.IGNORECASE)),
+    ("BUSINESS_OUTCOME", re.compile(
+        r"\bjobs?\s+(?:were\s+)?(?:created|generated)\b|\bemployment\s+(?:created|generated)\b|"
+        r"\bturnover\b|\bventures?\s+surviv\w*|\bbusiness\s+outcomes?\b",
+        re.IGNORECASE)),
+    ("LINK_APPLICATIONS", re.compile(
+        r"\bapplications?\s+behind\b|\blink\w*\s+(?:to|with)\s+(?:the\s+)?applications?\b|"
+        r"\bmatch\w*\s+(?:to|with)\s+(?:the\s+)?applications?\b",
+        re.IGNORECASE)),
+)
+
+
+def _cm_legacy_not_held(question: str) -> "ClarificationNeeded | None":
+    """A not-held explanation for a CM Elevate Legacy question the data cannot
+    answer, or None when it can be answered."""
+    for code, rx in _CM_LEGACY_NOT_HELD:
+        if not rx.search(question or ""):
+            continue
+        reason = annotations.refusal_reason("CM Elevate Legacy", code)
+        if not reason:
+            continue
+        main, _, offer = reason.partition("Offer instead:")
+        text = main.strip()
+        if offer.strip():
+            text += " What I can offer instead: " + offer.strip()
+        logger.info("CM Elevate Legacy not-held (%s): %r", code, question)
+        return ClarificationNeeded(text, rule="column-not-held")
+    return None
+
+
+# ── CM Elevate Legacy: caveats that travel with the numbers ─────────────────
+# The prompt layer routes its unit / year / village / refusal caveats by CODE,
+# not by asking the model to remember them — each is triggered here by what the
+# executed SQL actually did, so a caveat appears exactly when its number does.
+_CM_LEGACY_MONEY_RE = re.compile(
+    r"\b(?:total_disbursement|total_subsidy_disbursement|total_loan_disbursement|"
+    r"sanctioned_amount)\b", re.IGNORECASE)
+_CM_LEGACY_YEAR_FILTER_RE = re.compile(
+    r"\bfinancial_year(?:_short)?\s*(?:=|IN)\s*\(?\s*'|\byear_key\s*(?:=|IN)\s*\(?\s*\d",
+    re.IGNORECASE)
+_CM_LEGACY_YEAR_GROUP_RE = re.compile(r"\bGROUP\s+BY\b[^;]*\bfinancial_year", re.IGNORECASE)
+
+
+def _cm_legacy_answer_notes(sql: str, rows: list[dict]) -> list[str]:
+    s = sql or ""
+    notes: list[str] = []
+    cols = {k for r in (rows or [])[:1] if isinstance(r, dict) for k in r}
+    if "1e7" in s or any(c.endswith("_cr") for c in cols):
+        notes.append(
+            "Columns ending in _cr are already in ₹ crore (divided by 1e7); columns ending "
+            "in _rupees are rupees. Write money as ₹<value> crore / ₹<value>, copying the "
+            "digits exactly.")
+    if re.search(r"\btotal_disbursement\b", s, re.IGNORECASE):
+        notes.append(
+            "Total disbursed means subsidy and loan together. If subsidy and loan columns "
+            "are also in the result, give all three; sanctioned is the amount approved, not "
+            "the amount paid.")
+    if _CM_LEGACY_MONEY_RE.search(s) and "desanctioned_reason_raw" not in s:
+        notes.append(
+            "Desanctioned records (Refused / Duplicate) are included in these money totals, "
+            "as they are in the source file's own totals.")
+    if _CM_LEGACY_YEAR_FILTER_RE.search(s):
+        notes.append(
+            "395 records (both Sericulture schemes) carry no financial year, so they are "
+            "outside any single-year figure — say so in one short clause.")
+    if _CM_LEGACY_YEAR_GROUP_RE.search(s):
+        notes.append(
+            "The '(no financial year)' row is the 395 Sericulture records, which carry no "
+            "year label — describe it that way, not as missing or erroneous data. Only two "
+            "financial years exist, so describe this as a comparison, not a trend.")
+    if len(rows or []) > 1 and any(c.endswith("_cr") for c in cols):
+        # Seen live (TC-36 district summary, 2026-09-25): the composer added up
+        # the per-district _cr figures and stated ₹81.09 / ₹29.24 / ₹51.88 crore
+        # against the true ₹81.10 / ₹29.23 / ₹51.87 — each row is rounded to 2
+        # decimals, so a sum of them drifts. Counts are exact and may be summed.
+        def _is_total(r: dict) -> bool:
+            return any(isinstance(v, str) and v.upper().startswith("ALL ") for v in r.values())
+        has_total_row = any(_is_total(r) for r in rows)
+        # Name the extremes here rather than leave them to the composer: with a
+        # trailing ALL row it took the row above it as "the lowest" (TC-36,
+        # North Garo Hills ₹2.60 Cr instead of East Jaintia Hills ₹2.36 Cr).
+        body = [r for r in rows if not _is_total(r)]
+        metric = "total_disbursed_cr" if "total_disbursed_cr" in cols else \
+            next((c for c in cols if c.endswith("_cr")), None)
+        ranked = [r for r in body if _as_number(r.get(metric)) is not None]
+        if metric and len(ranked) >= 2:
+            def _label(r: dict) -> str:
+                return " / ".join(str(v) for v in r.values()
+                                  if isinstance(v, str)) or "(unlabelled)"
+            hi = max(ranked, key=lambda r: _as_number(r[metric]))
+            lo = min(ranked, key=lambda r: _as_number(r[metric]))
+            notes.append(
+                f"By {metric}: highest is {_label(hi)} ({_fmt_num(_as_number(hi[metric]))}), "
+                f"lowest is {_label(lo)} ({_fmt_num(_as_number(lo[metric]))}). Use these exactly "
+                "when naming the top or bottom row.")
+        notes.append(
+            "Each _cr value is rounded to 2 decimals per row, so NEVER add them across rows "
+            "to state a combined money total — the sum drifts from the true figure. "
+            + (f"The row labelled 'ALL …' holds the exact totals: quote statewide figures from "
+               f"that row only. It is a TOTAL, not an area — the breakdown has exactly "
+               f"{len(rows) - 1} rows besides it, so say {len(rows) - 1}, never {len(rows)}. "
+               "Also name the top and bottom rows of the breakdown. "
+               if has_total_row else
+               "Describe the rows (highest, lowest, range); a combined money total may "
+               "only be quoted from an 'Exact combined totals' note. ")
+            + "Record counts are exact and may be summed.")
+    if "sanctioned_records" in cols:
+        notes.append(
+            "sanctioned_records is the number of SANCTIONED cases (records carrying a "
+            "sanctioned amount) — report it under that name, separately from records where "
+            "both appear; do not call records 'sanctioned'. It is a COUNT: when listing "
+            "rows, give every row's sanctioned_records value, never its _cr money value "
+            "in place of the count (TC-19: Motorcaravan 1 record was written as '0.50 crore').")
+    if "sanctioned_pct" in cols:
+        notes.append(
+            "sanctioned_pct is the share of records in THIS sanction-and-disbursement dataset "
+            "that carry a sanctioned amount. Give the percentage and the two counts, then say "
+            "in one clause that applications which never reached sanction sit in the separate "
+            "CM Elevate applications dataset, which cannot be linked to this one.")
+    if "not_sanctioned_records" in cols:
+        notes.append(
+            "not_sanctioned_records are records with no sanctioned amount. Desanctioned "
+            "(Refused / Duplicate) counts are sanctions withdrawn later — label them that way, "
+            "never add them to the not-sanctioned figure.")
+    if re.search(r"\bac_name\b", s, re.IGNORECASE):
+        notes.append(
+            "The constituency comes from the geography registry through each record's "
+            "village; records with no village carry no constituency. Say this in one short "
+            "clause, and call it the assembly constituency, not a block.")
+    if re.search(r"entity_type\s*<>\s*'Unresolved'", s, re.IGNORECASE):
+        notes.append(
+            "Records that could not be matched to a village are left out of village "
+            "figures (they still count in district and block totals); villages are counted "
+            "by LGD code.")
+    if re.search(r"\b(?:desanctioned_reason_raw|refused_flag_raw|refused_reason_text)\b",
+                 s, re.IGNORECASE):
+        notes.append(
+            "The desanction reason, the refusal flag and the written reason disagree — name "
+            "the field each figure comes from and present none of them as the "
+            "authoritative refusal count.")
+    return notes
+
+
+_CR_SUM_RE = re.compile(
+    r"ROUND\(\s*SUM\(\s*([\w.]+)\s*\)\s*/\s*1e7\s*,\s*2\s*\)\s+AS\s+(\w+_cr)\b", re.IGNORECASE)
+_FROM_TO_GROUP_RE = re.compile(r"\bFROM\b(.*?)\bGROUP\s+BY\b", re.IGNORECASE | re.DOTALL)
+
+
+async def _cm_legacy_exact_totals(sql: str, rows: list[dict]) -> list[str]:
+    """Exact combined money totals for a multi-row _cr breakdown with no ALL row.
+
+    Seen live (TC-27, 2026-09-25): the composer added up 12 rounded per-district
+    figures and wrote "sums to ₹82.89 crore" against the true ₹82.90 — the prose
+    rule not to sum rounded values did not hold. The total is re-queried from the
+    same FROM/WHERE with the GROUP BY removed, so the composer can quote it exactly.
+    Only the plain single-SELECT shape is handled; anything else returns no note."""
+    s = sql or ""
+    if len(rows or []) < 2 or re.search(r"\bROLLUP\b|\bWITH\b|\bHAVING\b", s, re.IGNORECASE):
+        return []
+    if any(isinstance(v, str) and v.upper().startswith("ALL ") for r in rows for v in r.values()):
+        return []
+    sums = _CR_SUM_RE.findall(s)
+    m = _FROM_TO_GROUP_RE.search(s)
+    if not sums or not m or re.search(r"\bSELECT\b", m.group(1), re.IGNORECASE):
+        return []
+    select = ", ".join(f"ROUND(SUM({expr}) / 1e7, 2) AS {alias}" for expr, alias in sums)
+    try:
+        got = await run_readonly(f"SELECT {select} FROM {m.group(1).strip()}")
+    except Exception:  # noqa: BLE001
+        logger.warning("CM Legacy exact-total query failed — no total note", exc_info=True)
+        return []
+    if not got:
+        return []
+    figures = ", ".join(f"{k} = {_fmt_num(_as_number(v))}" for k, v in got[0].items()
+                        if _as_number(v) is not None)
+    if not figures:
+        return []
+    return [f"Exact combined totals across every group (queried separately, not a sum of "
+            f"the rounded rows): {figures}. If you state a combined money total, use "
+            f"exactly these figures."]
+
+
+# Focus Legacy answer notes (use-case QA, 2026-09-25).
+#
+# TC-19 "Which Producer Groups received more than ₹1,00,000?": 541 groups
+# qualify, but the generator capped the list at LIMIT 10/100 and the answer named
+# 23 groups without ever saying how many qualify — it read as the complete list.
+# When a Focus Legacy list comes back exactly at its LIMIT, the true count is
+# re-queried from the same statement and the answer must lead with it.
+_FINAL_LIMIT_RE = re.compile(r"\s+LIMIT\s+(\d+)\s*;?\s*\Z", re.IGNORECASE)
+# TC-12 "Are there any duplicate Producer Groups?": the answer called the 2,655
+# groups paid more than once "duplicate producer groups". They are repeat
+# payments in later tranches; a duplicate RECORD would be the same group paid
+# twice on the same date, and there are none.
+_DUPLICATE_Q = re.compile(r"\bduplicat\w*|\brepeated\s+(?:producer\s+)?groups?\b|\bdoubles?\b",
+                          re.IGNORECASE)
+
+
+async def _focus_legacy_list_total(sql: str, rows: list[dict]) -> "tuple[int, str] | None":
+    """(true row count, subject) when a Focus Legacy list was cut off by its own
+    LIMIT, else None. The subject is "producer groups" for a pg_id-grained list."""
+    m = _FINAL_LIMIT_RE.search(sql or "")
+    if not m or len(rows or []) != int(m.group(1)) or len(rows) < 2:
+        return None
+    subject = "producer groups" if _FL_GROUP_GRAIN.search(sql) else "results"
+    for key in ("groups_qualifying", "total_matching", "total_groups"):
+        n = _as_number((rows[0] or {}).get(key))
+        if isinstance(n, (int, float)) and n > len(rows):
+            return int(n), subject
+    inner = (sql or "")[: m.start()].rstrip().rstrip(";")
+    try:
+        got = await run_readonly(f"SELECT COUNT(*) AS n FROM ({inner}) q")
+    except Exception:  # noqa: BLE001
+        logger.warning("Focus Legacy list-total query failed — no total note", exc_info=True)
+        return None
+    n = _as_number((got or [{}])[0].get("n"))
+    if not isinstance(n, (int, float)) or n <= len(rows):
+        return None
+    return int(n), subject
+
+
+def _focus_legacy_answer_notes(question: str) -> list[str]:
+    if not _DUPLICATE_Q.search(question or ""):
+        return []
+    return ["A producer group paid more than once is a REPEAT PAYMENT in a later tranche, NOT a "
+            "duplicate group — never call those groups duplicates. A duplicate RECORD would be the "
+            "same pg_id paid twice on the same date; report that count as the duplicates figure "
+            "(0 means there are no duplicates), and mention the repeat-paid groups separately as "
+            "legitimate repeat payments."]
+
+
+# ── Focus Legacy: "is there a PG named X?" / "how many members are there in X?" ──
+# Bulk QA of 290 sampled producer groups (2026-09-25) found the model-written SQL
+# unreliable for these two fixed-shape questions: 52 of 131 member-count answers
+# were wrong. When several groups share a name ("Chibasal" matches 73) it ended
+# the query in LIMIT 1 and reported one arbitrary group's size; it rewrote names
+# ("Chelchak Pineapple P.g" -> '%chelchak pineapple p.g.%', zero rows); and some
+# never reached the data at all. The answer is fully determined by the data, so
+# it is built here: match the name on its WORDS (ignoring "PG" / "Producer
+# Group" / punctuation, each word anchored at a word start), rank groups whose
+# whole name is exactly those words first, and when several groups match, list
+# them instead of guessing.
+_PG_STOP_WORDS = {"pg", "pgs", "p", "g", "producer", "producers", "group", "groups", "grp",
+                  "the", "shg", "named", "called"}
+_PG_SIZE_QUESTION = re.compile(
+    r"^\s*(?:how\s+many\s+(?:pg\s+)?members?\s+(?:are\s+(?:there\s+)?|were\s+(?:there\s+)?|is\s+there\s+)?"
+    r"(?:in|of)\s+|how\s+many\s+members\s+does\s+|"
+    r"what\s+is\s+the\s+(?:member\s+count|group\s+size|number\s+of\s+members)\s+(?:of|in|for)\s+)"
+    r"(?:the\s+)?(?:(?:producer\s+group|pg|group)\s+(?:named|called)\s+)?(?P<name>.+?)"
+    r"(?:\s+have)?\s*[?.!]*\s*$",
+    re.IGNORECASE)
+# Scope phrases a clarification chip appends ("... for Focus Legacy for all of
+# Meghalaya, all years") — not part of a group name.
+_PG_SCOPE_TAIL = re.compile(
+    r"\s*,?\s*(?:(?:for|in|under|across|within)\s+(?:the\s+)?(?:focus\s+legacy|focus|all\s+of\s+meghalaya|"
+    r"meghalaya|all\s+(?:the\s+)?(?:financial\s+)?years(?:\s+combined)?)|all\s+(?:financial\s+)?years"
+    r"(?:\s+combined)?|scheme)\s*[?.!]*\s*$",
+    re.IGNORECASE)
+_PG_PLACE_WORDS = re.compile(r"\b(?:district|block|village|constituency|state|meghalaya|hills)\b", re.IGNORECASE)
+_PG_SUFFIX_WORD = re.compile(r"\b(?:p\.?\s*g\.?|pgs?|producer\s+groups?)\b|\bgroup\b", re.IGNORECASE)
+
+
+def _pg_name_question(question: str) -> "tuple[str, str] | None":
+    """('exists' | 'size', typed name) for a group-name question, else None."""
+    q = (question or "").strip()
+    kind, name = None, None
+    m = _PG_SIZE_QUESTION.match(q)
+    if m:
+        kind, name = "size", m.group("name")
+    else:
+        m = _PG_NAMED_ENTITY.search(q)
+        if m and re.match(r"^\s*(?:is|are)\s+there\s+(?:any|a|an)\b", q, re.IGNORECASE):
+            tail = q[m.end("name"):]
+            rest = _PG_SCOPE_TAIL.sub("", tail).strip(" ?.!")
+            # "…named X in Betasing block" carries its own place: leave it to the
+            # full pipeline, which filters on that place.
+            if re.match(r"^\s*,?\s*(?:in|for|under|from|at|within|across|there)\b", rest, re.IGNORECASE):
+                return None
+            # Otherwise the name simply ran on — a comma inside it ("Ka Seng Ki
+            # Nongrep Jhur, Shkenpyrsit") or more words than the pattern takes.
+            kind, name = "exists", (m.group("name") + rest) if rest else m.group("name")
+    if not kind:
+        return None
+    prev = None
+    while prev != name:
+        prev, name = name, _PG_SCOPE_TAIL.sub("", name).strip(" ?.!,\"'“”")
+    if not name or _PG_PLACE_WORDS.search(name):
+        return None
+    # A bare district/block name is a place question ("members in Nongstoin"),
+    # unless the user marked it as a group.
+    if kind == "size" and not _PG_SUFFIX_WORD.search(name) \
+            and not re.search(r"\b(?:producer\s+group|pg)\s+(?:named|called)\b", q, re.IGNORECASE):
+        if name.lower() in _known_place_names():
+            return None
+    if not [t for t in re.findall(r"[a-z0-9]+", name.lower()) if t not in _PG_STOP_WORDS]:
+        return None
+    return kind, name
+
+
+def _pg_name_tokens(text: str) -> list[str]:
+    return [t for t in re.findall(r"[a-z0-9]+", (text or "").lower()) if t not in _PG_STOP_WORDS]
+
+
+async def _focus_legacy_pg_name_answer(question: str) -> "dict | None":
+    parsed = _pg_name_question(question)
+    if parsed is None:
+        return None
+    kind, name = parsed
+    toks = _pg_name_tokens(name)
+
+    def _sql(word_end: bool) -> str:
+        # tokens are [a-z0-9]+ only, so they are safe inside the regex literal
+        end = "\\M" if word_end else ""
+        where = " AND ".join(f"pg_name ~* '\\m{t}{end}'" for t in toks)
+        return ("SELECT pg_id, MAX(pg_name) AS pg_name, MAX(lgd_district) AS district, "
+                "MAX(lgd_block) AS block, MAX(no_of_pg_members) AS group_size, "
+                "MIN(no_of_pg_members) AS smallest_recorded_size, COUNT(*) AS payments, "
+                "SUM(amount_disbursed) AS amount_disbursed\n"
+                f"FROM curated.v_focus_legacy\nWHERE {where}\nGROUP BY pg_id\nORDER BY pg_id\nLIMIT 1000")
+
+    # Whole words first ("ma" must not match every "Mawlai…"); word prefixes only
+    # when nothing matches whole ("Bak15" typed for "Bak-15" still resolves).
+    sql = _sql(True)
+    rows = await run_readonly(sql)
+    if not rows:
+        sql = _sql(False)
+        rows = await run_readonly(sql)
+    exact = [r for r in rows if _pg_name_tokens(r.get("pg_name")) == toks]
+    ranked = exact + [r for r in rows if r not in exact]
+
+    def place(r):
+        bits = [f"{str(r['block']).title()} block" if r.get("block") else None,
+                str(r.get("district") or "").title() or None]
+        return ", ".join(b for b in bits if b)
+
+    def line(r):
+        return (f"- **{r['pg_name']}** ({r['pg_id']}) — {place(r)}: "
+                f"{r['group_size']} member{'s' if r['group_size'] != 1 else ''}")
+
+    single = exact[0] if len(exact) == 1 else (rows[0] if len(rows) == 1 else None)
+    if not rows:
+        answer = (f"No producer group named “{name}” was found in the Focus Legacy data "
+                  "(names are matched on their words, ignoring “PG” / “Producer Group”)."
+                  + (" So there is no member count to report." if kind == "size" else ""))
+    elif single is not None:
+        r = single
+        if kind == "size":
+            answer = f"**{r['pg_name']}** ({r['pg_id']}, {place(r)}) has **{r['group_size']} members**."
+            if r["smallest_recorded_size"] != r["group_size"]:
+                answer += (f" Its recorded size changed between its {r['payments']} payments "
+                           f"({r['smallest_recorded_size']} to {r['group_size']}); "
+                           f"{r['group_size']} is the largest recorded.")
+        else:
+            answer = (f"Yes — **{r['pg_name']}** ({r['pg_id']}) is a Focus Legacy producer group in "
+                      f"{place(r)}, with {r['group_size']} members and {r['payments']} "
+                      f"payment{'s' if r['payments'] != 1 else ''} totalling "
+                      f"₹{_fmt_num(_as_number(r['amount_disbursed']) or 0)}.")
+        if len(rows) > 1:
+            answer += (f" ({len(rows) - 1} other group{'s' if len(rows) > 2 else ''} have "
+                       f"“{name}” within a longer name.)")
+    else:
+        head = (f"Yes — {len(rows)} producer groups match “{name}”" if kind == "exists"
+                else f"{len(rows)} producer groups match “{name}”, so the member count depends on "
+                     "which one you mean")
+        if exact:
+            head += f" ({len(exact)} named exactly that)"
+        shown = ranked[:10]
+        answer = head + ":\n\n" + "\n".join(line(r) for r in shown)
+        if len(ranked) > len(shown):
+            answer += f"\n\n…and {len(ranked) - len(shown)} more in the table."
+        if kind == "size":
+            answer += "\n\nTell me the PG ID or the district to pin down one group."
+    logger.info("Focus Legacy PG-name %s question for %r: %d match(es), %d exact", kind, name,
+                len(rows), len(exact))
+    return {"route": "data", "intent": "DATA", "confidence": "high", "schemes": ["Focus Legacy"],
+            "resolved_entities": {}, "sql": sql, "sql_query": sql, "row_count": len(rows),
+            "rows": ranked[:20], "data": ranked, "answer": answer}
+
+
+def _cm_legacy_small_money_notes(rows: list[dict]) -> list[str]:
+    """A _cr value of 0.00 is a real amount under ₹0.5 lakh, not zero (TC-18:
+    Sericulture spinning ₹26,000 was written as "₹0.00 crore")."""
+    tiny = [r for r in rows or [] for k, v in r.items()
+            if k.endswith("_cr") and _as_number(v) == 0]
+    if not tiny:
+        return []
+    return ["A _cr value of 0.00 means under ₹0.01 crore (less than ₹1 lakh), not "
+            "nothing — write it as 'under ₹0.01 crore', never '₹0.00 crore'."]
+
+
+_CM_LEGACY_TRAILING_OFFER = re.compile(
+    r"\s*(?:Would you like|Shall I|Do you want)[^?]*\?\s*$", re.IGNORECASE)
+
+
+def _cm_legacy_style_block(question: str) -> str:
+    """Two worked answers from the bank as WORDING examples for the composer.
+    The trailing "Would you like…?" is dropped — the UI already offers next-step
+    chips, and a second offer in the text would duplicate them."""
+    shots = [a for a in annotations.answer_shots("CM Elevate Legacy", question, top_k=4)
+             if a.get("rows")][:2]
+    if not shots:
+        return ""
+    parts = []
+    for a in shots:
+        answer = _CM_LEGACY_TRAILING_OFFER.sub("", " ".join(str(a["answer"]).split()))
+        parts.append(f'Q: "{a["question"]}"\nColumns: {", ".join(a["columns"])}\n'
+                     f"Rows: {json.dumps(a['rows'], ensure_ascii=False)}\nAnswer: {answer}")
+    return ("\nWORDING EXAMPLES for this scheme — copy the style only. Their numbers "
+            "belong to OTHER questions and must never appear in this answer:\n"
+            + "\n\n".join(parts) + "\n")
+
+
 # Plain-language, user-facing scheme summaries — separate from SCHEME_CATALOG
 # in schema_context.py, which is written for the SQL-generation prompt (DB
 # grain, money units, join keys) and reads as database jargon to an end user.
@@ -683,6 +1539,14 @@ _SCHEME_USER_SUMMARY = {
     "CM Elevate": "Meghalaya livelihood & enterprise support programme — covers "
                   "15 individual schemes (piggery, poultry, small enterprise "
                   "loans, tourism vehicles, and more) under one umbrella.",
+    "Focus Legacy": "Meghalaya state producer-group scheme (the original FOCUS) — "
+                    "payments to farmer Producer Groups at Rs 5,000 per member. "
+                    "Different from Focus Plus, which pays individual farmers.",
+    "CM Elevate Legacy": "CM-ELEVATE sanction and disbursement records — the amount "
+                         "sanctioned to each applicant across 13 schemes (piggery, "
+                         "poultry, dairy, warehouse, tourism vehicles and more) and the "
+                         "subsidy and loans actually paid, FY 2024-25 and 2025-26. "
+                         "Different from CM Elevate, which holds the applications.",
 }
 
 # "What schemes are available?" / "what can you help with?" — answered directly
@@ -734,6 +1598,534 @@ _SCHEME_HELP_CUE = re.compile(
 )
 
 
+# CM Elevate and CM Elevate Legacy are ONE programme (CM-ELEVATE) held as two
+# datasets — its applications, and its sanctions and disbursements. Listed as
+# two schemes, the reply read as if there were two unrelated programmes (and the
+# count was hard-coded "four" against six lines). The listing shows the
+# programme once and names its two data parts; every other scheme's line is
+# unchanged. _SCHEME_USER_SUMMARY keeps both entries, for the comparison answer.
+_PROGRAMME_DATASETS = {"CM Elevate": ["CM Elevate Legacy"]}
+_COUNT_WORDS = {1: "one", 2: "two", 3: "three", 4: "four", 5: "five", 6: "six",
+                7: "seven", 8: "eight", 9: "nine", 10: "ten"}
+
+
+def _count_word(n: int) -> str:
+    return _COUNT_WORDS.get(n, str(n))
+
+
+def _scheme_listing_lines() -> list[str]:
+    folded = {d for ds in _PROGRAMME_DATASETS.values() for d in ds}
+    lines = []
+    for name, desc in _SCHEME_USER_SUMMARY.items():
+        if name in folded:
+            continue
+        if name == "CM Elevate":
+            desc = (
+                "Meghalaya livelihood & enterprise support programme (CM-ELEVATE) — "
+                "piggery, poultry, dairy, small enterprise, tourism vehicles and more. "
+                "Its data comes in two parts: the **applications** (15 schemes — status, "
+                "verification, applicant type; no amounts) and **CM Elevate Legacy**, the "
+                "sanctions and disbursements (13 schemes — amount sanctioned, subsidy and "
+                "loans paid, FY 2024-25 and 2025-26)."
+            )
+        lines.append(f"- **{name}** — {desc}")
+    return lines
+
+
+# ── "Pick any scheme and explain it" — the user hands the CHOICE to the bot ──
+# "pick any scheme out of these and explain", "no, pick yourself any scheme",
+# "you choose one", "tell me about any one of them", "explain a scheme of your
+# choice", "surprise me"... The user is not naming a scheme and does not want to
+# be asked for one — asking "which scheme?" is the exact opposite of the request
+# (reported 2026-09-24: three turns of the bot either asking back or answering
+# "not covered" against the raw wording). Answered deterministically: the scheme
+# the user did name if any, else one this conversation has not covered yet,
+# explained as key points from that scheme's own reference docs.
+_PICK_VERB = (r"(?:pick|choose|chose|select|take|go\s+with|explain|describe|"
+              r"tell\s+(?:me\s+)?about|talk\s+about|give|show|share|summari[sz]e|brief|elaborate)")
+_PICK_DELEGATION = re.compile(
+    # "pick any scheme", "choose one of these", "take a random scheme", "pick yourself",
+    # "select one scheme", "pick another scheme"
+    rf"\b{_PICK_VERB}\b[^.?!]{{0,40}}?\b(?:any(?:\s*one)?|some|a\s+random|random|one\s+of|"
+    r"another|your\s*self|yourself|your\s+own|of\s+your\s+choice|whichever|"
+    r"(?:a|one)\s+(?:single\s+)?(?:scheme|programm?e))\b|"
+    # "any one of these / them", "any scheme", "one of the schemes"
+    r"\bany\s*(?:one|1)\s+(?:of\s+)?(?:these|them|those|the\s+schemes?)\b|"
+    r"\b(?:any|a\s+random|random)\s+scheme\b|"
+    # "you choose", "your choice", "you decide", "up to you", "surprise me"
+    r"\b(?:you|u)\s+(?:pick|choose|decide|select)\b|\byour\s+(?:choice|pick|call)\b|"
+    r"\bup\s+to\s+you\b|\bsurprise\s+me\b|\bwhichever\s+(?:you|u)\b",
+    re.IGNORECASE)
+# What makes it a question about a SCHEME (not "pick any district and show ..."):
+# the word scheme / programme, a reference back to the list just shown, or a
+# delegation phrase that can only mean the scheme choice.
+_PICK_OBJECT = re.compile(
+    r"\bschemes?\b|\bprogramm?e?s?\b|\b(?:these|them|those)\b|\bone\s+of\b|"
+    r"\byour\s*self\b|\byourself\b|\byour\s+(?:own|choice|pick|call)\b|\bup\s+to\s+you\b|"
+    r"\bsurprise\s+me\b|\b(?:you|u)\s+(?:pick|choose|decide|select)\b|"
+    # a bare "just pick any" / "pick any one" / "choose another" — nothing else in
+    # the message, so the only thing on offer to pick is a scheme
+    r"^\W*(?:no\W+|ok(?:ay)?\W+|then\W+|so\W+)?(?:just\s+)?(?:pick|choose|select)\s+"
+    r"(?:any(?:\s*one)?|one|another(?:\s+one)?|one\s+more|the\s+next\s+one|next\s+one)\W*$",
+    re.IGNORECASE)
+# "another one" / "one more" / "next one" / "explain another" on its own. Only a
+# pick when the PREVIOUS answer was a pick — after a data answer the same words
+# mean another district or year, and go to the follow-up rewrite as before.
+_PICK_CONTINUE = re.compile(
+    r"^\W*(?:no\W+|ok(?:ay)?\W+|then\W+|so\W+|and\W+)?(?:(?:explain|tell\s+(?:me\s+)?about|"
+    r"describe|give|show)\s+(?:me\s+)?)?(?:another(?:\s+(?:one|scheme))?|one\s+more|"
+    r"(?:the\s+)?next\s+(?:one|scheme))\W*$",
+    re.IGNORECASE)
+_PICK_OVERVIEW_PREFIX = "Explain its key points — the objective"
+# A NEED-based ask ("is there any scheme that can help my family?", "any scheme
+# for farmers?") wants the scheme that FITS — the existing help/listing path
+# answers that. Picking one arbitrarily would be the wrong answer to it.
+_PICK_NEED_GUARD = re.compile(
+    r"\b(?:help|helps|helpful|eligible|suitable|should\s+i|can\s+i|could\s+i|"
+    r"apply\s+for|is\s+there)\b|"
+    r"\bfor\s+(?:farmers?|women|youth|students?|the\s+poor|poor|my|us|families|"
+    r"entrepreneurs?|widows?|elderly|disabled)\b",
+    re.IGNORECASE)
+# A request for a FIGURE is a data question even when it says "pick any".
+_PICK_DATA_GUARD = re.compile(
+    r"\b(?:how\s+many|how\s+much|total|number\s+of|count|sum|average|top\s*\d|"
+    r"highest|lowest|most|least|rank\w*|district|block|village|panchayat|"
+    r"financial\s+year|fy\s*\d|20\d\d|expenditure|person[\s-]?days?|houses?|"
+    r"disburs\w*|amount|payments?|records?|applications?|beneficiar\w*|"
+    r"data|figures?|numbers|statistics|stats)\b",
+    re.IGNORECASE)
+# "another" / "different" / "other" / "next" — explicitly not the one just done.
+_PICK_ANOTHER = re.compile(r"\b(?:another|different|other|next|new|else)\b", re.IGNORECASE)
+
+
+def _is_scheme_pick_request(question: str) -> bool:
+    q = question or ""
+    # "why did you choose MGNREGA?" asks for a REASON, not another pick.
+    if _WHY_CHOICE.search(q):
+        return False
+    if not _PICK_DELEGATION.search(q) or not _PICK_OBJECT.search(q):
+        return False
+    return not (_PICK_DATA_GUARD.search(q) or _PICK_NEED_GUARD.search(q))
+
+
+def _pickable_schemes() -> list[str]:
+    """The programmes a user can be given, in listing order. CM Elevate Legacy
+    is CM Elevate's data, not a separate programme (see _PROGRAMME_DATASETS)."""
+    folded = {d for ds in _PROGRAMME_DATASETS.values() for d in ds}
+    return [s for s in _SCHEME_USER_SUMMARY if s not in folded]
+
+
+def _pick_scheme(question: str, session: "Session | None") -> tuple[str, bool]:
+    """(scheme, chosen_by_bot). A scheme the user named wins. Otherwise the first
+    programme this conversation has not been told about yet, so "pick another"
+    / a repeated "pick one yourself" moves on instead of repeating itself."""
+    named = [s for s in _named_schemes(question) if s in _SCHEME_USER_SUMMARY]
+    if named:
+        folded = {d: p for p, ds in _PROGRAMME_DATASETS.items() for d in ds}
+        return folded.get(named[0], named[0]), False
+    options = _pickable_schemes()
+    folded = {d: p for p, ds in _PROGRAMME_DATASETS.items() for d in ds}
+    covered: list[str] = []
+    for t in (getattr(session, "turns", None) or []):
+        for s in (t.schemes or []):
+            s = folded.get(s, s)
+            if s in options and s not in covered:
+                covered.append(s)
+    fresh = [s for s in options if s not in covered]
+    if fresh:
+        return fresh[0], True
+    # Everything has been covered once — cycle on from the most recent one.
+    last = covered[-1] if covered else options[-1]
+    return options[(options.index(last) + 1) % len(options)], True
+
+
+# A request for a summary of the scheme as a whole (see the knowledge route).
+_OVERVIEW_REQUEST = re.compile(
+    r"\boverview\b|\bbriefing\b|\bbrief\s+(?:note|summary|introduction)\b|"
+    r"\bsummar(?:y|ise|ize)\s+(?:of\s+)?(?:the\s+)?(?:scheme|programme|program|focus)\b|"
+    r"\bat\s+a\s+glance\b|\bexecutive\s+summary\b",
+    re.IGNORECASE)
+
+
+def _scheme_overview_question(scheme: str) -> str:
+    """The standalone knowledge question the pick is answered with — phrased as
+    the reference docs are written, so retrieval lands on the overview sections
+    rather than on whatever the user's delegation wording happened to match."""
+    return (f"What is {scheme}? Explain its key points — the objective, who is "
+            f"eligible, the benefits it provides and how to apply.")
+
+
+# ── "Suggest a scheme that suits me" — a RECOMMENDATION from the user's profile ──
+# "i am living in rural area, suggest me the best scheme", "my friend is starting
+# a startup, suggest him a scheme", "i am a farmer, suggest a scheme". None of
+# these names a scheme, so the knowledge route inherited the PREVIOUS turn's
+# scheme and searched only its documents — every one of them was answered from
+# MGNREGA's material, or "not covered" (reported 2026-09-24). A recommendation
+# is a question ACROSS schemes: it is answered here, deterministically, by
+# matching what the user says about themselves to who each scheme is for.
+#
+# Who each scheme is for — taken from each scheme's own reference FAQ
+# (data/reference/*_general_faq.md, FOCUS_LEGACY_FAQ.md), not invented. Focus
+# Plus in particular is NOT for any farmer: its FAQ makes Producer Group
+# membership the precondition.
+_SCHEME_FIT = {
+    "MGNREGA": (
+        "guaranteed paid work",
+        "any adult member of a rural household who is willing to do unskilled manual "
+        "work can get up to 100 days of paid work a year, with no income test — you "
+        "register for a job card at your Gram Panchayat."),
+    "PMAY-G": (
+        "a permanent (pucca) house",
+        "for rural households that do not own a pucca house and have not had government "
+        "housing help before; households are identified from the SECC / Awaas+ list "
+        "through the Gram Panchayat."),
+    "Focus Plus": (
+        "direct cash support for farm and livelihood activity",
+        "cash paid directly (DBT) to Meghalaya households that are members of a Producer "
+        "Group of 10 or more, for farm inputs and extra income activities such as "
+        "piggery, poultry, horticulture, ginger or turmeric."),
+    "Focus Legacy": (
+        "seed money for a farmers' Producer Group",
+        "farmers organised into (or willing to form) a Producer Group get ₹5,000 per "
+        "member as seed / working capital; urban groups of 10 or more members are also "
+        "eligible — register at the C&RD Block office."),
+    "CM Elevate": (
+        "starting or growing a business",
+        "individuals, registered businesses, SHGs and Producer Groups in Meghalaya can "
+        "get support for a venture in one of 15 sectors — piggery, poultry, dairy, goat "
+        "farming, warehousing, tourism vehicles and more — or under the \"Any Business "
+        "Venture\" category; you apply on the MeghalayaOne portal."),
+}
+# (profile, what it says about the user, pattern, schemes in order of fit)
+_PROFILE_RULES = (
+    ("business", "starting or running a business",
+     re.compile(r"\bstart[\s-]?ups?\b|\bstart(?:ing|ed)?\s+(?:a\s+|an\s+|my\s+|our\s+|his\s+|her\s+|"
+                r"their\s+|the\s+)?(?:own\s+|new\s+|small\s+)*(?:business|company|venture|enterprise|"
+                r"shop|unit|firm)\b|\bbusiness\w*\b|\benterprises?\b|\bentrepreneur\w*|"
+                r"\bself[\s-]?employ\w*|\bventures?\b|\bcompany\b|\bshop\b|\bmsme\b|"
+                r"\bpiggery\b|\bpoultry\b|\bdairy\b|\bgoat\w*|\btourism\b|\btaxi\b|"
+                r"\bwarehouse\b|\bhomestay\b", re.IGNORECASE),
+     ["CM Elevate"]),
+    ("group", "part of a farmers' group / SHG",
+     re.compile(r"\bproducer\s+groups?\b|\bfarmers?['’]?\s+groups?\b|\bgroup\s+of\s+farmers\b|"
+                r"\bshgs?\b|\bself[\s-]?help\s+groups?\b|\bcollective\b|\bco-?operative\b|\bpgs?\b",
+                re.IGNORECASE),
+     ["Focus Legacy", "Focus Plus", "CM Elevate"]),
+    ("farmer", "a farmer",
+     re.compile(r"\bfarm(?:er|ers|ing)?\b|\bagricultur\w*|\bcultivat\w*|\bcrops?\b|\bkisan\b|"
+                r"\bhorticultur\w*|\bkheti\b", re.IGNORECASE),
+     ["Focus Plus", "Focus Legacy", "CM Elevate", "MGNREGA"]),
+    ("housing", "in need of a house",
+     re.compile(r"\bhouse\b|\bhouses\b|\bhome\b|\bhousing\b|\bkutcha\b|\bhomeless\b|\bshelter\b|"
+                r"\broof\b|\bpucca\b", re.IGNORECASE),
+     ["PMAY-G"]),
+    ("work", "looking for work / income",
+     re.compile(r"\bjobs?\b|\bunemploy\w*|\bemployment\b|\blabou?r\w*|\bwages?\b|\bdaily\s+wage\b|"
+                r"\bneed\s+(?:some\s+)?(?:work|income|money)\b|\blooking\s+for\s+work\b|"
+                r"\bno\s+(?:work|income|job)\b", re.IGNORECASE),
+     ["MGNREGA"]),
+    ("rural", "living in a rural area",
+     re.compile(r"\brural\b|\bvillages?\b|\bgaon\b|\bcountryside\b", re.IGNORECASE),
+     ["MGNREGA", "PMAY-G"]),
+)
+_RECOMMEND_CUE = re.compile(
+    r"\bsuggest\w*|\brecommend\w*|\badvi[cs]e\b|\bbest\s+(?:suited\s+)?schemes?\b|"
+    r"\bright\s+scheme\b|\bsuit(?:s|able|ed)?\b|\bfits?\s+(?:me|him|her|us|them|my|our)\b|"
+    r"\b(?:which|what)\s+schemes?\s+(?:should|can|could|would|will|do|does)\s+"
+    r"(?:i|we|he|she|they|my|our|you\s+(?:suggest|recommend))\b|"
+    r"\b(?:which|what)\s+schemes?\s+(?:is|are|would\s+be)\s+(?:the\s+)?"
+    r"(?:best|good|right|suitable|useful)\s+for\b|"
+    r"\bschemes?\s+for\s+(?:me|him|her|us|them|my|our|a|an)\b|\bany\s+schemes?\s+for\b|"
+    r"\beligible\s+for\s+(?:which|what)\b|\bhelp\s+(?:me|him|her|us)\s+(?:choose|find|pick)\b",
+    re.IGNORECASE)
+# Looser question shapes that are a recommendation ONLY when the message also
+# describes the person's need ("my friend is starting a startup, which scheme
+# benefits him"). On their own they are far too common in data and listing
+# questions ("which scheme has the most houses", "is there any scheme that can
+# help my family?"), which keep their existing handling.
+_RECOMMEND_CUE_WITH_NEED = re.compile(
+    r"\b(?:which|what)\s+schemes?\b|\bany\s+schemes?\b|\bis\s+there\s+(?:any|a)\b|"
+    r"\bschemes?\b[^?.!]{0,40}\b(?:benefit|help|support|useful|avail|apply|get|give|offer)\w*|"
+    r"\b(?:benefit|help|support)\w*\s+(?:to\s+|for\s+)?(?:me|him|her|us|them|my|our|his)\b|"
+    r"\b(?:can|could|will|would)\s+(?:i|he|she|we|they|my\s+\w+)\s+(?:get|avail|apply|benefit)\b|"
+    r"\bwhat\s+(?:can|could|will)\s+(?:i|he|she|we|they|my\s+\w+)\s+get\b",
+    re.IGNORECASE)
+_RECOMMENDATION_LEAD = "Based on what you've told me"
+
+
+def _user_profile(text: str) -> list[tuple[str, str, list[str]]]:
+    return [(k, desc, schemes) for k, desc, rx, schemes in _PROFILE_RULES if rx.search(text or "")]
+
+
+def _latest_profile(session: "Session | None", n: int = 4) -> list[tuple[str, str, list[str]]]:
+    """The profile from the MOST RECENT of the user's last n messages that
+    described someone. Never a blend of several messages: "my friend is
+    starting a startup" and later "I am a farmer" are two different people,
+    and merging them recommended the friend's scheme to the farmer."""
+    for t in reversed((getattr(session, "turns", None) or [])[-n:]):
+        prof = _user_profile(t.raw_question or "")
+        if prof:
+            return prof
+    return []
+
+
+# "Is there any Producer Group named Nongstoin PG?" is a NAME LOOKUP in the data,
+# not a person describing themselves: the loose cue "is there any" plus the
+# "group" profile word sent it to the recommender, which replied with a list of
+# schemes (Focus Legacy QA TC-13, 2026-09-25). A naming word attached to a group
+# noun vetoes the recommendation; "my friend named Ram is a farmer" is untouched.
+_GROUP_NAME_LOOKUP = re.compile(
+    r"\b(?:producer\s+groups?|pgs?|groups?|shgs?)\s+(?:(?:is|are|was)\s+)?"
+    r"(?:named|called|titled|with\s+(?:the\s+)?name|by\s+(?:the\s+)?name)\b",
+    re.IGNORECASE)
+
+
+def _is_recommendation_request(question: str) -> bool:
+    q = question or ""
+    if _WHY_CHOICE.search(q):
+        return False
+    if _GROUP_NAME_LOOKUP.search(q):
+        return False
+    if not (_RECOMMEND_CUE.search(q)
+            or (_RECOMMEND_CUE_WITH_NEED.search(q) and _user_profile(q))):
+        return False
+    # "is PMAY-G suitable for me?" is an eligibility question about THAT scheme
+    # — its own reference docs answer it (the normal knowledge route).
+    if _named_schemes(q):
+        return False
+    if _RECOMMEND_DATA_GUARD.search(q):
+        return False
+    # It must actually be about a scheme: a scheme word, or a need a scheme can
+    # meet stated in the message itself. "give me some suggestions" on its own
+    # is not a scheme question — reading it as one borrowed the previous turn's
+    # need and recommended PMAY-G to "i want to rob bank, give me some
+    # suggestions" (reported 2026-09-24).
+    return bool(_SCHEME_CONTEXT.search(q) or _user_profile(q))
+
+
+_SCHEME_CONTEXT = re.compile(
+    r"\bschemes?\b|\byojana\b|\byojna\b|\bprogramm?e?s?\b|\bgovt\.?\b|\bgovernment\b|"
+    r"\bsubsid\w*|\bassistance\b|\bbenefits?\b|\beligible\b|\beligibility\b|\bapply\b",
+    re.IGNORECASE)
+
+
+# Only FIGURE words — unlike the pick guard, "house" / "village" / "district"
+# describe the user's situation here ("I live in a village, I need a house").
+_RECOMMEND_DATA_GUARD = re.compile(
+    r"\b(?:how\s+many|how\s+much|total|number\s+of|count|sum|average|top\s*\d|"
+    r"highest|lowest|most|least|maximum|minimum|largest|biggest|smallest|"
+    r"rank\w*|expenditure|person[\s-]?days?|disburs\w*|amount\s+(?:of|paid|spent)|"
+    r"data|figures?|statistics|stats|20\d\d)\b",
+    re.IGNORECASE)
+
+
+def _recommendation_clarification(question: str) -> "ClarificationNeeded":
+    stem = question.strip().rstrip(" ?.")
+    needs = [("I need paid work", "I need work"), ("I need a house", "I need a house"),
+             ("I am a farmer", "I am a farmer"),
+             ("I am in a farmers' group / SHG", "I am in a farmers' producer group"),
+             ("I want to start a business", "I want to start a business")]
+    return ClarificationNeeded(
+        "Happy to suggest one — tell me a little about the need, so I can match it to "
+        "the right scheme:",
+        options=[{"label": lbl, "question": f"{stem} — {why}"} for lbl, why in needs],
+        rule="recommendation-needs-profile",
+    )
+
+
+def _scheme_recommendation_answer(question: str, session: "Session | None") -> "dict | None":
+    if not _is_recommendation_request(question):
+        return None
+    profile = _user_profile(question)
+    from_history = False
+    if not profile:
+        profile = _latest_profile(session)
+        from_history = bool(profile)
+    if not profile:
+        raise _recommendation_clarification(question)
+    ranked: list[str] = []
+    for _k, _d, schemes in profile:
+        for s in schemes:
+            if s not in ranked:
+                ranked.append(s)
+    about = " and ".join(d for _k, d, _s in profile)
+    lead = f"{_RECOMMENDATION_LEAD} ({about}{', from earlier in our chat' if from_history else ''}), "
+    lead += ("this scheme fits best:" if len(ranked) == 1 else "these schemes fit, best match first:")
+    lines = []
+    for i, s in enumerate(ranked, 1):
+        what, who = _SCHEME_FIT[s]
+        lines.append(f"{i}. **{s}** — for {what}: {who}")
+    tail = ("\n\nThese are suggestions based on each scheme's published eligibility — the "
+            "implementing department makes the final decision. Ask me \"how to apply for "
+            f"{ranked[0]}\" for the steps.")
+    logger.info("scheme recommendation: %r -> %s (profile=%s)", question, ranked,
+                [k for k, _d, _s in profile])
+    return {"route": "knowledge", "intent": "RAG", "confidence": "high", "sources": [],
+            "answer": f"{lead}\n\n" + "\n".join(lines) + tail,
+            **_empty_data_fields(), "schemes": [ranked[0]]}
+
+
+# ── "my friend is starting a startup, which PMAY-G benefits him?" ───────────
+# A named scheme plus a stated need it does NOT serve. The scheme's own documents
+# cannot say "this is the wrong scheme for you" — they either describe the scheme
+# anyway or reply that startups are "not mentioned" (reported 2026-09-24). Said
+# plainly here, with the scheme that does fit. When the named scheme DOES fit the
+# need, this steps aside and its own documents answer, exactly as before.
+_FIT_CUE = re.compile(r"\beligib\w*|\bsuit\w*|\bfits?\b|\buseful\b|\bgood\s+for\b|\bright\s+for\b",
+                      re.IGNORECASE)
+
+
+def _scheme_fit_check_answer(question: str) -> "dict | None":
+    q = question or ""
+    if _WHY_CHOICE.search(q) or _RECOMMEND_DATA_GUARD.search(q):
+        return None
+    if not (_FIT_CUE.search(q) or _RECOMMEND_CUE.search(q) or _RECOMMEND_CUE_WITH_NEED.search(q)):
+        return None
+    folded = {d: p for p, ds in _PROGRAMME_DATASETS.items() for d in ds}
+    named = list(dict.fromkeys(folded.get(s, s) for s in _named_schemes(q)))
+    if len(named) != 1 or named[0] not in _SCHEME_FIT:
+        return None
+    profile = _user_profile(q)
+    if not profile:
+        return None
+    ranked: list[str] = []
+    for _k, _d, schemes in profile:
+        ranked += [s for s in schemes if s not in ranked]
+    x = named[0]
+    if x in ranked:
+        return None
+    about = " and ".join(d for _k, d, _s in profile)
+    what, who = _SCHEME_FIT[x]
+    parts = [f"**{x}** isn't meant for this need ({about}): it is for {what} — {who}"]
+    best = ranked[0]
+    parts.append(f"For this need, **{best}** fits: {_SCHEME_FIT[best][1]}")
+    if len(ranked) > 1:
+        parts.append("Also worth a look: " + ", ".join(f"**{s}** ({_SCHEME_FIT[s][0]})"
+                                                      for s in ranked[1:]) + ".")
+    parts.append(f"Ask me \"how to apply for {best}\" for the steps.")
+    logger.info("scheme fit check: %r -> %s does not fit %s; suggest %s", q, x,
+                [k for k, _d, _s in profile], best)
+    return {"route": "knowledge", "intent": "RAG", "confidence": "high", "sources": [],
+            "answer": "\n\n".join(parts), **_empty_data_fields(), "schemes": [best]}
+
+
+# ── "Why did you choose / give MGNREGA (instead of Focus)?" ─────────────────
+# A question about the BOT'S OWN previous answer, not about a scheme's rules —
+# no reference document can answer it, so the knowledge route either repeated
+# the overview or said "not covered" (reported 2026-09-24). It is answered from
+# what the previous answer actually was: a pick, a recommendation, or a scheme
+# the conversation was already on.
+_WHY_CHOICE = re.compile(
+    r"\bwhy\b[^?.!]{0,40}\b(?:choose|chose|chosen|pick|picked|picking|give|given|gave|"
+    r"suggest\w*|recommend\w*|select\w*|instead|rather|only|not)\b",
+    re.IGNORECASE)
+_INSTEAD_OF = re.compile(r"\b(?:instead\s+of|rather\s+than|over|and\s+not|not)\s+(?P<alt>.+)$",
+                         re.IGNORECASE)
+
+
+def _why_choice_answer(question: str, session: "Session | None") -> "dict | None":
+    q = question or ""
+    if not _WHY_CHOICE.search(q):
+        return None
+    last = getattr(session, "last_turn", None) if session is not None else None
+    if last is None:
+        return None
+    folded = {d: p for p, ds in _PROGRAMME_DATASETS.items() for d in ds}
+    # The scheme the question says was given, and the alternative it names.
+    m = _INSTEAD_OF.search(q)
+    alt_text = m.group("alt") if m else ""
+    given_text = q[: m.start()] if m else q
+    given = [folded.get(s, s) for s in _named_schemes(given_text)]
+    given = given or [folded.get(s, s) for s in (last.schemes or [])]
+    alts = [folded.get(s, s) for s in _named_schemes(alt_text)] if alt_text else []
+    if alt_text and not alts and _BARE_FOCUS_WORD.search(alt_text):
+        alts = ["Focus Plus", "Focus Legacy"]
+    alts = [a for a in dict.fromkeys(alts) if a in _SCHEME_FIT and a not in given]
+    x = given[0] if given and given[0] in _SCHEME_FIT else None
+    if x is None:
+        return None
+
+    was_pick = _PICK_OVERVIEW_PREFIX in (last.question or "")
+    was_rec = (last.answer or "").startswith(_RECOMMENDATION_LEAD)
+    if was_pick:
+        why = (f"I picked **{x}** only because you left the choice to me and it was the "
+               "first scheme on my list we hadn't covered yet — it isn't a ranking, and it "
+               "doesn't mean it suits you best.")
+    elif was_rec:
+        # Where each scheme actually sat in that list — the question may assume
+        # one was left out when it was in fact ranked higher.
+        listed = re.findall(r"^\d+\.\s+\*\*(.+?)\*\*", last.answer or "", re.MULTILINE)
+        rank = {s: i + 1 for i, s in enumerate(listed)}
+        if x in rank and len(listed) > 1:
+            why = (f"**{x}** was number {rank[x]} of {len(listed)} in my suggestions, not the "
+                   f"only one — it is there for {_SCHEME_FIT[x][0]}: {_SCHEME_FIT[x][1]}")
+        else:
+            why = (f"I suggested **{x}** because of what you told me about yourself: it is for "
+                   f"{_SCHEME_FIT[x][0]} — {_SCHEME_FIT[x][1]}")
+        ranked_above = [a for a in alts if a in rank and (x not in rank or rank[a] < rank[x])]
+        if ranked_above:
+            why += ("\n\nIn fact " + " and ".join(f"**{a}** (number {rank[a]})" for a in ranked_above)
+                    + (" was" if len(ranked_above) == 1 else " were")
+                    + f" ranked above {x} in that same list.")
+            alts = [a for a in alts if a not in ranked_above]
+    else:
+        why = (f"My last answer drew only on **{x}**'s reference material because our "
+               f"conversation was about {x} at that point — I didn't compare it with the "
+               "other schemes.")
+    parts = [why]
+    for a in alts:
+        what, who = _SCHEME_FIT[a]
+        parts.append(f"**{a}** is for {what}: {who}")
+    profile = _user_profile(q) or _latest_profile(session)
+    if profile and not was_rec:
+        ranked: list[str] = []
+        for _k, _d, schemes in profile:
+            ranked += [s for s in schemes if s not in ranked]
+        about = " and ".join(d for _k, d, _s in profile)
+        parts.append(f"From what you've said ({about}), the best match is **{ranked[0]}**"
+                     + (f", then {', '.join(ranked[1:3])}" if len(ranked) > 1 else "") + ".")
+    elif not profile:
+        parts.append("Tell me what you need — paid work, a house, farming support or starting "
+                     "a business — and I'll suggest the scheme that fits best.")
+    return {"route": "knowledge", "intent": "RAG", "confidence": "high", "sources": [],
+            "answer": "\n\n".join(parts), **_empty_data_fields(),
+            "schemes": [alts[0] if alts else x]}
+
+
+def _last_turn_was_pick(session: "Session | None") -> bool:
+    last = getattr(session, "last_turn", None) if session is not None else None
+    return bool(last and _PICK_OVERVIEW_PREFIX in (last.question or ""))
+
+
+async def _scheme_pick_answer(question: str, session: "Session | None") -> "dict | None":
+    if not (_is_scheme_pick_request(question)
+            or (_PICK_CONTINUE.match(question or "") and _last_turn_was_pick(session))):
+        return None
+    scheme, chosen = _pick_scheme(question, session)
+    overview_q = _scheme_overview_question(scheme)
+    kb = None
+    try:
+        kb = await rag.answer_from_kb(overview_q, scheme=scheme)
+    except Exception:  # noqa: BLE001 — fall back to the summary below
+        logger.warning("scheme pick: knowledge lookup failed for %s", scheme, exc_info=True)
+    lead = (f"I'll pick **{scheme}** — here are its key points:" if chosen
+            else f"Here are the key points of **{scheme}**:")
+    if kb:
+        body, conf, sources = kb["answer"], kb["confidence"], kb["sources"]
+    else:
+        # No passage retrieved (KB unreachable, or nothing scored): still answer
+        # the request from the scheme's own one-line summary, never "not covered".
+        body, conf, sources = f"- {_SCHEME_USER_SUMMARY[scheme]}", "medium", []
+    others = [s for s in _pickable_schemes() if s != scheme]
+    tail = ("\n\nWant me to explain another one? I also cover "
+            + ", ".join(others[:-1]) + " and " + others[-1] + "." if chosen and others else "")
+    logger.info("scheme pick: %r -> %s (chosen_by_bot=%s)", question, scheme, chosen)
+    return {"route": "knowledge", "intent": "RAG", "confidence": conf,
+            "answer": f"{lead}\n\n{body}{tail}", "sources": sources,
+            "rewritten_question": overview_q,
+            **_empty_data_fields(), "schemes": [scheme]}
+
+
 def _scheme_listing_answer(question: str) -> "dict | None":
     explicit = _SCHEME_LISTING_CUE.search(question or "")
     if not explicit:
@@ -745,9 +2137,9 @@ def _scheme_listing_answer(question: str) -> "dict | None":
         # instead of burying that signal under the generic four-scheme list.
         if _infer_scheme_from_terms(question) is not None:
             return None
-    lines = [f"- **{name}** — {desc}" for name, desc in _SCHEME_USER_SUMMARY.items()]
+    lines = _scheme_listing_lines()
     answer = (
-        "I cover four Meghalaya government schemes:\n\n" + "\n".join(lines) +
+        f"I cover {_count_word(len(lines))} Meghalaya government schemes:\n\n" + "\n".join(lines) +
         "\n\nAsk me about any of these — eligibility, benefits, how to apply, "
         "or the actual data (numbers, by district or year)."
     )
@@ -787,11 +2179,13 @@ def _scheme_comparison_clarification() -> "ClarificationNeeded":
         {"label": f"{a} vs {b}", "question": f"difference between {a} and {b}"}
         for a, b in itertools.combinations(names, 2)
     ]
-    options.append({"label": "All four schemes",
-                     "question": "difference between MGNREGA, PMAY-G, Focus Plus and CM Elevate"})
+    _all = ", ".join(names[:-1]) + " and " + names[-1]
+    _any = ", ".join(names[:-1]) + ", or " + names[-1]
+    options.append({"label": f"All {len(names)} schemes",
+                     "question": f"difference between {_all}"})
     return ClarificationNeeded(
-        "Which schemes would you like to compare — MGNREGA, PMAY-G, Focus Plus, or "
-        "CM Elevate? Pick a pair, or compare all four.",
+        f"Which schemes would you like to compare — {_any}? Pick a pair, or compare "
+        f"all {len(names)}.",
         options=options,
         rule="scheme-comparison-not-specified",
     )
@@ -895,8 +2289,13 @@ def _unsupported_scheme_clarification(question: str, name: str) -> "Clarificatio
          "question": _scheme_option_question(stem, "Focus Plus")},
         {"label": "CM Elevate (livelihood / enterprise schemes)",
          "question": _scheme_option_question(stem, "CM Elevate")},
+        {"label": "Focus Legacy (producer group payments)",
+         "question": _scheme_option_question(stem, "Focus Legacy")},
+        {"label": "CM Elevate Legacy (sanctions & disbursements)",
+         "question": _scheme_option_question(stem, "CM Elevate Legacy")},
         {"label": "Compare across schemes",
-         "question": f"{stem} across MGNREGA, PMAY-G, Focus Plus and CM Elevate"},
+         "question": (f"{stem} across MGNREGA, PMAY-G, Focus Plus, CM Elevate, "
+                      f"Focus Legacy and CM Elevate Legacy")},
     ]
     # Names the scheme asked for, says plainly that it is outside what is
     # loaded, then points somewhere useful. Deliberately about SCHEME COVERAGE
@@ -912,9 +2311,11 @@ def _unsupported_scheme_clarification(question: str, name: str) -> "Clarificatio
                         for w in name.strip().split())
     return ClarificationNeeded(
         f"{_display} isn't one of the schemes I cover, so I can't answer questions "
-        "about it — not its rules, eligibility or its data. I cover four Meghalaya "
+        "about it — not its rules, eligibility or its data. I cover these Meghalaya "
         "schemes: MGNREGA (rural employment), PMAY-G (rural housing), Focus Plus "
-        "(farmer cash benefit) and CM Elevate (livelihood and enterprise support). "
+        "(farmer cash benefit), CM Elevate (livelihood and enterprise applications), "
+        "Focus Legacy (producer group payments) and CM Elevate Legacy (CM-ELEVATE "
+        "sanctions and disbursements). "
         "If one of those is what you need, pick it below and I'll take the question "
         "from there.",
         options=options,
@@ -943,15 +2344,29 @@ _BANK_ACCOUNT_DETAIL_REQUESTED = re.compile(
     r"\bdbt\b",
     re.IGNORECASE,
 )
+# CM Elevate Legacy's loan_entity holds only the categories 'Bank' / 'LIFCOM'.
+# These ask for an individual bank or branch, which is not recorded.
+_LENDER_DETAIL_REQUESTED = re.compile(
+    r"\bbranch(?:es)?\b|\bbank[\s-]?names?\b|\bname of (?:the )?banks?\b|"
+    r"\bwhich (?:particular |specific )?banks?\b|\bsbi\b|\bstate bank\b|\bmrb\b|"
+    r"\bmeghalaya rural bank\b|\bcooperative bank\b",
+    re.IGNORECASE,
+)
 _BANK_NOT_HELD_TEXT = {
     "Focus Plus": (
         "Account numbers and IFSC codes aren't held for Focus Plus — only the "
         "bank name is. Shall I answer using bank name instead?"
     ),
     "CM Elevate": (
-        "There is no loan-channel field for CM Elevate — Bank and LIFCOM are not "
-        "recorded, and no payment of any kind is held for this scheme. Shall I "
-        "answer on applications by scheme or district instead?"
+        "There is no loan-channel field in the CM Elevate applications data — Bank and "
+        "LIFCOM are recorded only in CM Elevate Legacy (the sanction and disbursement "
+        "records). Shall I answer from CM Elevate Legacy, or on applications by scheme "
+        "or district instead?"
+    ),
+    "CM Elevate Legacy": (
+        "Individual bank names, branches, IFSC codes and account numbers are not held "
+        "for CM Elevate Legacy — the only lender values recorded are 'Bank' and "
+        "'LIFCOM'. Shall I show loans by those two lender categories instead?"
     ),
     "PMAY-G": (
         "Bank transfer status, DBT outcomes and account details are not held for "
@@ -964,10 +2379,11 @@ _BANK_NOT_HELD_TEXT = {
     ),
 }
 _BANK_GENERIC_TEXT = (
-    "Bank name is only held for Focus Plus — MGNREGA, PMAY-G and CM Elevate "
-    "never captured a bank field at ingest, and none of the four schemes hold "
-    "account numbers or IFSC codes. Shall I answer using Focus Plus bank name, "
-    "or by scheme, district, block or village instead?"
+    "Bank name is only held for Focus Plus and Focus Legacy — MGNREGA, PMAY-G "
+    "and CM Elevate never captured a bank field at ingest. Focus Legacy also "
+    "holds the IFSC code; no scheme exposes account numbers. Shall I answer "
+    "using Focus Plus or Focus Legacy bank name, or by scheme, district, block "
+    "or village instead?"
 )
 
 
@@ -982,6 +2398,12 @@ def _bank_clarification(question: str) -> "ClarificationNeeded | None":
     if not is_account_detail and schemes == ["Focus Plus"]:
         # Bare bank-name question scoped to Focus Plus only — bank_name_raw is
         # queryable via curated.v_focus_plus, so let SQL generation handle it.
+        return None
+    if schemes == ["CM Elevate Legacy"] and not is_account_detail \
+            and not _LENDER_DETAIL_REQUESTED.search(question):
+        # "loans by Bank vs LIFCOM", "how many LIFCOM loans" — loan_entity is a
+        # real, queryable lender column there. Only a named bank / branch /
+        # account asks for something the data does not hold.
         return None
     text = _BANK_NOT_HELD_TEXT[schemes[0]] if len(schemes) == 1 else _BANK_GENERIC_TEXT
     return ClarificationNeeded(text, rule="column-not-held")
@@ -1221,6 +2643,15 @@ _HAS_BREAKDOWN = re.compile(
     # specifically (kept out of the tight pattern above to avoid over-matching
     # "each ... district" style geography phrasing where slack isn't needed).
     r"\b(?:per|each|every)\b[^?.!]{0,25}\b(?:scheme|program(?:me)?|sector)s?\b|"
+    # "in each financial year", "total disbursed through each loan entity" —
+    # a qualifier before "year", and category dimensions the tight pattern
+    # above never listed. Both are groupings over every value, so asking
+    # "which area / year?" first was wrong, and the "all years" reply then got
+    # collapsed into ONE total instead of a per-year split (CM Elevate Legacy
+    # QA TC-21 / TC-22 / TC-23 / TC-24, 2026-09-25).
+    r"\b(?:per|each|every|by)\s+(?:financial|fiscal)\s+years?\b|"
+    r"\b(?:per|each|every|by)\s+(?:loan\s+)?(?:entit(?:y|ies)|lenders?|categor(?:y|ies)|"
+    r"tranches?|instal{1,2}ments?)\b|"
     r"\b(?:district|block|village|year|scheme|program(?:me)?|sector)[\s-]?wise\b|"
     r"\bbreak[\s-]?down\b|\btrend\b|\byear[\s-]?on[\s-]?year\b|"
     r"\bover (?:the )?(?:last|past) \w+ years?\b|"
@@ -1331,9 +2762,60 @@ def _needs_scope_clarification(question: str, resolved: dict) -> bool:
 _REPLY_IS_NEW_QUESTION = re.compile(
     r"\b(how many|how much|number of|count of|what(?:'s| is| are| was) the|"
     r"who (?:is|can)|how do i|how to apply|what documents?|which documents?|"
-    r"explain|define|difference between|tell me about)\b",
+    r"explain|define|difference between|tell me about)\b|"
+    # A reply OPENING with "which ..." is a question of its own, not a place or
+    # a year — "Which banks handle Focus Legacy payments?" was being merged into
+    # the stale paused question. Anchored to the start so "the block, which is
+    # in Ri Bhoi" is unaffected.
+    r"^\s*which\b",
     re.IGNORECASE,
 )
+
+
+# A reply that OPENS with one of these is giving an instruction, not naming a
+# place or a year. _REPLY_IS_NEW_QUESTION covers interrogative phrasings only,
+# so an imperative slipped through and got glued onto the stale paused question
+# ("List top 5 PGs which has more than 10 of members." came back as the previous
+# turn's Nongstoin block-or-village prompt — reported 2026-09-23).
+_REPLY_IS_IMPERATIVE = re.compile(
+    r"^\s*(?:please\s+)?(?:list|show|give|display|rank|compare|find|search)\b",
+    re.IGNORECASE,
+)
+
+# A scope pause asks for exactly a place and/or a year, so that vocabulary is
+# the EXPECTED reply and must never read as "a new question". Stripping it out
+# before the metric test is what separates "West Garo Hills, 2023-24" (a scope
+# reply — nothing left once place and year are removed) from "Total amount
+# disbursed by district" (a real question — the metric survives). An earlier
+# version tested only for a BARE year and wrongly abandoned the pause on the
+# commonest reply shape of all, place-plus-year.
+_SCOPE_REPLY_VOCAB = re.compile(
+    r"\b(?:fy\s*)?\d{4}(?:\s*-\s*\d{2,4})?\b|"           # 2023-24, FY 2021-22
+    r"\ball\s+(?:of\s+)?meghalaya\b|\ball\s+years?\b|\ball\s+districts?\b|"
+    r"\bstatewide\b|\bthe\s+(?:block|village|district|constituency)\b|"
+    r"\bnot\s+(?:the|another)\b|\barea\s+type\b|\bcombined\b|"
+    r"[,\.]",
+    re.IGNORECASE,
+)
+
+
+@functools.lru_cache(maxsize=1)
+def _known_place_names() -> tuple[str, ...]:
+    """Every district and block name the resolvers know, lowercased, longest
+    first. Used only to strip a place out of a scope reply before testing it for
+    a metric — so "West Garo Hills" cannot be mistaken for question vocabulary.
+    Built from the catalogues already loaded at startup; empty if they are not,
+    in which case the test simply falls back to the year/phrase stripping."""
+    from app import entity_resolver
+
+    names: set[str] = set()
+    for scheme in list(entity_resolver._catalog):
+        for dim in ("district", "block"):
+            for v in entity_resolver._catalog.get(scheme, {}).get(dim, []):
+                c = str(v.get("canonical") or "").strip().lower()
+                if len(c) >= 4:
+                    names.add(c)
+    return tuple(sorted(names, key=len, reverse=True))
 
 
 def _reply_abandons_scope_pause(reply: str) -> bool:
@@ -1342,7 +2824,22 @@ def _reply_abandons_scope_pause(reply: str) -> bool:
     r = (reply or "").strip()
     if len(r.split()) > 12:
         return True
-    return bool(_REPLY_IS_NEW_QUESTION.search(r) or _KNOWLEDGE_HINTS.search(r))
+    if _REPLY_IS_NEW_QUESTION.search(r) or _KNOWLEDGE_HINTS.search(r):
+        return True
+    if _REPLY_IS_IMPERATIVE.search(r):
+        return True
+    # A scope fragment names a place and/or a year and nothing else. Strip that
+    # expected vocabulary, plus any place NAME the resolver knows, and see
+    # whether a METRIC survives: if one does, the reply is a question in its own
+    # right whatever its grammatical shape (the same signal the DATA router
+    # trusts). "West Garo Hills, 2023-24" reduces to nothing and still merges.
+    residue = _SCOPE_REPLY_VOCAB.sub(" ", r)
+    for place in _known_place_names():
+        if place in residue.lower():
+            residue = re.sub(re.escape(place), " ", residue, flags=re.IGNORECASE)
+    if _DATA_HINTS.search(residue):
+        return True
+    return False
 
 
 # ── "Which district in this region?" clarification ─────────────────────────
@@ -1459,6 +2956,17 @@ _SCHEME_DATA_YEARS: dict[str, list[str]] = {
     "PMAY-G":  ["2017-18", "2018-19", "2019-20", "2020-21", "2021-22", "2022-23", "2023-24"],
     "Focus Plus": ["2022-23", "2025-26"],
     "CM Elevate": [],
+    # Focus Legacy holds FOUR years with a HOLE IN THE MIDDLE: FY2023-24 has no
+    # payments at all — an absent year, not a zero one (focuslegacy_schema_
+    # partitions.yaml semantic_rules.time_gap_rule). It is deliberately NOT
+    # listed, so the year chips never offer it and the out-of-range guard
+    # correctly refuses a FY2023-24 question instead of returning an empty total.
+    "Focus Legacy": ["2021-22", "2022-23", "2024-25", "2025-26"],
+    # CM Elevate Legacy holds TWO years. 395 records (both Sericulture schemes)
+    # carry no year at all — they are not a third year, so they get no chip; an
+    # "all financial years" answer still includes them because it applies no
+    # year filter (cmelevatelegacy_schema_partitions.yaml year_key rules).
+    "CM Elevate Legacy": ["2024-25", "2025-26"],
 }
 
 
@@ -1486,6 +2994,13 @@ async def refresh_scheme_years() -> None:
         "PMAY-G": "SELECT DISTINCT year_key FROM curated.v_pmay WHERE year_key IS NOT NULL",
         "Focus Plus": (
             "SELECT DISTINCT year_key FROM curated.v_focus_plus WHERE year_key IS NOT NULL"
+        ),
+        "Focus Legacy": (
+            "SELECT DISTINCT year_key FROM curated.v_focus_legacy WHERE year_key IS NOT NULL"
+        ),
+        "CM Elevate Legacy": (
+            "SELECT DISTINCT year_key FROM curated.v_cm_elevate_disbursement "
+            "WHERE year_key IS NOT NULL"
         ),
         # CM Elevate deliberately has no entry here — curated.v_cm_elevate has no
         # year_key column at all (not merely NULL), so there is nothing to probe.
@@ -1884,11 +3399,23 @@ SELECT 'Focus Plus' AS scheme,
        ROUND(SUM(amount_disbursed) / 1e7, 2) AS amount_crore,
        'amount disbursed to farmers (DBT), rupees' AS measure_semantics
 FROM curated.v_focus_plus
+UNION ALL
+SELECT 'Focus Legacy' AS scheme,
+       ROUND(SUM(amount_disbursed) / 1e7, 2) AS amount_crore,
+       'amount remitted to producer groups, rupees' AS measure_semantics
+FROM curated.v_focus_legacy
+UNION ALL
+SELECT 'CM Elevate Legacy' AS scheme,
+       ROUND(SUM(total_disbursement) / 1e7, 2) AS amount_crore,
+       'subsidy and loan disbursed to sanctioned applicants, rupees' AS measure_semantics
+FROM curated.v_cm_elevate_disbursement
 ORDER BY amount_crore DESC
 """.strip()
 
 _SCHEME_DISPLAY_NAME = {"MGNREGA": "MGNREGA", "PMAY": "PMAY-G", "PMAY-G": "PMAY-G",
-                        "Focus Plus": "Focus Plus", "CM Elevate": "CM Elevate"}
+                        "Focus Plus": "Focus Plus", "CM Elevate": "CM Elevate",
+                        "Focus Legacy": "Focus Legacy",
+                        "CM Elevate Legacy": "CM Elevate Legacy"}
 # Plain-English rendering of each scheme's measure_semantics. The stored strings
 # are written for the SQL prompt ("annual FLOW (lakh rupees)", "an EVENT, not a
 # clean annual flow") and read as database jargon in a chat bubble; the caveat
@@ -1897,6 +3424,8 @@ _MEASURE_PLAIN = {
     "MGNREGA": "expenditure actually incurred",
     "PMAY-G": "money released against sanctions",
     "Focus Plus": "cash disbursed to farmers (DBT)",
+    "Focus Legacy": "cash remitted to producer groups",
+    "CM Elevate Legacy": "subsidy and loans disbursed to sanctioned applicants",
 }
 
 
@@ -1927,9 +3456,12 @@ async def _cross_scheme_money_answer(question: str) -> dict:
     lines.append(
         "\nThese are not the same kind of figure, so treat the ranking as indicative "
         "rather than like-for-like: MGNREGA's is expenditure actually incurred, PMAY-G's "
-        "is money released against sanctions, and Focus Plus's is cash disbursed to "
-        "farmers. CM Elevate records no payment of any kind — only applications — so it "
-        "cannot appear in a money comparison at all."
+        "is money released against sanctions, Focus Plus's is cash disbursed to "
+        "individual farmers, and Focus Legacy's is cash remitted to producer groups "
+        "(where every payment is Rs 5,000 per member, so the figure is really a "
+        "membership count), and CM Elevate Legacy's is subsidy and loans together paid "
+        "to sanctioned applicants. The CM Elevate applications data records no payment "
+        "of any kind, so it cannot appear in a money comparison at all."
     )
     return {
         "route": "data", "intent": "DATA", "confidence": "high",
@@ -2128,6 +3660,154 @@ _MALFORMED_YEAR_CUE_RE = re.compile(
 )
 
 
+def _years_in_question(text: str, schemes: "list[str] | None" = None
+                       ) -> "tuple[list[str], list[str]]":
+    """(available, unavailable) raw year tokens named in `text`.
+
+    _out_of_range_year_in below returns only the FIRST unavailable token, which
+    is the right answer for "is there a bad year here?" but the wrong basis for
+    "should the whole question be refused?" — a question can name a year the
+    scheme lacks AND a year it holds ("compare FY 2023-24 and FY 2024-25", the
+    Focus Legacy gap case). Refusing that discards a question the data can
+    largely answer."""
+    ok: list[str] = []
+    bad: list[str] = []
+    for m in _YEAR_RANGE_TOKEN_RE.finditer(text or ""):
+        tok = m.group(1)
+        yk = _parse_year_key(tok)
+        if yk is not None:
+            (ok if _year_in_data_range(yk, schemes) else bad).append(tok)
+        elif _YEAR_SHAPED_RE.search(tok):
+            bad.append(tok)
+    return ok, bad
+
+
+# A question that asks for a COMPARISON needs two operands. Dropping one of
+# them answers a different, narrower question than the one asked.
+_COMPARES_YEARS = re.compile(
+    r"\bcompare\b|\bcomparison\b|\bversus\b|\bvs\.?\b|\bagainst\b|"
+    r"\bdifference between\b|\bbetween\b.{0,40}\band\b|"
+    r"\bhigher than\b|\blower than\b|\bmore than\b.{0,20}\bfy\b",
+    re.IGNORECASE,
+)
+
+
+def _nearest_available_year(bad_token: str, schemes: "list[str] | None") -> "str | None":
+    """The year with data closest to `bad_token`, preferring the one BEFORE it.
+
+    The scheme's own contract calls for exactly this on a gap comparison —
+    focuslegacy_few_shot.yaml: "The preceding year WITH PAYMENTS is FY2022-23,
+    not FY2023-24", and response_template's fy_gap_comparison_note. Preferring
+    the earlier year keeps "compare X with the year before it" meaning what it
+    says; a later year is used only when nothing earlier exists."""
+    target = _parse_year_key(bad_token)
+    if target is None:
+        return None
+    available, _live = _available_years_for(schemes or [])
+    keys = sorted(k for k in (_parse_year_key(y) for y in available) if k is not None)
+    if not keys:
+        return None
+    earlier = [k for k in keys if k < target]
+    if earlier:
+        return _fy_short(earlier[-1])
+    later = [k for k in keys if k > target]
+    return _fy_short(later[0]) if later else None
+
+
+def _substitute_year_token(question: str, old_tok: str, new_short: str) -> str:
+    """Replace one year token in place, keeping the surrounding wording (and any
+    "FY " prefix) so the sentence still reads as the comparison it is."""
+    return re.sub(
+        r"(?:fy\s*)?" + re.escape(old_tok.strip()) + r"\b",
+        f"FY {new_short}", question, count=1, flags=re.IGNORECASE,
+    )
+
+
+def _apply_year_gap(question: str, schemes: "list[str] | None"
+                    ) -> "tuple[str, str | None, bool]":
+    """Decide what to do with a question naming a financial year the scheme has
+    no data for. Returns (question, note, handled).
+
+    `handled` is False only when NOTHING in the question is answerable — the
+    caller then raises the out-of-range clarification. Otherwise the question is
+    rewritten and a note explains what changed, so the answer states the gap
+    rather than silently ignoring it.
+
+    Two rewrites, and which one applies is the whole point:
+
+    * COMPARISON ("compare FY 2023-24 and FY 2024-25", "X vs Y") — a comparison
+      needs two operands, so the absent year is SUBSTITUTED with the nearest
+      year that holds data. Deleting it left one year and answered with a single
+      figure, leaving the verb the user typed unmet (reported 2026-09-23). The
+      substitute is the preceding year with payments, which is exactly what the
+      scheme's own exemplar and fy_gap_comparison_note prescribe.
+    * ANYTHING ELSE — the absent year is dropped. There is no second operand to
+      preserve, and substituting would answer about a year the user never named.
+
+    Lives here rather than inline in resolve_entities so the tests exercise the
+    real decision: an earlier version of this logic was inline, the regression
+    test re-implemented it, and the test stayed green when the production branch
+    was disabled."""
+    ok_years, bad_years = _years_in_question(question, schemes)
+    if not ok_years:
+        return question, None, False
+
+    swapped: list[tuple[str, str]] = []
+    if _COMPARES_YEARS.search(question) and len(ok_years) + len(bad_years) >= 2:
+        for bad in list(bad_years):
+            near = _nearest_available_year(bad, schemes)
+            if near and near not in ok_years:
+                question = _substitute_year_token(question, bad, near)
+                ok_years.append(near)
+                bad_years.remove(bad)
+                swapped.append((bad, near))
+    if bad_years:
+        question = _strip_year_tokens(question, bad_years)
+
+    parts: list[str] = []
+    if swapped:
+        parts.append(
+            "; ".join(
+                f"FY {b} holds no data for this scheme, so FY {n} — the nearest "
+                f"financial year that does — is compared instead"
+                for b, n in swapped
+            )
+            + ". That is a gap in the records, not a zero."
+        )
+    if bad_years:
+        parts.append(
+            ", ".join(f"FY {y}" for y in bad_years)
+            + " holds no data for this scheme, so it is left out — "
+            "that is a gap in the records, not a zero."
+        )
+    logger.info("year gap: swapped=%s dropped=%s, answering for %s",
+                swapped, bad_years, ok_years)
+    return question, (" ".join(parts) or None), True
+
+
+def _strip_year_tokens(question: str, tokens: "list[str]") -> str:
+    """Remove the given year tokens (and any "for "/"in "/"FY " lead-in, or a
+    dangling "and"/",") from the question, so what remains reads naturally and
+    cannot re-trip the year guard on a later turn."""
+    out = question
+    for tok in tokens:
+        # Take any connector that FOLLOWS the token too ("between FY 2023-24
+        # and ..." -> "between ..."), otherwise dropping the first of a pair
+        # leaves a dangling "and": "Compare the total remittance and FY
+        # 2024-25." Both sides are optional, so a lone year is still removed.
+        out = re.sub(
+            r"\s*(?:,|\band\b)?\s*(?:for\s+|in\s+|during\s+|of\s+|between\s+)?"
+            r"(?:fy\s*)?" + re.escape(tok.strip()) + r"\b\s*(?:,|\band\b)?",
+            " ", out, count=1, flags=re.IGNORECASE,
+        )
+    out = re.sub(r"\s{2,}", " ", out)
+    # "between" / "from" left with nothing to join, and a trailing connector
+    # before the closing punctuation.
+    out = re.sub(r"\b(?:between|from)\s+(?=[\"\u201d.?]|$)", "", out, flags=re.IGNORECASE)
+    out = re.sub(r"\s+(?:and|,)\s*(?=[\"\u201d.?]|$)", "", out, flags=re.IGNORECASE)
+    return re.sub(r"\s{2,}", " ", out).strip().strip(",").strip()
+
+
 def _out_of_range_year_in(text: str, schemes: "list[str] | None" = None) -> "str | None":
     """Raw text of the first financial-year token in `text` that NONE of the
     given scheme(s) hold, or None if every year mentioned is available / none is
@@ -2266,6 +3946,14 @@ def _shortcut_scheme(question: str) -> list[str] | None:
     handles the genuinely unnamed/ambiguous case."""
     named = _named_schemes(question)
     if len(named) >= 2:
+        return named
+    # CM Elevate Legacy's 13 sub-units are themselves called "schemes"
+    # (Piggery, Poultry, ...), so "CM Elevate Legacy records by scheme" /
+    # "scheme-wise" asks for ITS scheme_name breakdown — not every scheme in
+    # the catalog. Read as cross-scheme, it pulled in all six schemes and the
+    # year pause offered their union (FY 2017-18..2025-26) for a scheme that
+    # holds only FY 2024-25 and 2025-26.
+    if named == ["CM Elevate Legacy"]:
         return named
     if _EXPLICIT_BOTH.search(question):
         return list(SCHEME_CATALOG)
@@ -2421,6 +4109,117 @@ def _mention_in_question(value: str, question: str) -> bool:
     return norm(value) in norm(question)
 
 
+# A name the question itself introduces as a PRODUCER GROUP. Focus Legacy group
+# names routinely collide with real places ("Nongstoin PG", "Mairang Producer
+# Group") because groups are named after where they are, so the LLM extractor
+# tags them as a block or village despite being told not to — and the geography
+# branches then ask "did you mean the block or the village?" about a name the
+# user never offered as a place (reported 2026-09-23).
+_PG_NAMED_ENTITY = re.compile(
+    r"\b(?:producer[\s-]?group|pg|group)s?\s+"
+    r"(?:named|called|by the name of)\s+"
+    r"(?:as\s+)?"
+    # Name words may start with a digit or a bracket \u2014 "Bak 15 Banana Dijogre",
+    # "Ieintylli Pg (cham Cham Pig Fattening Pg)" \u2014 and run to 8 words.
+    r"[\"\u201c\u2018']?(?P<name>[A-Za-z0-9(][\w.\-()&']*(?:\s+[A-Za-z0-9(][\w.\-()&']*){0,7}?)"
+    # The name ends the sentence, or is followed by a place / scope phrase:
+    # "named Nongstoin PG in Betasing block" \u2014 without the second branch the
+    # whole pattern missed and "Nongstoin" was resolved as a BLOCK.
+    r"[\"\u201d\u2019']?\s*(?=[?.,;:]|$|(?:in|for|under|from|at|within|across|there)\b)",
+    re.IGNORECASE,
+)
+# The group-type suffix, so "Nongstoin PG" strips to the core "Nongstoin" that
+# the extractor actually tagged as a block.
+_PG_SUFFIX = re.compile(
+    r"[\s,]*\b(?:producer\s+groups?|producer\s+grp|p\.?\s*g\.?|group)\.?\s*$",
+    re.IGNORECASE,
+)
+
+
+def _question_without_pg_name(question: str) -> str:
+    """The question with a producer-group NAME the user labelled as one blanked
+    out, for the place-name SCANS in resolve_entities. _drop_producer_group_names
+    only cleans the extractor's mentions; the admin-level gate and the block
+    backstop then re-scan the raw text and put the name straight back — "Is
+    there any Producer Group named Nongstoin PG?" (Focus Legacy QA TC-13,
+    2026-09-25) became "Nongstoin: the block or the village?", and the chip
+    turned a name lookup into a geography question. Unchanged when no group is
+    named."""
+    m = _PG_NAMED_ENTITY.search(question or "")
+    if not m:
+        return question
+    return (question[: m.start("name")] + question[m.end("name"):]).strip()
+
+
+def _drop_producer_group_names(question: str, mentions: dict) -> dict:
+    """Remove geography mentions that the question introduced as a PRODUCER
+    GROUP name. The name still reaches SQL generation in the question text,
+    where the pg_name ILIKE rule handles it; what must not happen is a
+    block/village disambiguation about a group the user named.
+
+    Narrow by construction: only a name the question itself labelled with group
+    phrasing is stripped, so "disbursement in Nongstoin" still resolves as
+    geography."""
+    m = _PG_NAMED_ENTITY.search(question or "")
+    if not m:
+        return mentions
+    named = m.group("name").strip()
+    core = _PG_SUFFIX.sub("", named).strip().lower()
+    if not core:
+        return mentions
+
+    out = dict(mentions)
+    for dim in ("district", "block", "village"):
+        val = str(out.get(dim) or "").strip().lower()
+        if val and (val == core or val in core or core in val):
+            out.pop(dim, None)
+            logger.info("dropped %s mention %r — the question names it as a producer group",
+                        dim, mentions.get(dim))
+    for dim in ("districts", "blocks"):
+        vals = out.get(dim)
+        if isinstance(vals, list):
+            kept = [v for v in vals
+                    if str(v).strip().lower() not in (core,)
+                    and core not in str(v).strip().lower()]
+            if len(kept) != len(vals):
+                logger.info("dropped %s entries naming the producer group %r", dim, named)
+            if kept:
+                out[dim] = kept
+            else:
+                out.pop(dim, None)
+    return out
+
+
+# An unmistakable financial-year range: "2024-25", "FY 2024-25", "2024-2025".
+_EXPLICIT_FY_RANGE_RE = re.compile(r"\b((?:19|20|21)\d\d\s*[-/]\s*\d{2}(?:\d{2})?)\b")
+
+
+def _backfill_explicit_year(question: str, schemes: list[str], mentions: dict) -> dict:
+    """Fill the year slot from the text when the LLM extractor dropped it.
+
+    The extractor sometimes returns no "year" for a question that plainly names
+    one (TC-23, 2026-09-25: "What was the total amount remitted in FY 2024-25
+    for Focus Legacy" -> {}). With no year_key resolved, the scope gate then
+    asked "which area and time period?" and its "all years" chip made the SQL
+    drop the FY — ₹51.01 Cr (every year) reported as FY 2024-25's ₹11.50 Cr.
+
+    Deliberately narrow: only an explicit NNNN-NN range, only when exactly one
+    distinct one is named, and only when the scheme holds that year (an absent
+    year is the year-gap guard's business, already settled before this runs)."""
+    if mentions.get("year"):
+        return mentions
+    toks = {yk for m in _EXPLICIT_FY_RANGE_RE.finditer(question or "")
+            if (yk := _parse_year_key(m.group(1))) is not None}
+    if len(toks) != 1:
+        return mentions
+    yk = next(iter(toks))
+    if not _year_in_data_range(yk, schemes):
+        return mentions
+    fy = f"{yk}-{(yk + 1) % 100:02d}"
+    logger.info("year mention back-filled from the question text: FY %s", fy)
+    return {**mentions, "year": fy}
+
+
 async def extract_entity_mentions(question: str) -> dict:
     """Which spans of the question name a district, block, village, year or
     assembly constituency? Span-finding only — resolving each span to a
@@ -2458,10 +4257,16 @@ Selsella/West Garo Hills/Abagre as the AREA the figure is about, exactly like
 (disbursement, expenditure, spending, amount, total) is itself the thing being
 named — the name after "of" is still a place, and must still be extracted.
 
-A SCHEME name (MGNREGA, PMAY-G, Focus Plus, CM Elevate, or a close variant)
-is NEVER a place — do not extract it as a district/block/village even when it
-follows "for"/"of"/"under" exactly like a place would ("disbursement for
-Focus Plus" names the scheme, not an area; extract nothing).
+A SCHEME name (MGNREGA, PMAY-G, Focus Plus, CM Elevate, Focus Legacy, or a
+close variant) is NEVER a place — do not extract it as a district/block/village
+even when it follows "for"/"of"/"under" exactly like a place would
+("disbursement for Focus Plus" names the scheme, not an area; extract nothing).
+
+A PRODUCER GROUP name or id is NEVER a place either. A Focus Legacy pg_id looks
+like "PG-FOCUS-WGH-7089" and contains a district abbreviation — do NOT extract
+that abbreviation, or any part of the id, as a district. A producer group NAME
+("Muskan Producer Group", "Bak 15 Banana", "Iainehlang Pg") often reads like a
+village name; it is a group, not an area, so extract nothing from it.
 
 Likewise, a CM Elevate SUB-SCHEME name is NEVER a place, even though several
 of them sound like plausible village/block names in isolation: Piggery,
@@ -2691,7 +4496,7 @@ _EXPLICIT_LEVEL_RE = {
 }
 
 
-# Assembly constituency is recorded on exactly ONE fact in the whole warehouse:
+# Assembly constituency is recorded on exactly ONE fact directly:
 # curated.fact_mgnrega_employment (surfaced as curated.v_employment, see
 # data/schema/schema_for_developers.md). It does not exist on MGNREGA
 # expenditure, nor on PMAY-G / Focus Plus / CM Elevate at all — the resolver
@@ -2699,6 +4504,18 @@ _EXPLICIT_LEVEL_RE = {
 # mgnrega_expenditure"). Offering "the X assembly constituency" as a chip for a
 # question about expenditure or houses would therefore invite the user to pick
 # a reading that can never be answered, so the chip is suppressed for those.
+#
+# FOCUS LEGACY IS THE EXCEPTION, and its own contract is explicit about it:
+# v_focus_legacy exposes geography_key, so joining curated.dim_geography for
+# ac_name/ac_number is a permitted dimension join on a declared FK
+# (focuslegacy_schema_partitions.yaml semantic_rules.constituency_rule,
+# status ANSWERABLE_ONLY_BY_AN_EXPLICIT_DIMENSION_JOIN; the worked SQL is
+# sanctioned_patterns.constituency in the join-graph YAML, and
+# schema_context's Focus Legacy block already ships it). The rule's own
+# runtime_behavior says "Answer the question ... Do not silently refuse", so
+# suppressing the AC reading for this scheme hid a level the data can answer:
+# "How many Producer Groups are mapped to Amlarem?" offered only block and
+# village, though Amlarem is also a constituency (reported 2026-09-23).
 #
 # The employment measures that DO carry it, per that same schema: person-days,
 # households/persons employed, job cards, 100-days completions, women
@@ -2722,11 +4539,27 @@ _AC_INCAPABLE_METRIC = re.compile(
 )
 
 
+# The schemes whose data can answer a constituency question at all. MGNREGA
+# carries ac_name on its employment fact; Focus Legacy reaches it through the
+# documented dim_geography join on geography_key. PMAY-G, Focus Plus and CM
+# Elevate have no route to it and keep the unconditional refusal. CM Elevate
+# Legacy reaches it the same way as Focus Legacy (geography_key -> dim_geography,
+# a declared FK), and the join matches the source workbook's own
+# mapped_constituency_name exactly (Mairang 52 = 52, verified 2026-09-25).
+_AC_CAPABLE_SCHEMES = ("MGNREGA", "Focus Legacy", "CM Elevate Legacy")
+
+
 def _ac_dimension_available(question: str, schemes: list[str]) -> bool:
     """True when an assembly-constituency reading of a place name could
     actually be queried for THIS question. False suppresses the AC chip."""
-    if (schemes or []) != ["MGNREGA"]:
+    _live = list(schemes or [])
+    if len(_live) != 1 or _live[0] not in _AC_CAPABLE_SCHEMES:
         return False
+    if _live[0] == "CM Elevate Legacy":
+        # Every measure on this view (records, sanctioned, subsidy, loan,
+        # disbursement) hangs off the same geography_key, so the MGNREGA
+        # employment-vs-expenditure metric test does not apply.
+        return True
     q = question or ""
     # An explicit expenditure/housing metric rules it out even if an
     # employment-ish word also appears ("wage employment expenditure").
@@ -3019,15 +4852,35 @@ async def resolve_entities(question: str, schemes: list[str],
     # comma-joined scope-pause reply like "wgh, 1999-20" does exactly that). A
     # year outside the data window makes the whole question unanswerable
     # regardless of the place, so this must not depend on anything downstream.
+    _year_gap_note: "str | None" = None
     if settings.YEAR_RANGE_GUARD_ENABLED:
         _yraw = _out_of_range_year_in(question, schemes)
         if _yraw is not None:
-            raise _year_out_of_range_clarification(question, _yraw, schemes)
+            # Only refuse when NOTHING in the question is answerable. A question
+            # naming an absent year AND a valid one ("compare FY 2023-24 and FY
+            # 2024-25" — the Focus Legacy gap) used to be refused outright, which
+            # asked the user to re-pick years they had already named, from a list
+            # that deliberately excludes the one they asked about. Drop the
+            # absent year, note the gap so the answer states it, and answer for
+            # the years that exist — which is what the scheme's own response
+            # contract requires (fy_gap_note).
+            question, _year_gap_note, _handled = _apply_year_gap(question, schemes)
+            if not _handled:
+                raise _year_out_of_range_clarification(question, _yraw, schemes)
 
     mentions = await extract_entity_mentions(question)
+    mentions = _drop_producer_group_names(question, mentions)
+    mentions = _backfill_explicit_year(question, schemes, mentions)
+    # Every raw-text place SCAN below reads this copy, so a producer-group name
+    # the user labelled as one is never re-found as a block/village/constituency.
+    _scan_q = _question_without_pg_name(question)
 
     resolved: dict[str, object] = {}
     notes: list[str] = []
+    if _year_gap_note:
+        # Stated in the answer, so a dropped gap year is visible to the user
+        # rather than silently ignored.
+        notes.append(_year_gap_note)
     # Human-readable names for whatever the query ends up filtering on, keyed by
     # dimension. Handed to the response composer so it says "West Garo Hills",
     # not the "wgh" the user typed or the "WEST GARO HILLS" DB literal.
@@ -3067,7 +4920,7 @@ async def resolve_entities(question: str, schemes: list[str],
             # name is already in hand (extractor value, else the hint).
             _placed = mentions.get("village") or mentions.get("block")                 or mentions.get("district") or village_hint
         else:
-            _placed = _canonical_in_question(question, schemes[0], _stated_level)
+            _placed = _canonical_in_question(_scan_q, schemes[0], _stated_level)
             if not _placed:
                 # No catalogue name in the text — fall back to whatever the
                 # extractor found, but only if it resolves at this level.
@@ -3120,7 +4973,7 @@ async def resolve_entities(question: str, schemes: list[str],
                    ("district", "block", "village", "assembly_constituency")):
             _found = None
             for _dim in ("block", "assembly_constituency"):
-                _found = _canonical_in_question(question, _scheme0, _dim)
+                _found = _canonical_in_question(_scan_q, _scheme0, _dim)
                 if _found:
                     mentions = {**mentions, _dim: _found}
                     logger.info("admin-level gate: %r scanned from question text "
@@ -3175,7 +5028,7 @@ async def resolve_entities(question: str, schemes: list[str],
             # growing each round). When the raw text contains a LONGER name
             # that resolves to exactly one village, that is the real mention:
             # nothing is ambiguous, so the gate must stand down.
-            _scanned = await _scan_village_in_question(question, _scheme0)
+            _scanned = await _scan_village_in_question(_scan_q, _scheme0)
             if _scanned and len(_scanned[1]) == 1 \
                     and str(_name).strip().lower() in _scanned[0].strip().lower() \
                     and len(_scanned[0]) > len(str(_name)):
@@ -3422,7 +5275,7 @@ async def resolve_entities(question: str, schemes: list[str],
             # ("william nagar(mb)" from "william nagar(mb) - ward no.4"), not a
             # genuine block-vs-village ambiguity. Resolve the village instead of
             # asking a question the text already answers.
-            _longer = await _scan_village_in_question(question, schemes[0] if schemes else "")
+            _longer = await _scan_village_in_question(_scan_q, schemes[0] if schemes else "")
             if _longer and len(_longer[1]) == 1 \
                     and str(mentions["block"]).strip().lower() in _longer[0].strip().lower() \
                     and len(_longer[0]) > len(str(mentions["block"])):
@@ -3687,7 +5540,7 @@ async def resolve_entities(question: str, schemes: list[str],
     # explicitly declined.
     if not _village_text and not resolved.get("village_code") \
             and not resolved.get("village_code_list") and _stated_level is None:
-        _scanned = await _scan_village_in_question(question, schemes[0] if schemes else "")
+        _scanned = await _scan_village_in_question(_scan_q, schemes[0] if schemes else "")
         if _scanned:
             _vname, _vhits = _scanned
             logger.info("village backstop: %r matched %d village(s) in the question text "
@@ -3874,8 +5727,43 @@ async def resolve_entities(question: str, schemes: list[str],
                 resolved["cm_scheme"] = grp2["schemes"]
                 display["cm_scheme"] = f"the {grp2['group']} schemes ({', '.join(grp2['schemes'])})"
 
+    # CM Elevate Legacy's 13 schemes — its OWN catalogue (the stored spellings
+    # differ from the applications dataset's: 'Prime Tourism Vehicle Scheme' vs
+    # 'PRIME Tourism Vehicle Scheme'), resolved into the same cm_scheme slot.
+    # Skipped when the applications dataset is also in play, so the two
+    # catalogues never overwrite each other's literal.
+    if "CM Elevate Legacy" in schemes and "CM Elevate" not in schemes:
+        _seri = _cm_legacy_sericulture_choice(question)
+        if _seri == "ask":
+            raise _cm_legacy_sericulture_clarification(question)
+        cs = resolve_cm_scheme(question, "CM Elevate Legacy")
+        if _seri:
+            resolved["cm_scheme"] = _seri if len(_seri) > 1 else _seri[0]
+            display["cm_scheme"] = " and ".join(_seri)
+        elif cs and cs.values:
+            resolved["cm_scheme"] = cs.values if len(cs.values) > 1 else cs.values[0]
+            display["cm_scheme"] = cs.display or " and ".join(cs.values)
+
+    # An assembly constituency cuts across districts (8 of 56 straddle two), so a
+    # district the user never named must not narrow it. Seen 2026-09-25 (CM
+    # Elevate Legacy TC-31, "applications mapped to Mairang constituency"):
+    # resolution returned district EASTERN WEST KHASI HILLS beside the AC — Mairang
+    # is also a block there — and the SQL ANDed it in. Harmless for Mairang, which
+    # sits wholly in that district; a silent undercount for a straddling one. A
+    # district the user did name (or picked via the ", within the X district only"
+    # chip) is in the question text, so the resolver's own scan finds it and it stays.
+    if resolved.get("assembly_constituency") and resolved.get("district"):
+        _named = scan_dimension(_scan_q, schemes[0] if schemes else "", "district")
+        if not (_named and _named.status == "resolved"
+                and str(_named.canonical).upper() == str(resolved["district"]).upper()):
+            logger.info("AC %r: dropped district %r — not named in the question",
+                        resolved["assembly_constituency"], resolved["district"])
+            resolved.pop("district", None)
+            display.pop("district", None)
+
     if prior_resolved:
-        if not mentions.get("district") and "district" not in resolved and prior_resolved.get("district"):
+        if not mentions.get("district") and "district" not in resolved and prior_resolved.get("district") \
+                and not resolved.get("assembly_constituency"):
             resolved["district"] = prior_resolved["district"]
         if not mentions.get("block") and "block" not in resolved and prior_resolved.get("block"):
             resolved["block"] = prior_resolved["block"]
@@ -3902,8 +5790,26 @@ async def resolve_entities(question: str, schemes: list[str],
         if (schemes == ["CM Elevate"] and "cm_scheme" not in resolved
                 and prior_resolved.get("cm_scheme")):
             resolved["cm_scheme"] = prior_resolved["cm_scheme"]
+        # Same carry for CM Elevate Legacy — but only a value from ITS catalogue,
+        # so a sub-scheme pinned while talking about the applications dataset
+        # cannot leak a literal this view does not store.
+        if (schemes == ["CM Elevate Legacy"] and "cm_scheme" not in resolved
+                and prior_resolved.get("cm_scheme")):
+            _prior = prior_resolved["cm_scheme"]
+            _vals = _prior if isinstance(_prior, list) else [_prior]
+            _known = set(canonical_names("CM Elevate Legacy", "cm_scheme"))
+            if _vals and all(v in _known for v in _vals):
+                resolved["cm_scheme"] = _prior
 
-    return {"resolved": resolved, "notes": notes, "display": display}
+    out = {"resolved": resolved, "notes": notes, "display": display}
+    if _year_gap_note:
+        # _apply_year_gap rewrote the question (the absent year stripped, or
+        # swapped for the nearest year with data on a comparison). SQL must be
+        # generated from THAT text: from the original, the generator filtered
+        # on the absent year and the note above then contradicted the result
+        # (TC-24, 2026-09-25: "2024-25: 114,990,000" with no 2023-24 mention).
+        out["question"] = question
+    return out
 
 
 _FOCUSPLUS_BENEFICIARY_QUALIFIER = re.compile(
@@ -4128,6 +6034,124 @@ def _uppercase_geo_literals(sql: str) -> str:
 # prose-doesn't-reliably-win gap as _focusplus_single_district_beneficiary_guard
 # above. Deterministic strip instead of a repair round trip, since the fix
 # (drop one column) is unambiguous once the shape is detected.
+# CM Elevate Legacy: the Unresolved-placeholder exclusion belongs ONLY on village
+# counts and village lists (schema_context rule 9, geography_unresolved_rule).
+# The 404 no-village records still have a known district, so a district / scheme
+# / year total that drops them is simply wrong. Confirmed in the 2026-09-25
+# use-case QA (TC-27, "total disbursement for each district"): the generator
+# copied the filter from the village shots and returned ₹53.30 Cr statewide
+# against a true ₹81.10 Cr. The rule is in the prompt; it does not reliably win,
+# and the fix (delete one predicate) is unambiguous once the shape is detected.
+_UNRESOLVED_NE = r"(?:\w+\.)?entity_type\s*(?:<>|!=)\s*'Unresolved'"
+_UNRESOLVED_WHERE_AND_RE = re.compile(rf"\bWHERE\s+{_UNRESOLVED_NE}\s+AND\s+", re.IGNORECASE)
+_UNRESOLVED_AND_RE = re.compile(rf"\s+AND\s+{_UNRESOLVED_NE}", re.IGNORECASE)
+_UNRESOLVED_WHERE_ONLY_RE = re.compile(rf"\s*\bWHERE\s+{_UNRESOLVED_NE}(?=\s*(?:GROUP|ORDER|LIMIT|;|\)|$))",
+                                       re.IGNORECASE)
+_VILLAGE_SQL_RE = re.compile(r"\bvillage_code\b|\blgd_village_name\b", re.IGNORECASE)
+_VILLAGE_WORD_RE = re.compile(r"\bvillages?\b", re.IGNORECASE)
+# Focus Legacy has the same placeholder design and the same rule (README §5,
+# "entity_type <> 'Unresolved' on village counts and lists only — never on
+# money, district"). Its 2026-09-25 QA hit the identical bug: TC-18 "total amount
+# disbursed for East Khasi Hills" dropped 11 no-village payments (₹5,35,15,000
+# against a true ₹5,42,05,000).
+_UNRESOLVED_PLACEHOLDER_SCHEMES = (["CM Elevate Legacy"], ["Focus Legacy"])
+
+
+def _cm_legacy_keep_unresolved_off_village(question: str, schemes: list[str], sql: str) -> str:
+    if (schemes not in _UNRESOLVED_PLACEHOLDER_SCHEMES
+            or not re.search(_UNRESOLVED_NE, sql or "", re.IGNORECASE)):
+        return sql
+    if _VILLAGE_SQL_RE.search(sql) or _VILLAGE_WORD_RE.search(question or ""):
+        return sql
+    out = _UNRESOLVED_WHERE_AND_RE.sub("WHERE ", sql)
+    out = _UNRESOLVED_AND_RE.sub("", out)
+    out = _UNRESOLVED_WHERE_ONLY_RE.sub("", out)
+    if out != sql:
+        logger.info("%s: dropped entity_type <> 'Unresolved' from a non-village query — "
+                    "the no-village records still count at district grain", schemes[0])
+    return out
+
+
+# CM Elevate Legacy constituency SQL joins curated.dim_geography for ac_name, and
+# the view already carries every geography column dim_geography has
+# (lgd_district, lgd_block, …). An unqualified one is then "ambiguous" to
+# Postgres, and the repair loop kept re-emitting it until the budget ran out
+# (TC-31 "applications mapped to Mairang constituency", 2026-09-25). The view's
+# copy is always the intended one, so qualify bare references with its alias.
+_CML_VIEW_ALIAS_RE = re.compile(
+    r"\bFROM\s+curated\.v_cm_elevate_disbursement\s+(?:AS\s+)?(?!JOIN\b|WHERE\b|GROUP\b|ORDER\b|LIMIT\b)(\w+)",
+    re.IGNORECASE)
+_DIM_GEO_JOIN_RE = re.compile(r"\bJOIN\s+curated\.dim_geography\b", re.IGNORECASE)
+_SHARED_GEO_COLS = ("lgd_district", "lgd_block", "lgd_village_name", "village_code",
+                    "entity_type", "on_roster", "has_geo_conflict")
+
+
+def _cm_legacy_qualify_shared_geo_cols(schemes: list[str], sql: str) -> str:
+    if schemes != ["CM Elevate Legacy"] or not _DIM_GEO_JOIN_RE.search(sql or ""):
+        return sql
+    m = _CML_VIEW_ALIAS_RE.search(sql)
+    if not m:
+        return sql
+    alias = m.group(1)
+    out = sql
+    for col in _SHARED_GEO_COLS:
+        # Leave output aliases ("AS lgd_district") and already-qualified refs alone.
+        out = re.sub(rf"(\bAS\s+)?(?<![\w.]){col}\b",
+                     lambda mm, c=col: mm.group(0) if mm.group(1) else f"{alias}.{c}",
+                     out, flags=re.IGNORECASE)
+    if out != sql:
+        logger.info("CM Elevate Legacy: qualified view geography columns with %r "
+                    "(dim_geography join)", alias)
+    return out
+
+
+# Focus Legacy: a group's member count is recorded on EACH of its payments, so
+# "how many members does <group> have" / "groups with more than N members" is the
+# group's SIZE — MAX(no_of_pg_members) per pg_id. The generator SUMmed it across
+# the group's payments instead, and 2,655 groups were paid more than once: a
+# 20-member group paid twice read "40 members", the 190-member outlier "201"
+# (use-case QA TC-14b / TC-15, 2026-09-25). SUM(no_of_pg_members) stays correct
+# for memberships PAID FOR (a district / year / scheme total), so this fires only
+# when the SQL works at group grain — GROUP BY pg_id, or a filter on one group.
+_FL_GROUP_SIZE_Q = re.compile(
+    r"\bhow\s+many\s+members\b|\bnumber\s+of\s+members\s+(?:in|of)\b|"
+    r"\b(?:more|less|fewer)\s+than\s+\d+\s+(?:of\s+)?members\b|"
+    r"\b(?:over|above|under|below|at\s+least|at\s+most)\s+\d+\s+members\b|"
+    r"\bgroup\s+size\b|\bmember\s+count\b|\b(?:largest|biggest|smallest)\s+(?:producer\s+)?groups?\b",
+    re.IGNORECASE)
+_FL_MONEY_Q = re.compile(r"\bpaid\b|\bmemberships\b|\bamount\b|\bdisburs\w*|\breceiv\w*|\bmoney\b|"
+                         r"\bremit\w*|\brupees?\b|₹|\brs\.?\s*\d", re.IGNORECASE)
+_FL_SUM_MEMBERS = re.compile(r"\bSUM\s*\(\s*(?:\w+\.)?no_of_pg_members\s*\)", re.IGNORECASE)
+_FL_GROUP_GRAIN = re.compile(
+    r"\bGROUP\s+BY\s+(?:[\w.]+\s*,\s*)*(?:\w+\.)?pg_id\b|\b(?:\w+\.)?pg_(?:name|id)\s*(?:=|ILIKE|LIKE|IN)\b",
+    re.IGNORECASE)
+
+
+# Focus Legacy: the view's audit copies block_name_raw / district_name_raw are NULL
+# on every row since the 2026-09-25 database change (the curated lgd_block /
+# lgd_district were fixed to carry the source values instead). A query filtering
+# on them returns nothing: "How many Producer Groups are mapped to Nongstoin
+# block?" answered "no matching records" against a true 460 (bulk block QA, 3 of
+# 168 questions). Read the curated columns, which hold the same values.
+_FL_RAW_GEO_COL = re.compile(r"\b(block|district)_name_raw\b", re.IGNORECASE)
+
+
+def _focus_legacy_geo_columns(schemes: list[str], sql: str) -> str:
+    if schemes != ["Focus Legacy"] or not _FL_RAW_GEO_COL.search(sql or ""):
+        return sql
+    out = _FL_RAW_GEO_COL.sub(lambda m: f"lgd_{m.group(1).lower()}", sql)
+    logger.info("Focus Legacy: block/district_name_raw -> lgd_block/lgd_district (raw copies are empty)")
+    return out
+
+
+def _focus_legacy_group_size_summed(question: str, schemes: list[str], sql: str) -> bool:
+    return (schemes == ["Focus Legacy"]
+            and bool(_FL_GROUP_SIZE_Q.search(question or ""))
+            and not _FL_MONEY_Q.search(question or "")
+            and bool(_FL_SUM_MEMBERS.search(sql or ""))
+            and bool(_FL_GROUP_GRAIN.search(sql or "")))
+
+
 _VERIFICATION_MENTION = re.compile(r"verif\w*", re.IGNORECASE)
 _STATUS_ENUMERATE_AUDIT = re.compile(
     r"what\s+\S+\s+status\s+values|which\s+\S+\s+status\s+values|"
@@ -4631,6 +6655,11 @@ def _verifier_year_complaint_is_false(issue: str, resolved: dict, sql: str) -> b
     if not _VERIFIER_YEAR_COMPLAINT.search(issue or ""):
         return False
     filters = set(re.findall(r"\byear_key\s*=\s*(\d{4})\b", sql or ""))
+    # A view that carries the FY label filters on it instead — financial_year_short
+    # = '2024-25' IS year_key 2024 (Focus Legacy QA TC-23, 2026-09-25: rejected as
+    # "the resolved entity value (2024) is not present in the WHERE clause").
+    filters |= set(re.findall(r"\bfinancial_year(?:_short)?\s*=\s*'(\d{4})-\d{2}'", sql or "",
+                              re.IGNORECASE))
     return filters == {str(int(year))}
 
 
@@ -4745,6 +6774,59 @@ def _verifier_apostrophe_complaint_is_false(issue: str, resolved: dict, sql: str
     return all(v in unescaped for v in vals)
 
 
+# Seventh known verifier false positive: a "prohibited join" in SQL that joins
+# nothing. The PROHIBITED JOINS block carries self-edges that are really grain
+# rules ("NEVER join curated.v_focus_legacy -> curated.v_focus_legacy directly.
+# Use GROUP BY pg_id instead.") and "any -> <base fact>" edges, and the small
+# verifier reads them as forbidding the view itself. Confirmed 2026-09-25 in the
+# Focus Legacy QA: TC-22 "records for each financial year" was rejected on every
+# attempt ("The SQL joins directly to 'curated.v_focus_legacy', which is a
+# prohibited join") for a one-table GROUP BY, and TC-20/TC-21 intermittently
+# ("joins directly to curated.fact_focus_legacy_disbursement" — a table the SQL
+# never names). The repair budget ran out and a plain COUNT(*) died as
+# "couldn't build a working query".
+#
+# Discarded only when the complaint is about a PROHIBITED join and is provably
+# false: the SQL has no JOIN and reads a single table, or every table the
+# complaint names is absent from the SQL. A query that really joins a named
+# table still raises.
+_VERIFIER_PROHIBITED_JOIN = re.compile(r"\bprohibit\w*", re.IGNORECASE)
+_SQL_TABLE_REF = re.compile(r"\b(?:curated|raw|semantic|meta|app)\.\w+", re.IGNORECASE)
+_SQL_JOIN_KW = re.compile(r"\bJOIN\b", re.IGNORECASE)
+_SQL_FROM_LIST = re.compile(r"\bFROM\s+[\w.]+(?:\s+(?:AS\s+)?\w+)?\s*,", re.IGNORECASE)
+
+
+# Eighth: a Check 2 (resolved-entity) complaint when NOTHING was resolved. The
+# verify prompt tells the verifier that "an empty or absent block means there is
+# nothing to check here, so answer this check true" — yet it flagged "How many
+# Producer Groups are mapped to each district" (GROUP BY lgd_district, no WHERE)
+# on every attempt: "The RESOLVED ENTITIES block is empty ... the SQL attempts
+# to group by lgd_district, which implies a geography filter exists" (Focus
+# Legacy QA TC-25, 2026-09-25). Discarded only when the resolved block really is
+# empty of filter entities and the complaint names no other check.
+_VERIFIER_CHECK2 = re.compile(r"\bcheck\s*2\b|\bresolved\s+entit", re.IGNORECASE)
+# Only an explicit reference to another check keeps the complaint alive — its
+# wording ("filtering/aggregating on a dimension that was not resolved") is the
+# same false Check 2 complaint, not a grain or metric finding.
+_VERIFIER_OTHER_CHECK = re.compile(r"\bcheck\s*[134]\b|\bprohibit\w*|\bmissing\s+(?:sum|count|avg)\b",
+                                   re.IGNORECASE)
+def _verifier_check2_on_empty_entities(issue: str, resolved: dict) -> bool:
+    if any(v not in (None, "", [], {}) for v in (resolved or {}).values()):
+        return False
+    return bool(_VERIFIER_CHECK2.search(issue or "")) and not _VERIFIER_OTHER_CHECK.search(issue or "")
+
+
+def _verifier_join_complaint_is_false(issue: str, sql: str) -> bool:
+    if not (_VERIFIER_PROHIBITED_JOIN.search(issue or "") and re.search(r"\bjoin", issue or "", re.IGNORECASE)):
+        return False
+    in_sql = {t.lower() for t in _SQL_TABLE_REF.findall(sql or "")}
+    joins = bool(_SQL_JOIN_KW.search(sql or "") or _SQL_FROM_LIST.search(sql or ""))
+    if not joins and len(in_sql) <= 1:
+        return True
+    named = {t.lower() for t in _SQL_TABLE_REF.findall(issue or "")}
+    return bool(named) and not (named & in_sql)
+
+
 async def _verify_sql(question: str, schemes: list[str], entity_result: dict, sql: str) -> "str | None":
     """One short issue sentence if the semantic verifier (SQL_VERIFY_MODEL,
     qwen4-deploy — see app/config.py) flags this SQL as not actually
@@ -4802,6 +6884,16 @@ async def _verify_sql(question: str, schemes: list[str], entity_result: dict, sq
             "SQL verifier demanded a district/block that the RESOLVED ENTITIES block "
             "deliberately suppressed as redundant with village_code — discarding: %s", issue)
         return None
+    if _verifier_check2_on_empty_entities(issue, entity_result.get("resolved") or {}):
+        logger.warning(
+            "SQL verifier raised a resolved-entity (check 2) complaint with no resolved "
+            "entities — its own instructions make that check pass — discarding: %s", issue)
+        return None
+    if _verifier_join_complaint_is_false(issue, sql):
+        logger.warning(
+            "SQL verifier reported a prohibited join the SQL does not make (no JOIN, or the "
+            "named table is not in the query) — discarding: %s", issue)
+        return None
     return issue
 
 
@@ -4810,9 +6902,22 @@ async def execute_with_repair(question: str, schemes: list[str], entity_result: 
                               max_repairs: int = 3) -> tuple[str, list[dict]]:
     sql = initial_sql if initial_sql is not None else await generate_sql(question, schemes, entity_result)
     for attempt in range(max_repairs + 1):
+        sql = _focus_legacy_geo_columns(schemes, sql)
         sql = _uppercase_geo_literals(sql)
         sql = _focusplus_drop_unrequested_verification_status(question, schemes, sql)
+        sql = _cm_legacy_keep_unresolved_off_village(question, schemes, sql)
+        sql = _cm_legacy_qualify_shared_geo_cols(schemes, sql)
         try:
+            if _focus_legacy_group_size_summed(question, schemes, sql):
+                raise ValueError(
+                    "this question asks for a producer group's SIZE (its member count), but the "
+                    "query SUMs no_of_pg_members across the group's payments. A group's member "
+                    "count is recorded on EACH payment and 2,655 groups were paid more than once, "
+                    "so a SUM double-counts them (a 20-member group paid twice reads 40). Use "
+                    "MAX(no_of_pg_members) AS group_size per pg_id — GROUP BY pg_id with "
+                    "MAX(pg_name) for display, and put any 'more than N members' test in HAVING "
+                    "MAX(no_of_pg_members) > N. Keep every other clause as it was."
+                )
             bad_code = _village_name_filter_instead_of_code(entity_result, sql)
             if bad_code is not None:
                 raise ValueError(
@@ -5150,9 +7255,34 @@ def _deterministic_answer(rows: list[dict]) -> str:
             return f"{prefix}{_fmt_num(v)} {k.replace('_', ' ')}."
         if len(nums) >= 2:
             return prefix + "; ".join(f"{k.replace('_', ' ')}: {_fmt_num(v)}" for k, v in nums) + "."
-    return "Results — " + "; ".join(
-        ", ".join(f"{k}: {v}" for k, v in r.items()) for r in rows[:5]
-    )
+    # Multi-row: one labelled line per row. This used to be a raw
+    # "Results — col: val; col: val" dump of the first 5 rows only, which read as
+    # debug output and silently dropped the rest (a 12-district summary showed 5
+    # districts — CM Elevate Legacy use-case QA TC-25 / TC-36, 2026-09-25).
+    shown = rows[:_DETERMINISTIC_MAX_ROWS]
+    lines = []
+    for r in shown:
+        labels = [str(v) for v in r.values() if v is not None and _as_number(v) is None]
+        metrics = ", ".join(f"{_metric_label(k)}: {_fmt_num(v)}" for k, v in _row_metrics(r))
+        head = " / ".join(labels) or "(no label)"
+        lines.append(f"- {head} — {metrics}" if metrics else f"- {head}")
+    more = len(rows) - len(shown)
+    tail = f"\n…and {more} more row{'s' if more != 1 else ''} in the table." if more > 0 else ""
+    return f"Here are the {len(rows)} results:\n" + "\n".join(lines) + tail
+
+
+_DETERMINISTIC_MAX_ROWS = 15
+
+
+def _metric_label(col: str) -> str:
+    """A readable name for a result column: total_disbursed_cr -> 'total disbursed
+    (₹ crore)'. The unit suffixes are the SQL-prompt conventions (_cr, _lakh,
+    _pct, _rupees)."""
+    for suffix, unit in (("_cr", " (₹ crore)"), ("_lakh", " (₹ lakh)"),
+                         ("_pct", " (%)"), ("_rupees", " (₹)")):
+        if col.endswith(suffix):
+            return col[: -len(suffix)].replace("_", " ") + unit
+    return col.replace("_", " ")
 
 
 def _no_data_answer(schemes: list[str] | None, entities: dict[str, str] | None) -> str:
@@ -5225,7 +7355,15 @@ def _entity_names_block(entities: dict[str, str] | None) -> str:
 async def compose_response(question: str, sql: str, rows: list[dict],
                            notes: list[str] | None = None,
                            entities: dict[str, str] | None = None,
-                           schemes: list[str] | None = None) -> str:
+                           schemes: list[str] | None = None,
+                           style_examples: str = "",
+                           extra_numbers: "set[str] | None" = None) -> str:
+    # extra_numbers: figures a caller re-queried and handed over in a note (a
+    # list's true total), which the answer may quote although no row holds
+    # them. None for every caller that doesn't pass it — unchanged behaviour.
+    # style_examples: optional worked answers for the scheme (CM Elevate
+    # Legacy's answer shots). Empty for every other scheme, which leaves the
+    # prompt exactly as it was.
     if not rows:
         return _no_data_answer(schemes, entities)
     preview = rows[:40]
@@ -5236,7 +7374,18 @@ async def compose_response(question: str, sql: str, rows: list[dict],
     # see it, hand the composer the real metric list so it can tell the user
     # exactly what IS available rather than a vague "not covered".
     _nums = [n for r in rows for _k, n in _row_metrics(r)]
-    no_usable_value = bool(_nums) and all(n in (0, None) for n in _nums)
+    # An aggregate that matched NOTHING comes back as one row of NULLs, not as
+    # zero rows, so the `if not rows` guard above cannot catch it. _row_metrics
+    # drops NULL cells (they are not numbers), which left _nums empty and this
+    # test False — the composer then received a row whose only value was None
+    # and reported "the membership count is null", as if the database held a
+    # null for that group rather than nothing having matched the filters
+    # (reported 2026-09-22, "members in Sakania Producer Group"). Detect the
+    # all-NULL row explicitly.
+    _all_null = bool(rows) and not _nums and all(
+        v is None for r in rows for v in r.values()
+    )
+    no_usable_value = (bool(_nums) and all(n in (0, None) for n in _nums)) or _all_null
     metrics_block = ""
     if no_usable_value:
         metrics_block = (
@@ -5314,7 +7463,7 @@ itself, not with "The data shows..." or a description of what the query returned
 Keep each sentence to one idea — short and declarative, not a chain of clauses
 joined by "so" / "as" / "which means".
 {guidance}
-{metrics_block}{names_block}{summary_block}{notes_block}
+{metrics_block}{names_block}{summary_block}{notes_block}{style_examples}
 Question: "{question}"
 Result ({len(rows)} row(s), showing up to {len(preview)}):
 {json.dumps(preview, default=str)}
@@ -5322,7 +7471,7 @@ Result ({len(rows)} row(s), showing up to {len(preview)}):
 Answer:"""
     answer = await llm.call_response_composer(prompt)
 
-    data_nums = _data_numbers(preview) | digest_nums
+    data_nums = _data_numbers(preview) | digest_nums | set(extra_numbers or ())
     # A note may ask the composer to name the figure the question wrongly assumed
     # ("not the 1.71 L assumed…") — allow those premise numbers through the
     # faithfulness check so the correction itself isn't flagged as a misquote.
@@ -5396,6 +7545,13 @@ async def classify_intent(question: str) -> str:
     # fast-path so the "what are" knowledge cue can't win.
     if _CROSS_SCHEME_SET_QUESTION.search(question):
         return "DATA"
+    # "How many members are there in Bak-15 Wachal Pg?" is a lookup in the data;
+    # with no counting noun the classifier sometimes sent it to the reference
+    # docs ("the reference material does not contain…").
+    if _pg_name_question(question):
+        return "DATA"
+    if _PROGRAMME_DESIGN_CUE.search(question):
+        return "KNOWLEDGE"
     if _BREAKDOWN_CUE.search(question):
         return "DATA"
     if _METRIC_WHATIS_CUE.search(question):
@@ -5472,6 +7628,11 @@ async def _answer_data(question: str, scope: "auth.UserScope | None" = None,
     if _wants_cross_scheme_money_ranking(question):
         return await _cross_scheme_money_answer(question)
 
+    # "Focus" with nothing to say WHICH Focus — a two-way ask that keeps what the
+    # user already told us, rather than the generic five-way pause below.
+    if _is_ambiguous_focus(question):
+        raise _focus_ambiguity_clarification(question)
+
     if _needs_scheme_clarification(question):
         raise _scheme_clarification(question)
 
@@ -5481,9 +7642,35 @@ async def _answer_data(question: str, scope: "auth.UserScope | None" = None,
         raise _topn_clarification(question)
 
     schemes = await classify_scheme(question)
+    # Only Focus Legacy holds producer groups and their members. A group name can
+    # contain another scheme's word — "How many members are there in Chisam
+    # Piggery?" was classified CM Elevate (its Piggery sub-scheme) and answered
+    # "3010 members" of the Piggery scheme. A group-name question that names no
+    # scheme of its own is a Focus Legacy question.
+    if schemes != ["Focus Legacy"] and _pg_name_question(question) and not _mentions_scheme(question):
+        logger.info("group-name question %r -> Focus Legacy (was %s)", question, schemes)
+        schemes = ["Focus Legacy"]
+    # Focus Legacy group-name questions are answered deterministically (see
+    # _focus_legacy_pg_name_answer) before any geography resolution, which would
+    # otherwise read a group name like "Nongstoin PG" as a place.
+    if schemes == ["Focus Legacy"]:
+        _pg_answer = await _focus_legacy_pg_name_answer(question)
+        if _pg_answer is not None:
+            return _pg_answer
+    # CM Elevate Legacy: a question its data cannot answer (a sanction rate,
+    # applicant names, constituency, monthly figures, ...) gets the reviewed
+    # not-held explanation now, before any model call.
+    if schemes == ["CM Elevate Legacy"]:
+        _not_held = _cm_legacy_not_held(question)
+        if _not_held is not None:
+            raise _not_held
     # raises ClarificationNeeded if ambiguous
     entity_result = await resolve_entities(question, schemes, prior_resolved=prior_resolved,
                                             village_hint=village_hint)
+    # A year-gap rewrite (see resolve_entities) replaces the question for
+    # everything downstream — SQL generation above all.
+    if entity_result.get("question"):
+        question = entity_result["question"]
 
     # "Garo Hills" / "Khasi Hills" name a hill RANGE, not a district. When one is
     # named and no specific district resolved, either offer its districts as one-tap
@@ -5556,6 +7743,20 @@ async def _answer_data(question: str, scope: "auth.UserScope | None" = None,
     notes = list(entity_result.get("notes") or [])
     notes.extend(_genuine_zero_notes(sql))
     notes.extend(_sector_not_tracked_notes(rows))
+    _style = ""
+    if schemes == ["CM Elevate Legacy"]:
+        notes.extend(_cm_legacy_answer_notes(sql, rows))
+        notes.extend(_cm_legacy_small_money_notes(rows))
+        notes.extend(await _cm_legacy_exact_totals(sql, rows))
+        _style = _cm_legacy_style_block(question)
+    _fl_total = None
+    if schemes == ["Focus Legacy"]:
+        notes.extend(_focus_legacy_answer_notes(question))
+        _fl_total = await _focus_legacy_list_total(sql, rows)
+        if _fl_total:
+            notes.append(f"{_fl_total[0]:,} {_fl_total[1]} match in total; the result lists only the "
+                         f"first {len(rows)}. Say that {_fl_total[0]:,} {_fl_total[1]} match, then name "
+                         "the top ones — never present the list as complete.")
     if settings.PREMISE_CHECK_ENABLED:
         try:
             notes.extend(premise_check.check_premises(question, rows))
@@ -5564,7 +7765,23 @@ async def _answer_data(question: str, scope: "auth.UserScope | None" = None,
 
     answer = await compose_response(question, sql, rows, notes=notes,
                                     entities=entity_result.get("display"),
-                                    schemes=schemes)
+                                    schemes=schemes, style_examples=_style,
+                                    extra_numbers={str(_fl_total[0])} if _fl_total else None)
+    if _fl_total and not re.search(rf"\b{_fl_total[0]:,}\b|\b{_fl_total[0]}\b",
+                                   answer.split("\n", 1)[0]):
+        # Deterministic guarantee: the composer (or its row-by-row fallback)
+        # did not lead with the true count, so the list would read as complete.
+        answer = (f"{_fl_total[0]:,} {_fl_total[1]} match in total; the top {len(rows)} are "
+                  f"shown below.\n\n{answer}")
+    # Year-gap guarantee: the question named a year the scheme does not hold and
+    # _apply_year_gap answered for another. The note says so, but the composer
+    # dropped it (TC-24: "Compare FY 2023-24 and FY 2024-25" answered with
+    # 2022-23 and 2024-25 and no word about 2023-24). Lead with the note.
+    _gap_note = next((n for n in (entity_result.get("notes") or []) if "holds no data" in n), None)
+    if entity_result.get("question") and _gap_note:
+        _absent = re.search(r"\bFY\s*(\d{4}-\d{2})", _gap_note)
+        if _absent and _absent.group(1) not in answer:
+            answer = f"{_gap_note}\n\n{answer}"
     return {
         "route": "data",
         "intent": "DATA",
@@ -5711,6 +7928,12 @@ async def _run_pipeline(question: str, session: "Session | None" = None,
                         scope: "auth.UserScope | None" = None) -> dict:
     raw_question = question
     question = _correct_scheme_spelling(question)
+    # "total amount disbursed under CM Elevate" can only be answered by CM
+    # Elevate Legacy — settle which CM Elevate dataset is meant, once, here.
+    # A DATA decision only: the KNOWLEDGE route undoes it (see _unpin_cm_elevate).
+    _pinned = _pin_cm_elevate_dataset(question)
+    _cm_pinned = _pinned != question
+    question = _pinned
     scope_resumed = False
 
     # Computed early (moved ahead of the original follow-up step) so the step-0
@@ -5756,6 +7979,16 @@ async def _run_pipeline(question: str, session: "Session | None" = None,
             scope_resumed = True
             logger.info("scope clarification resumed -> %r", question)
 
+    # 0--. A request for help with something illegal ("i want to rob a bank,
+    #      give me suggestions") is refused FIRST — before the recommendation /
+    #      pick / listing steps below, any of which could otherwise claim it on a
+    #      word like "suggestions" and answer with an unrelated scheme.
+    _harm = edge.detect_harmful(question)
+    if _harm:
+        return {"route": "edge", "intent": "EDGE", "confidence": "high",
+                "answer": _harm["response"], "edge_type": _harm["type"],
+                "suggestions": [], **_empty_data_fields()}
+
     # 0-. "What is EKH?" / "MYLLIEM full form" — spell out a district or block
     #     straight from the resolver catalogue. Must run BEFORE the edge layer
     #     (which bounces a lone abbreviation as off-topic) and before routing
@@ -5774,6 +8007,23 @@ async def _run_pipeline(question: str, session: "Session | None" = None,
     #      has no single document covering either and either over-elaborates on
     #      one scheme or says "not covered". Same scope-pause carve-out as above.
     if not scope_resumed:
+        # "Pick any scheme and explain it" — checked FIRST: it is neither a
+        # listing nor a follow-up, and must not reach the "which scheme?" pause
+        # or the follow-up rewrite (which re-reads it against the last scheme).
+        # "Why did you choose MGNREGA?" / "suggest a scheme that suits me" — a
+        # question about the bot's own choice, and a recommendation ACROSS
+        # schemes. Neither is in any one scheme's documents, so both are
+        # answered here, before the knowledge route narrows to one scheme.
+        explained = _why_choice_answer(question, session)
+        if explained:
+            return explained
+        recommended = (_scheme_fit_check_answer(question)
+                       or _scheme_recommendation_answer(question, session))
+        if recommended:
+            return recommended
+        picked = await _scheme_pick_answer(question, session)
+        if picked:
+            return picked
         direct = _scheme_listing_answer(question) or _scheme_comparison_answer(question)
         if direct:
             if question != raw_question:
@@ -5828,6 +8078,11 @@ async def _run_pipeline(question: str, session: "Session | None" = None,
                     logger.warning("context_manager.build_followup_context failed — continuing without it",
                                    exc_info=True)
             question = await rewrite_followup(question, prev, extra_context=_extra_ctx)
+            # The rewrite can introduce a bare "CM Elevate" alongside a money word
+            # ("...and the amount disbursed?") — same dataset decision as above.
+            _pinned = _pin_cm_elevate_dataset(question)
+            _cm_pinned = _pinned != question
+            question = _pinned
             is_followup_rewrite = True
         elif _CONTEXTLESS_REF.search(question) and not _mentions_scheme(question):
             # "how launched it?" with no prior scheme answer — don't guess.
@@ -5835,8 +8090,9 @@ async def _run_pipeline(question: str, session: "Session | None" = None,
                     "edge_type": "confused",
                     "answer": ("I don't have an earlier answer to build on, so I'm not "
                                "sure what that refers to. Tell me the scheme — MGNREGA, "
-                               "PMAY-G, Focus Plus, or CM Elevate — and what you'd like to "
-                               "know."),
+                               "PMAY-G, Focus Plus, CM Elevate, Focus Legacy, or CM Elevate "
+                               "Legacy — and what "
+                               "you'd like to know."),
                     "suggestions": list(edge.STARTERS),
                     **_empty_data_fields()}
 
@@ -5900,6 +8156,11 @@ async def _run_pipeline(question: str, session: "Session | None" = None,
 
     # 3. KNOWLEDGE -> RAG over the scheme reference docs.
     if intent == "KNOWLEDGE":
+        # Both CM Elevate datasets share one knowledge base (rag.kb_scheme), so
+        # the data-side "which CM Elevate?" pin means nothing here — give the
+        # question back in the user's own words rather than showing a rewrite.
+        if _cm_pinned:
+            question = _unpin_cm_elevate(question)
         # Scope retrieval to a single scheme when we're confident which one this
         # is about — named outright, or (for a follow-up with nothing named of
         # its own) the scheme the previous turn was about. Without this, vector
@@ -5909,8 +8170,27 @@ async def _run_pipeline(question: str, session: "Session | None" = None,
         _named = _named_schemes(question)
         if len(_named) == 1:
             _kb_scheme = _named[0]
-        elif prev is not None and len(prev.schemes or []) == 1:
-            _kb_scheme = prev.schemes[0]
+        else:
+            # Not named outright — but scheme-specific VOCABULARY pins it just
+            # as reliably, and this is the same signal the DATA path has always
+            # used (_infer_scheme_from_terms returns a scheme only when exactly
+            # one scheme's vocabulary matches). Without it, "What is the role of
+            # Producer Groups under FOCUS?" searched the whole KB unfiltered:
+            # measured on the real corpus, 3 of the top 8 chunks came back from
+            # Focus Plus — which holds no producer-group data at all — and the
+            # single best hit was one of them, so the composer answered the
+            # wrong scheme's question.
+            _inferred = _infer_scheme_from_terms(question)
+            if _inferred and len(_inferred) == 1:
+                _kb_scheme = _inferred[0]
+            # Not when the question says a bare "Focus": that names a scheme —
+            # just not WHICH of the two — so inheriting the previous turn's
+            # scheme would answer the wrong one ("for focus" after a CM Elevate
+            # answer re-answered CM Elevate). It goes to the "which Focus?"
+            # pause below instead.
+            elif (prev is not None and len(prev.schemes or []) == 1
+                  and not _is_ambiguous_focus(question)):
+                _kb_scheme = prev.schemes[0]
 
         # Genuinely scheme-agnostic ("tell me about the scheme", "how do I
         # apply", "what are the benefits") — no scheme named, no follow-up
@@ -5930,6 +8210,8 @@ async def _run_pipeline(question: str, session: "Session | None" = None,
                     "rewritten_question": question if question != raw_question else None,
                     "schemes": [],
                     **_empty_data_fields()}
+        if _kb_scheme is None and _is_ambiguous_focus(question):
+            raise _focus_ambiguity_clarification(question)
         if _kb_scheme is None and _needs_scheme_clarification(question):
             raise _scheme_clarification(question)
 
@@ -5942,7 +8224,19 @@ async def _run_pipeline(question: str, session: "Session | None" = None,
             base = {"rewritten_question": question if question != raw_question else None,
                     "schemes": _named}
         else:
-            kb = await rag.answer_from_kb(question, scheme=_kb_scheme)
+            # "Give me a short overview of Focus Legacy for an official briefing":
+            # the words "official"/"briefing" pulled the where-to-find-official-info
+            # and institutional-structure chunks, so the answer was a list of
+            # departments with no benefit amount, objective or scale (Focus Legacy
+            # QA TC-09, 2026-09-25). Retrieve with the scheme-overview phrasing
+            # instead; the answer is still written to the user's own question.
+            _retrieval_q = (_scheme_overview_question(_kb_scheme)
+                            if _kb_scheme == "Focus Legacy" and _OVERVIEW_REQUEST.search(question)
+                            else None)
+            if _retrieval_q:
+                kb = await rag.answer_from_kb(question, scheme=_kb_scheme, retrieval_query=_retrieval_q)
+            else:
+                kb = await rag.answer_from_kb(question, scheme=_kb_scheme)
             base = {"rewritten_question": question if question != raw_question else None,
                     "schemes": [_kb_scheme] if _kb_scheme else []}
         if kb:
@@ -6035,9 +8329,17 @@ _GENERIC_SCHEME_WORDS = {
 
 def _names_unknown_scheme(question: str) -> bool:
     """True when the question names a specific scheme by name that is neither
-    one of our four nor in the unsupported catalogue."""
+    one of ours nor in the unsupported catalogue."""
     if _named_schemes(question) or _infer_scheme_from_terms(question):
         return False                       # one of ours — nothing unknown here
+    # A bare "Focus" names one of OUR schemes — we just don't yet know which of
+    # the two (see _is_ambiguous_focus). Without this, "what is the FOCUS
+    # scheme?" matched the "<name> scheme" pattern below, found "focus" in
+    # neither registry above, and was answered "that isn't a scheme I hold" —
+    # for a scheme with a full reference doc and FAQ in the KB. It must fall
+    # through to the which-Focus ask instead.
+    if _is_ambiguous_focus(question):
+        return False
     if _unsupported_scheme_named(question):
         return False                       # handled by its own, better reply
     m = _NAMED_UNKNOWN_SCHEME_RE.search(question or "")
@@ -6068,16 +8370,21 @@ def _knowledge_not_covered_answer(question: str, scheme: "str | None") -> str:
     named a scheme gets a scheme-scoped answer; one that named none is told
     what IS covered."""
     if scheme:
+        # Name the reference material actually searched — CM Elevate Legacy has
+        # none of its own, it reads CM Elevate's (rag.kb_scheme). Identity for
+        # every other scheme.
         return (
-            f"I don't have that detail in the {scheme} reference material. I can "
+            f"I don't have that detail in the {rag.kb_scheme(scheme)} reference material. I can "
             f"cover {scheme}'s eligibility, benefits, documents and how to apply, "
             "and its data by district, block, village or financial year — so it may "
             "just be worth rephrasing. If you meant a different scheme, tell me which."
         )
     return (
-        "That isn't something I hold. I cover four Meghalaya schemes — MGNREGA "
+        "That isn't something I hold. I cover five Meghalaya schemes — MGNREGA "
         "(rural employment), PMAY-G (rural housing), Focus Plus (farmer cash "
-        "benefit) and CM Elevate (livelihood and enterprise support) — both how "
+        "benefit), CM Elevate (livelihood and enterprise support — its applications, "
+        "and as CM Elevate Legacy its sanctions and disbursements) and Focus Legacy "
+        "(producer group payments) — both how "
         "each one works and its actual data. If your question is about one of "
         "those, name it and I'll answer; if it's about another scheme or another "
         "state, that's outside what I can see."

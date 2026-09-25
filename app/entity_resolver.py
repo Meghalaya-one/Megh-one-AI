@@ -31,7 +31,30 @@ _RESOLVER_FILE = {
     "PMAY-G": _DATA_PART / "pmay" / "pmay_entity_resolver.yaml",
     "Focus Plus": _DATA_PART / "focus_plus" / "focusplus_entity_resolver.yaml",
     "CM Elevate": _DATA_PART / "cm_elevate" / "cmelevate_entity_resolver.yaml",
+    "Focus Legacy": _DATA_PART / "focus_legacy" / "focuslegacy_entity_resolver.yaml",
+    "CM Elevate Legacy": _DATA_PART / "cm_elevate_legacy" / "cmelevatelegacy_entity_resolver.yaml",
 }
+
+# The dimension key a resolver file uses when it differs from the one this
+# module reads. cmelevatelegacy_entity_resolver.yaml names its 13-value
+# sub-scheme dimension `scheme`; it is the same closed set, same `canonical` +
+# `aliases` shape and same scheme_name column as CM Elevate's `cm_scheme`, so it
+# is read under that name and resolve_cm_scheme() works for both.
+_DIMENSION_ALIASES = {"cm_scheme": ("scheme",)}
+
+
+def _dimension_values(dims: dict, dim_name: str) -> list:
+    """A dimension's value list, tolerating the two shapes the SME files use:
+    a plain list, or a mapping that wraps it as `catalogue:` (the CM Elevate
+    Legacy block dimension carries provenance beside it)."""
+    for key in (dim_name, *_DIMENSION_ALIASES.get(dim_name, ())):
+        values = (dims.get(key) or {}).get("values", [])
+        if isinstance(values, dict):
+            values = values.get("catalogue", [])
+        values = [v for v in (values or []) if isinstance(v, dict) and v.get("canonical")]
+        if values:
+            return values
+    return []
 
 # scheme -> dimension ("district" | "block" | "year") -> list of value dicts
 _catalog: dict[str, dict[str, list[dict]]] = {}
@@ -151,7 +174,7 @@ def load_all() -> None:
         dims = data.get("dimensions", {})
         _catalog[scheme] = {}
         for dim_name in ("district", "block", "year", "assembly_constituency", "tranche_label", "cm_scheme"):
-            values = dims.get(dim_name, {}).get("values", [])
+            values = _dimension_values(dims, dim_name)
             if values:
                 _catalog[scheme][dim_name] = values
 
@@ -649,7 +672,7 @@ def _resolve_in_catalog(values: list[dict], text: str, dimension: str,
 def resolve_dimension(text: str, scheme: str, dimension: str) -> Resolved:
     """District/block/year — fully in-memory, stages 1/2/3/6."""
     values = _catalog.get(scheme, {}).get(dimension, [])
-    if not values:
+    if not values and dimension not in _SHARED_ADMIN_DIMENSIONS:
         return Resolved("not_found", dimension, text, message=f"no {dimension} catalogue for {scheme}")
 
     # A per-scheme BLOCK catalogue can be incomplete where the live data is
@@ -660,20 +683,35 @@ def resolve_dimension(text: str, scheme: str, dimension: str) -> Resolved:
     # administrative units across schemes, so a name any scheme's catalogue
     # knows is a genuine block; only the per-scheme coverage differs. Fall
     # back to the other catalogues rather than declaring it unknown.
-    if dimension == "block":
+    #
+    # ASSEMBLY CONSTITUENCY is the same situation, more extreme: only MGNREGA
+    # ships a catalogue at all, so every other scheme returned not_found for a
+    # name it had just offered as a chip. Focus Legacy CAN answer a
+    # constituency question (via the documented dim_geography join — see its
+    # semantic_rules.constituency_rule), so a user who picked "the AMLAREM
+    # assembly constituency" got the filter silently dropped and was asked for
+    # a district instead (reported 2026-09-23). Same fallback, same reasoning:
+    # constituencies are one real set of boundaries, not a per-scheme fiction.
+    # _SHARED_ADMIN_DIMENSIONS is the existing name for exactly this set — it
+    # is what _collision_values already borrows across.
+    if dimension in _SHARED_ADMIN_DIMENSIONS:
         _direct = _resolve_in_catalog(values, text, dimension, _blocked.get(scheme))
         if _direct.status != "not_found":
             return _direct
         for _other, _dims in _catalog.items():
             if _other == scheme:
                 continue
-            _vals = _dims.get("block") or []
+            # The SAME dimension in the other scheme's catalogue, not a
+            # hard-coded "block": this branch now serves assembly_constituency
+            # too, and searching block lists for an AC name resolved only the
+            # names that happen to be both ("Amlarem" is; "Sohra" is not).
+            _vals = _dims.get(dimension) or []
             if not _vals:
                 continue
             _hit = _resolve_in_catalog(_vals, text, dimension, _blocked.get(_other))
             if _hit.status == "resolved":
-                logger.info("block %r resolved via %s's catalogue (missing from %s's)",
-                            text, _other, scheme)
+                logger.info("%s %r resolved via %s's catalogue (missing from %s's)",
+                            dimension, text, _other, scheme)
                 return _hit
         return _direct
 
@@ -765,7 +803,16 @@ def _scannable_forms(value: dict) -> list[str]:
     acronym = str(value.get("acronym") or "").strip()
     if len(acronym) >= 3:
         forms.append(acronym)
-    forms += [a for a in value.get("aliases", []) if " " in a and len(a) >= 7]
+    # "<HQ town> district" aliases ("Mairang district") are excluded: fold()
+    # strips the trailing "district", so the form shrinks to the bare town name,
+    # which is usually also a block and an assembly constituency. Scanned, it
+    # turned every "…in Mairang…" into a filter on the WHOLE Eastern West Khasi
+    # Hills district — including "applications mapped to Mairang constituency",
+    # where it was ANDed onto the constituency (2026-09-25, CM Elevate Legacy
+    # TC-31). The alias still resolves through resolve_dimension when the
+    # extractor tags it as a district.
+    forms += [a for a in value.get("aliases", [])
+              if " " in a and len(a) >= 7 and not _HQ_ALIAS_RE.match(a)]
     return forms
 
 
@@ -1137,7 +1184,8 @@ def all_districts(scheme: str) -> list[str]:
 
 _ACTIVITY_VIEWS = (
     "curated.v_employment", "curated.v_expenditure", "curated.v_pmay",
-    "curated.v_focus_plus", "curated.v_cm_elevate",
+    "curated.v_focus_plus", "curated.v_cm_elevate", "curated.v_focus_legacy",
+    "curated.v_cm_elevate_disbursement",
 )
 
 

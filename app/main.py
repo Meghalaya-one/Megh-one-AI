@@ -207,22 +207,27 @@ async def metrics_endpoint(authorization: str | None = Header(default=None),
 
 
 # ── Static UI — the one service also serves the portal + chat console ─────────
+# The pages are served with no-cache (revalidate every load; the ETag keeps it a
+# cheap 304). Without it Chrome heuristically reused a stale ai_query.html after
+# a fix shipped, so the user kept running the old voice-input code.
+_NO_CACHE = {"Cache-Control": "no-cache"}
+
 if _FRONTEND.is_dir():
     app.mount("/static", StaticFiles(directory=str(_FRONTEND)), name="static")
 
     @app.get("/", include_in_schema=False)
     async def portal():
         f = _FRONTEND / "Meghalaya_UnifiedPortal_UI.html"
-        return FileResponse(f) if f.exists() else JSONResponse({"app": settings.APP_NAME})
+        return FileResponse(f, headers=_NO_CACHE) if f.exists() else JSONResponse({"app": settings.APP_NAME})
 
     @app.get("/ai-query", include_in_schema=False)
     async def ai_query():
         f = _FRONTEND / "ai_query.html"
-        return FileResponse(f) if f.exists() else JSONResponse({"app": settings.APP_NAME})
+        return FileResponse(f, headers=_NO_CACHE) if f.exists() else JSONResponse({"app": settings.APP_NAME})
 
     @app.get("/admin-ui", include_in_schema=False)
     async def admin_ui():
         f = _FRONTEND / "admin.html"
-        return FileResponse(f) if f.exists() else JSONResponse({"error": "admin.html missing"})
+        return FileResponse(f, headers=_NO_CACHE) if f.exists() else JSONResponse({"error": "admin.html missing"})
 else:
     logger.warning("web/ not found at %s — API-only mode", _FRONTEND)

@@ -245,6 +245,27 @@ class Settings(BaseSettings):
     ASR_BASE_URL: str = "https://10.48.242.4/openai/v1"
     ASR_API_KEY: str = ""
     ASR_TIMEOUT_SECONDS: int = 60
+    # Vocabulary hint sent as the OpenAI-style `prompt` field (the gateway honours
+    # it). Without it the model writes "East Cassey Hills", "Riphoi",
+    # "dispersment"; with it every district came back right (measured
+    # 2026-09-25). Keep it SHORT — listing all 70 blocks made the model snap to a
+    # wrong real block name. On speech-free audio the model returns this text
+    # verbatim; asr_guard.is_prompt_echo() turns that into "no speech". Empty
+    # disables it. The digits example matters: without it "financial year
+    # 2024-25" came back as "twenty twenty four twenty five".
+    ASR_PROMPT: str = (
+        "Questions about Meghalaya government schemes (MGNREGA, PMAY-G, Focus Plus, "
+        "Focus Legacy, CM Elevate, CM Elevate Legacy), with numbers written as digits, "
+        "e.g. FY 2023-24, 2024-25, top 5, Rs 10,000. Beneficiaries, producer groups "
+        "(PGs), disbursement, sanctioned, person-days. Districts: East Khasi Hills, "
+        "West Khasi Hills, South West Khasi Hills, Eastern West Khasi Hills, Ri Bhoi, "
+        "East Jaintia Hills, West Jaintia Hills, East Garo Hills, West Garo Hills, "
+        "North Garo Hills, South Garo Hills, South West Garo Hills."
+    )
+    # Diagnostics only: when set, every /api/query/transcribe upload is saved
+    # there (WAV + the ASR's answer) so a bad transcript can be replayed. Holds
+    # users' voice recordings — leave empty outside local debugging.
+    ASR_DEBUG_DIR: str = ""
 
     # ── Vector store (Qdrant on the same data box) — scheme-knowledge base ──
     QDRANT_URL: str = "http://10.48.242.4:6333"

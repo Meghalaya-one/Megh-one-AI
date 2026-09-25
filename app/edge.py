@@ -130,6 +130,34 @@ _MONEY_ADVICE = [
 ]
 
 
+# A request for help with something ILLEGAL or harmful — "i want to rob a bank,
+# give me suggestions", "how to make fake job cards", "help me bribe the
+# officer". Checked before everything else, including by the pipeline ahead of
+# its own recommendation / pick steps: "give me some suggestions" in such a
+# message was once read as a scheme recommendation and answered with the
+# previous turn's scheme (reported 2026-09-24). Anchored on INTENT phrasing, so
+# a legitimate question about wrongdoing ("how are fake job cards detected?",
+# "fraud cases in MGNREGA social audits") is not refused.
+_HARMFUL_INTENT = (
+    r"(?:\bi\s+(?:want|wanna|plan|am\s+planning|need|intend|would\s+like)\s+to\b|"
+    r"\bwe\s+(?:want|plan|need)\s+to\b|\bhow\s+(?:can|do|could|should|would)\s+(?:i|we|one|someone)\b|"
+    r"\bhow\s+to\b|\bhelp\s+(?:me|us)\b|\bteach\s+me\b|\bshow\s+me\s+how\b|\bways?\s+to\b|"
+    r"\btips?\s+(?:to|for|on)\b|\bideas?\s+(?:to|for)\b|\bsuggest\w*\s+(?:to|for|how)\b|"
+    r"\bbest\s+way\s+to\b|\blet'?s\b|\bplan\s+to\b)")
+_HARMFUL_ACT = (
+    r"\b(?:rob\w*|loot\w*|steal\w*|burgl\w*|kidnap\w*|murder\w*|smuggl\w*|launder\w*|"
+    r"forg(?:e|ed|ing|ery)\b|brib\w*|embezzl\w*|defraud\w*|swindl\w*|extort\w*|"
+    r"counterfeit\w*|siphon\w*|hack\s+(?:into|the|a|an)\b|cheat\w*\s+(?:the\s+)?"
+    r"(?:government|govt|scheme|bank|system|officer|people)\b|"
+    r"(?:make|create|get|use|prepare)\s+(?:a\s+)?(?:fake|false|forged|duplicate)\s+\w+|"
+    r"fake\s+(?:documents?|certificates?|job\s*cards?|aadhaa?r|ids?|beneficiar\w*|bills?)\b|"
+    r"misuse\s+(?:the\s+)?(?:funds?|money|scheme)\b|evade\s+tax\w*|poison\w*|bomb\w*)")
+_HARMFUL = [
+    _HARMFUL_INTENT + r"[^.?!]{0,50}?" + _HARMFUL_ACT,
+    r"\brob(?:bing|bed)?\s+(?:a\s+|the\s+)?bank\b|\bbank\s+robbery\b|\bmoney\s+laundering\b",
+]
+
+
 _CONFUSED = [
     r"^(i\s+don.?t\s+(know|understand)|huh|what\?|confused|i\s*m\s+confused|no\s+idea)[\s!.?]*$",
     r"^(help|help\s*me|i\s+need\s+help|guide\s*me|assist\s*me)[\s!.?]*$",
@@ -159,7 +187,8 @@ _HARD_OFF_TOPIC = [
 # ...unless the text also names a scheme outright, in which case route it.
 _SCHEME_NAMED = re.compile(
     r"\b(mgnrega|mnrega|nrega|pmay[\s-]?g?|awaas|awas|focus[\s-]?plus|focusplus|"
-    r"cm[\s-]?elevate|cmelevate)\b|focus\s*\+",
+    r"cm[\s-]?elevate|cmelevate|focus[\s-]?legacy|focuslegacy|producer[\s-]?groups?)\b|"
+    r"focus\s*\+",
     re.IGNORECASE,
 )
 
@@ -304,7 +333,7 @@ _ASKS_FOR_A_FIGURE = re.compile(
     # a can-you check.
     r"\b(?:tell|explain|describe)\b[^?]{0,30}"
     r"\b(?:mgnrega|mnrega|nrega|pmay|awaas|awas|focus\s*\+?|focusplus|"
-    r"cm\s*elevate|cmelevate)\b|"
+    r"cm\s*elevate|cmelevate|focus\s*legacy|focuslegacy|producer\s*groups?)\b|"
     r"\b(how\s+many|how\s+much|total|sum|count|number\s+of|average|avg|"
     r"person[\s-]?days?|expenditure|spend(?:ing)?|spent|wages?|job\s?cards?|"
     r"houses?|sanction\w*|complet\w*|disburs\w*|beneficiar\w*|applications?|"
@@ -352,7 +381,19 @@ _DOMAIN_WORDS = [
     "mgnrega", "mnrega", "nrega", "pmay", "pmayg", "pmay-g", "awaas", "awas",
     "indira awaas", "employment guarantee", "rural housing", "rural employment",
     "focus plus", "focus+", "focusplus", "focus-plus", "producer group",
+    "focus legacy", "focuslegacy", "producer groups", "pg id", "pg member",
+    "pg-focus", "pg-lamp",
+    # "PG" is Focus Legacy's everyday shorthand — the UI's own starter chips say
+    # "Top 5 PGs" — but only the SPELLED-OUT forms were whitelisted, so
+    # "is there any pg group with name sakania?" had no domain word and was
+    # bounced as off-topic while the identical question with "producer group"
+    # went through (reported 2026-09-23). Word-boundary, never a bare "pg":
+    # these entries are used as unanchored regexes, and a loose "pg" matches
+    # inside "upgrade", "upgrading" and "mpg".
+    r"\bpgs?\b",
     "cm elevate", "cmelevate", "cm-elevate", "piggery", "poultry", "warehouse scheme",
+    # CM Elevate Legacy's own vocabulary (lender and desanction fields).
+    "lifcom", "desanction", "loan entity", "lender",
     "sericulture", "motorcaravan", "prime small enterprise", "prime tourism vehicle",
     "any business venture", "cinema theatre", "sports and wellness", "green taxi",
     "meghalayaone", "mbda", "meghalaya basin development", "farmer cash benefit",
@@ -417,24 +458,30 @@ _STARTER_KINDS = {"greeting", "identity", "capability", "money_advice", "profani
 # topic, a general-knowledge question, or a place outside Meghalaya. Callers past
 # the edge layer (the pipeline's OutOfScope handler) reuse it via out_of_scope().
 _OUT_OF_SCOPE_REPLY = (
-    "I'm Megh One AI, the assistant for Meghalaya's MGNREGA, PMAY-G, Focus Plus and "
-    "CM Elevate schemes. I can only answer questions about those schemes and their "
-    "data in Meghalaya — not other topics, other states, or places outside Meghalaya."
+    "I'm Megh One AI, the assistant for Meghalaya's MGNREGA, PMAY-G, Focus Plus, "
+    "CM Elevate, Focus Legacy (producer groups) and CM Elevate Legacy (sanctions and "
+    "disbursements) schemes. I can only answer "
+    "questions about those schemes and their data in Meghalaya — not other topics, "
+    "other states, or places outside Meghalaya."
 )
 
 _RESPONSES = {
     "greeting": (
-        "Hello! I answer questions about Meghalaya's MGNREGA, PMAY-G, Focus Plus and "
-        "CM Elevate data — person-days, expenditure, houses sanctioned and completed, "
-        "Focus Plus disbursements, CM Elevate applications by scheme, district and "
-        "block breakdowns — and general questions about how the schemes work."
+        "Hello! I answer questions about Meghalaya's MGNREGA, PMAY-G, Focus Plus, "
+        "CM Elevate, Focus Legacy and CM Elevate Legacy data — person-days, expenditure, "
+        "houses sanctioned and completed, Focus Plus disbursements, CM Elevate applications "
+        "by scheme, Focus Legacy producer-group payments, CM Elevate Legacy subsidy and "
+        "loans disbursed, district and block "
+        "breakdowns — and general questions about how the schemes work."
     ),
     "identity": (
-        "I can help you with Meghalaya's MGNREGA, PMAY-G, Focus Plus and CM Elevate "
-        "schemes — things like person-days and wage expenditure, houses sanctioned "
-        "and completed, Focus Plus disbursements, CM Elevate applications, district "
-        "and block breakdowns, and eligibility or how-to-apply questions for any of "
-        "these schemes. Just ask in plain language."
+        "I can help you with Meghalaya's MGNREGA, PMAY-G, Focus Plus, CM Elevate, "
+        "Focus Legacy and CM Elevate Legacy schemes — things like person-days and wage expenditure, houses "
+        "sanctioned and completed, Focus Plus disbursements, CM Elevate applications, "
+        "Focus Legacy payments to producer groups, CM Elevate Legacy sanctions and "
+        "disbursements, district and block breakdowns, and "
+        "eligibility or how-to-apply questions for any of these schemes. Just ask in "
+        "plain language."
     ),
     # Answers the question that was actually asked — "can you?" — with a plain
     # yes first, then what that covers. Deliberately NOT the _OUT_OF_SCOPE_REPLY
@@ -442,11 +489,13 @@ _RESPONSES = {
     # "which scheme?" pause (nothing is being queried yet).
     "capability": (
         "Yes — that's exactly what I'm here for. I can answer questions about "
-        "Meghalaya's MGNREGA, PMAY-G, Focus Plus and CM Elevate schemes, in two ways: "
-        "the actual data (person-days, expenditure, houses sanctioned and completed, "
-        "Focus Plus disbursements, CM Elevate applications — by district, block, "
-        "village or financial year), and how the schemes work (eligibility, benefits, "
-        "documents, how to apply). Ask in plain language and I'll take it from there."
+        "Meghalaya's MGNREGA, PMAY-G, Focus Plus, CM Elevate, Focus Legacy and CM "
+        "Elevate Legacy schemes, in two ways: the actual data (person-days, expenditure, houses "
+        "sanctioned and completed, Focus Plus disbursements, CM Elevate applications, "
+        "Focus Legacy producer-group payments, CM Elevate Legacy disbursements — by "
+        "district, block, village or "
+        "financial year), and how the schemes work (eligibility, benefits, documents, "
+        "how to apply). Ask in plain language and I'll take it from there."
     ),
     # Personal financial advice. Says plainly that this is not what the
     # assistant does — a generic "I can only answer questions about those
@@ -455,25 +504,36 @@ _RESPONSES = {
     "money_advice": (
         "I can't advise on investing or saving your own money — I'm not a financial "
         "adviser, and that's outside what I do. I'm Megh One AI: I answer questions "
-        "about Meghalaya's MGNREGA, PMAY-G, Focus Plus and CM Elevate schemes — who "
+        "about Meghalaya's MGNREGA, PMAY-G, Focus Plus, CM Elevate and Focus Legacy "
+        "schemes — who "
         "is eligible, what benefits they pay, how to apply, and the actual figures by "
         "district, block or year. If you'd like to know what any of those schemes "
         "offers, ask away."
     ),
-    "thanks": "You're welcome. Ask me anything else about MGNREGA, PMAY-G, Focus Plus or CM Elevate in Meghalaya.",
+    "thanks": ("You're welcome. Ask me anything else about MGNREGA, PMAY-G, "
+               "Focus Plus, CM Elevate, Focus Legacy or CM Elevate Legacy in Meghalaya."),
     "goodbye": "Thanks for using the Meghalaya scheme assistant. Come back any time.",
     "profanity": (
-        "I'm here to help. I can answer MGNREGA, PMAY-G, Focus Plus and CM Elevate "
-        "questions for Meghalaya — for example \"MGNREGA expenditure by district in "
-        "2024-25\" or \"documents needed to apply for PMAY-G\"."
+        "I'm here to help. I can answer MGNREGA, PMAY-G, Focus Plus, CM Elevate and "
+        "Focus Legacy questions for Meghalaya — for example \"MGNREGA expenditure by "
+        "district in 2024-25\" or \"documents needed to apply for PMAY-G\"."
     ),
     "silly": _OUT_OF_SCOPE_REPLY,
     "off_topic": _OUT_OF_SCOPE_REPLY,
+    # Says plainly that it won't help — and why — then points at the lawful
+    # help it CAN give, instead of an unrelated scheme answer.
+    "harmful": (
+        "I can't help with that — it's illegal and could cause real harm. I'm Megh One "
+        "AI, and I only help with Meghalaya's government schemes. If money is the "
+        "problem, there are lawful options I can explain: paid work under MGNREGA, "
+        "housing help under PMAY-G, farm support under Focus Plus and Focus Legacy, or "
+        "business support under CM Elevate."
+    ),
     "confused": (
         "No problem. I can answer things like the count of PMAY-G houses completed "
         "in a district, total MGNREGA wage expenditure for a year, Focus Plus payments "
-        "by batch, how many CM Elevate applications are on hold, or the eligibility "
-        "criteria for a scheme."
+        "by batch, how many CM Elevate applications are on hold, how much Focus Legacy "
+        "paid out to producer groups, or the eligibility criteria for a scheme."
     ),
 }
 
@@ -488,7 +548,20 @@ _SCHEME_ALIASES = {
     "MGNREGA": re.compile(r"\b(mgnrega|mnrega|nrega)\b", re.IGNORECASE),
     "PMAY-G": re.compile(r"\b(pmay[\s-]?g?|awaas|awas)\b", re.IGNORECASE),
     "Focus Plus": re.compile(r"\b(focus[\s-]?plus|focusplus)\b|focus\s*\+", re.IGNORECASE),
-    "CM Elevate": re.compile(r"\b(cm[\s-]?elevate|cmelevate)\b", re.IGNORECASE),
+    # Not when qualified as the Legacy dataset — that is its own entry below.
+    "CM Elevate": re.compile(
+        r"(?<!legacy )\b(cm[\s-]?elevate|cmelevate)\b(?![\s-]*(?:legacy|disbursements?)\b)",
+        re.IGNORECASE),
+    "CM Elevate Legacy": re.compile(
+        r"\b(cm[\s-]?elevate|cmelevate)[\s-]*(legacy|disbursements?)\b|"
+        r"\blegacy[\s-]+cm[\s-]?elevate\b|\belevate[\s-]?legacy\b",
+        re.IGNORECASE),
+    # Qualified spellings only — a bare "focus" names neither Focus scheme on its
+    # own (see pipeline._is_ambiguous_focus), so narrowing on it would pick one
+    # of the two at random.
+    "Focus Legacy": re.compile(
+        r"\b(focus[\s-]?legacy|focuslegacy|legacy[\s-]?focus|producer[\s-]?groups?)\b",
+        re.IGNORECASE),
 }
 
 # What each scheme actually holds — the data side and the knowledge side — so
@@ -513,6 +586,18 @@ _SCHEME_CAPABILITY = {
         "applications across its 15 sub-schemes (piggery, poultry, tourism "
         "vehicles, small enterprise and more), application mode, workflow "
         "level and verification status — by district, block or sub-scheme"
+    ),
+    "Focus Legacy": (
+        "payments to producer groups, the groups themselves and their member "
+        "counts, amount remitted (Rs 5,000 per member), producer group type, "
+        "the product each group works on, and bank-wise payments — by district, "
+        "block, village or financial year"
+    ),
+    "CM Elevate Legacy": (
+        "CM-ELEVATE sanction and disbursement records across 13 schemes — amounts "
+        "sanctioned, subsidy and loans disbursed, the share of the sanction paid out, "
+        "lender (Bank / LIFCOM) and desanctioned records — by scheme, district, block, "
+        "village or financial year (FY 2024-25 and 2025-26)"
     ),
 }
 
@@ -544,6 +629,20 @@ _SCHEME_STARTERS = {
         "Which district has the most CM Elevate applications?",
         "CM Elevate applications by district",
         "Who is eligible for CM Elevate?",
+    ],
+    "Focus Legacy": [
+        "How many producer groups were paid under Focus Legacy?",
+        "Total Focus Legacy amount disbursed by district",
+        "How many PG members were covered under Focus Legacy?",
+        "Which products do Focus Legacy producer groups work on?",
+        "What is the main objective of FOCUS?",
+    ],
+    "CM Elevate Legacy": [
+        "What is the total amount disbursed under CM Elevate Legacy?",
+        "CM Elevate Legacy disbursement by district",
+        "CM Elevate Legacy records by scheme",
+        "CM Elevate Legacy loans by lender",
+        "CM Elevate Legacy records by financial year",
     ],
 }
 
@@ -611,9 +710,10 @@ def _out_of_area_reply(question: str, place: str) -> str:
         lead = f"I don't hold any data for {name}. "
     return (
         lead + "I'm Megh One AI, and I only cover Meghalaya's MGNREGA, PMAY-G, "
-        "Focus Plus and CM Elevate schemes — the data is Meghalaya's alone, so I "
-        "have nothing for other states or countries. If there's something you'd "
-        "like to know about these four schemes in Meghalaya, I can help with that."
+        "Focus Plus, CM Elevate, Focus Legacy and CM Elevate Legacy schemes — the data is "
+        "Meghalaya's "
+        "alone, so I have nothing for other states or countries. If there's something "
+        "you'd like to know about these six schemes in Meghalaya, I can help with that."
     )
 
 
@@ -661,6 +761,17 @@ def out_of_scope() -> dict:
     return _edge("off_topic")
 
 
+def detect_harmful(question: str) -> dict | None:
+    """The refusal for a request for help with something illegal or harmful,
+    or None. Separate from detect_edge_case so the pipeline can run it FIRST —
+    ahead of its own recommendation / pick steps, which otherwise claim
+    "give me some suggestions" before the edge layer is reached."""
+    ql = (question or "").lower()
+    if any(re.search(p, ql) for p in _HARMFUL):
+        return {"type": "harmful", "response": _RESPONSES["harmful"]}
+    return None
+
+
 def detect_edge_case(question: str, has_context: bool = False) -> dict | None:
     """`has_context`: True when there's a live prior scheme answer this turn
     could plausibly be a follow-up to (see pipeline._run_pipeline's
@@ -678,6 +789,12 @@ def detect_edge_case(question: str, has_context: bool = False) -> dict | None:
         return _edge("confused")
 
     ql = q.lower()
+
+    # 00. A request for help with something illegal or harmful — refused before
+    #     anything else, even when it also names a scheme.
+    harmful = detect_harmful(q)
+    if harmful:
+        return harmful
 
     # 0. Hard off-topic (weather, markets, sport, film) wins even over a place
     #    name — unless a scheme is actually named.

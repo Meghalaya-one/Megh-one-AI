@@ -29,6 +29,19 @@ SCHEME_CATALOG = {
                   "schemes under one scheme_code — one row per application. NO money "
                   "column and NO date column exist anywhere in this partition; "
                   "COUNT(*) is the entire aggregate vocabulary.",
+    "Focus Legacy": "Meghalaya STATE legacy producer-group disbursement programme (the "
+                    "'FOCUS' scheme) — one row per payment to a PRODUCER GROUP, the only "
+                    "group-grained fact in megh_db (no individual exists in it at all). "
+                    "amount_disbursed = no_of_pg_members x 5000 on every row. Money UNIT "
+                    "IS UNVERIFIED — read curated.dim_scheme.money_unit. NOT Focus Plus: "
+                    "the two share a name and no key.",
+    "CM Elevate Legacy": "Meghalaya CM-ELEVATE SANCTION-AND-DISBURSEMENT records (the DB "
+                         "calls it CM Elevate Disbursement) — one row per applicant's "
+                         "sanction and disbursement under one of 13 schemes, with a "
+                         "sanctioned amount, subsidy / loan / total disbursed (RUPEES), "
+                         "lender (Bank / LIFCOM) and a financial year (FY2024-25, "
+                         "FY2025-26). NOT the 15-scheme CM Elevate applications dataset: "
+                         "the two share a name and no key.",
 }
 
 # The metrics each scheme actually carries in the curated data — the plain-English
@@ -75,6 +88,41 @@ SCHEME_METRICS = {
         "distinct villages / blocks / districts reached",
         "NO sanctioned amount, subsidy, loan, disbursement, or any rupee figure exists",
         "NO application date, month, or financial year exists",
+    ],
+    "Focus Legacy": [
+        "payments / disbursements made (COUNT(*), one row per payment to a producer group)",
+        "producer groups paid (COUNT(DISTINCT pg_id) — never by name; 11,906 groups carry "
+        "only 10,678 distinct names)",
+        "memberships paid for (SUM(no_of_pg_members) — memberships, NOT distinct people; "
+        "there is no person record anywhere in this partition)",
+        "amount disbursed (SUM — UNIT UNVERIFIED, read curated.dim_scheme.money_unit; it is "
+        "exactly memberships x Rs 5,000 on every row, so it is a membership figure)",
+        "producer group type (PG-FOCUS / PG-LAMP / PG-EXISTING, via pg_entity_type)",
+        "programme variant ('FOCUS' vs 'Focus (Addnl)', the latter a single top-up day)",
+        "product / commodity the group works on (FY2021-22 and FY2022-23 ONLY — 21% of rows)",
+        "bank and IFSC the payment went to (bank-wise analysis IS legitimate here)",
+        "remittance date — but only 30 distinct dates exist; these are treasury BATCHES",
+        "distinct villages / blocks / districts reached",
+        "NO individual beneficiary, name, EPIC, member id, gender, caste or household exists",
+        "NO application, approval, rejection, status, outcome, target or budget exists",
+    ],
+    "CM Elevate Legacy": [
+        "sanction-and-disbursement records (COUNT(*), one row per applicant per scheme) and "
+        "sanctioned cases (records carrying a sanctioned amount), with the sanctioned share",
+        "assembly constituency (through the geography registry)",
+        "records by scheme (13 schemes: Piggery, Poultry, Dairy, Goat, Warehouse, the two "
+        "Sericulture schemes, the two PRIME vehicle schemes and more)",
+        "sanctioned amount (in rupees; shown in crore)",
+        "subsidy disbursed, loan disbursed and total disbursed (subsidy + loan), and the "
+        "share of the sanctioned amount paid out",
+        "subsidy / loan instalments (tranches 1-3) and their dates",
+        "lender category (Bank / LIFCOM) and loans with no lender recorded",
+        "desanctioned records (Refused / Duplicate) and the refusal flag / written reason",
+        "financial year (FY2024-25 and FY2025-26 only; the two Sericulture schemes carry "
+        "no financial year)",
+        "distinct villages / blocks / districts reached",
+        "NO applicant name, gender, caste, applicant type, application status, repayment, "
+        "target, budget or monthly figure exists",
     ],
 }
 
@@ -727,6 +775,371 @@ CM ELEVATE BUSINESS VOCABULARY (source: cmelevate_schema_partitions.yaml + cmele
     "withdrawn" / "withdrawal" -> COUNT(*) FILTER (WHERE is_withdraw)   (boolean, FALSE on every row today — answer is 0, NEVER a refusal)
 """.strip()
 
+_FOCUSLEGACY_TABLES = """
+FOCUS LEGACY TABLES
+  curated.v_focus_legacy  -- THE query surface, and for this scheme that is a PRIVACY
+      boundary, not a convenience: the underlying fact carries an UNMASKED account
+      number and the account holder's name; the view masks the first and drops the
+      second. One row = one disbursement (one payment, to one PRODUCER GROUP).
+      This is the ONLY group-grained fact in megh_db — there is no individual
+      anywhere in the partition. 28 columns:
+        focus_legacy_fact_id, source_row_id, pg_id, pg_name, pg_entity_type,
+        pg_entity_type_name, programme_variant, year_key, financial_year,
+        financial_year_short, year_note, date_of_remittance, geography_key,
+        village_code, lgd_village_name, lgd_block, lgd_district, entity_type,
+        on_roster, has_geo_conflict, no_of_pg_members, amount_disbursed,
+        product_raw, bank_name, ifsc_code, branch_raw, account_no_masked,
+        bank_details_current
+      dim_producer_group, dim_pg_entity_type, dim_geography, dim_year and
+      bridge_pg_bank_history are ALL PRE-JOINED — pg_id / pg_name, lgd_district /
+      lgd_block / lgd_village_name and financial_year / financial_year_short are on
+      the row, so no join is needed for any statewide, district-, block- or
+      village-level number.
+      BLOCK/DISTRICT COLUMNS — lgd_district and lgd_block are stored UPPERCASE
+      ('WEST GARO HILLS', 'MAIRANG'). A Title Case literal returns ZERO ROWS
+      SILENTLY. lgd_village_name is NOT uppercased — do not fold all three alike.
+  curated.dim_producer_group  -- 11,904 rows, one per producer group. Reach for it
+      ONLY for first_payment_year_key / last_payment_year_key, which the view does
+      NOT expose ("groups new this year", "groups paid in more than one year").
+      Query it ALONE — joining it back to the view repeats those columns once per
+      payment and double-counts every group paid more than once.
+  curated.dim_pg_entity_type  -- 3 rows (type_code, type_name, source_id_prefix).
+      Read it to ENUMERATE the three group types; the stored type_code strings are
+      NOT documented, so never filter on a guessed 'FOCUS' / 'LAMP' / 'EXISTING'.
+  curated.dim_scheme  -- read ON ITS OWN (never joined per row) ONLY to look up
+      money_unit for the Focus Legacy row. amount_disbursed's unit is UNVERIFIED and
+      v_focus_legacy does not expose scheme_key.
+  NEVER QUERY, NEVER JOIN: curated.fact_focus_legacy_disbursement and
+      curated.bridge_pg_bank_history. Both hold the unmasked account_no; the fact
+      also holds name_on_the_account. Reaching either through a join is the same
+      privacy breach as querying it directly, and there is no column on either
+      worth it — everything legitimate is on the view.
+""".strip()
+
+_FOCUSLEGACY_RULES = """
+FOCUS LEGACY RULES (breaking these produces a wrong number, not just an ugly query):
+  1. Query curated.v_focus_legacy, NEVER curated.fact_focus_legacy_disbursement and
+     NEVER curated.bridge_pg_bank_history — privacy boundary, see above.
+  2. THERE IS NO MANDATORY PREDICATE. Do NOT copy PMAY's `WHERE NOT is_placeholder`.
+     is_placeholder / is_completed / mapping_category / mapping_confidence_pct /
+     sanction_date / installments_paid DO NOT EXIST here — a query referencing one
+     ERRORS, it does not merely mislead.
+  3. THE ENTITLEMENT IDENTITY — the single most important fact about this scheme:
+         amount_disbursed = no_of_pg_members * 5000
+     on every one of the 14,569 source rows, zero exceptions, confirmed twice. So:
+       - SUM(amount_disbursed) is exactly 5000 * SUM(no_of_pg_members).
+       - AVG(amount_disbursed) is NOT an average entitlement — it is 5000 x average
+         GROUP SIZE, and it moves when group sizes move, never when policy does.
+         Never describe it as an entitlement, a benefit level or a policy change.
+       - "Amount per member" is the CONSTANT 5,000. State the rate; do not compute
+         a ratio that can only return 5,000.
+       - A ranking by amount and a ranking by members are the SAME ranking. Never
+         present them as two independent findings.
+     Therefore EVERY money SELECT must carry SUM(no_of_pg_members) beside it, so the
+     relationship is visible in the result rather than buried in prose.
+  4. THREE DIFFERENT COUNTING SUBJECTS, never interchangeable:
+       COUNT(*)                  = PAYMENTS (~14,566). One row is one payment.
+       COUNT(DISTINCT pg_id)     = PRODUCER GROUPS (~11,904).
+       SUM(no_of_pg_members)     = MEMBERSHIPS (~102,021) — NOT people. A group paid
+                                   in two years contributes twice, and its recorded
+                                   size can differ between the two payments.
+     2,655 groups were paid more than once, so COUNT(*) exceeds COUNT(DISTINCT pg_id)
+     by about 2,663. Alias every count so the answer says which one it is. There is NO
+     person-level count and none can be constructed — no name, EPIC or member id exists.
+  5. GROUPS ARE COUNTED ON pg_id, NEVER ON pg_name. 11,906 groups carry only 10,678
+     distinct names and 1,634 groups appear under more than one spelling, so a name
+     both SPLITS one group and MERGES several. NEVER COUNT(DISTINCT pg_name) and
+     NEVER GROUP BY pg_name. To show a name for a group, GROUP BY pg_id and take
+     MAX(pg_name) for display.
+ 5a. FILTERING BY A GROUP NAME THE USER TYPED — never `pg_name = '...'`. An exact
+     match on this column is almost always zero rows, because the stored name
+     carries a group-type suffix the user does not reproduce. Of the 9,452 distinct
+     names, 3,053 end in "Pg" ("Sakania Pg", "Iamyntoilang Pg") and 2,867 contain
+     "Producer Group" ("Sunflower Producer Group"); others use "P.g." or a trailing
+     number ("Nongtymmai Pg-5"). Measured:
+         pg_name =     'Sakania'                  -> 0 rows
+         pg_name =     'Sakania Producer Group'   -> 0 rows
+         pg_name ILIKE '%Sakania Producer Group%' -> 0 rows   (wrapping is NOT enough)
+         pg_name ILIKE '%Sakania%'                -> 1 row    (PG-FOCUS-EKH-2245)
+     So: STRIP the group-type words from what the user typed — "Producer Group",
+     "Producer Grp", "PG", "P.G.", "Group" — and ILIKE the CORE name only:
+         WHERE pg_name ILIKE '%sakania%'
+     "members in Sakania Producer Group" and "members in Sakania PG" must both
+     become '%sakania%'. A zero-row result after this is a real "no such group",
+     not a spelling mismatch — and it is NOT the same as a NULL measure: say the
+     group was not found rather than reporting the count as null/unavailable.
+     One core name can match SEVERAL pg_id values ("Muskan" matches 4, spelled
+     both "Muskan Pg" and "Muskan Producer Group"). When the question is about one
+     group, resolve to the pg_id(s) first and say which group(s) were matched.
+ 5b. "BY <DIMENSION>" MEANS GROUP BY THAT DIMENSION, AND SELECT IT. A question
+     asking for a figure "by district" / "district-wise" / "for each district"
+     (or by block, village, financial year, product, bank, group type) must put
+     that column in BOTH the SELECT list and the GROUP BY. A bare
+     `SELECT SUM(amount_disbursed) ... WHERE ...` answers a DIFFERENT question —
+     the statewide total — and when it is run per-dimension it returns rows with
+     no labels at all, which is worse than a wrong number because the user
+     cannot even see what each row refers to (reported 2026-09-23: "amount
+     disbursed by district for FY 2021-22" came back as ten unlabelled
+     amount/membership pairs whose values were, in fact, the correct
+     per-district totals).
+     A filter is NOT a breakdown: "for FY 2021-22" restricts rows (WHERE), while
+     "by district" splits them (GROUP BY). A question can carry both, and then
+     it needs both clauses — the WHERE for the year and the GROUP BY for the
+     district. Order the result by the measure descending unless asked otherwise.
+  6. NEVER PARSE THE pg_id. It looks like PG-FOCUS-WGH-7089 and the three-letter token
+     is the district AT ENROLMENT — stale on 1,075 of 14,569 rows because of district
+     bifurcation (990 'WKH' rows are now EASTERN WEST KHASI HILLS, 85 'WGH' rows are
+     now SOUTH WEST GARO HILLS). Geography comes from lgd_district, ALWAYS. Also: the
+     trailing number is unique only within a prefix, so PG-FOCUS-WKH-5956 and
+     PG-LAMP-WGH-5956 are different groups — never match on the number alone.
+  7. FY 2023-24 IS ABSENT FROM THE DATA, NOT ZERO IN IT. The scheme's years are
+     2021-22, 2022-23, 2024-25 and 2025-26. dim_year holds 2023-24, so a GROUP BY
+     simply returns NO ROW for it. Never emit a zero column for it in a year grid,
+     never draw a line through the gap, and when asked for "the previous year" before
+     FY2024-25 use FY2022-23 — the preceding year that HOLDS payments.
+  8. DATES ARE TREASURY BATCHES, NOT A FLOW. date_of_remittance spans 2021-08-31 to
+     2026-03-31 and takes only 30 DISTINCT VALUES; three dates carry 9,193 of 14,569
+     rows. A monthly or daily GROUP BY is valid SQL and misleading prose — label it a
+     batch view. 171 rows have a NULL date (170 of them FY2025-26) and vanish from any
+     date-grouped answer while surviving an FY grouping, so the two return different
+     totals; prefer financial_year_short when completeness matters.
+  9. product_raw IS RAW AND UNNORMALISED — 62 spellings collapse to 45 products
+     (Piggery / PIGGERY / piggery). ALWAYS `GROUP BY UPPER(TRIM(product_raw))`; a bare
+     GROUP BY product_raw splits one product into three rows. AND it is populated on
+     only 3,112 of 14,569 rows (21%): 100% in FY2021-22 and FY2022-23, then 0 of 2,653
+     in FY2024-25 and 8 of 8,812 in FY2025-26. EVERY product answer covers FY2021-22
+     and FY2022-23 only and must say so. A product question about FY2024-25/FY2025-26
+     is unanswerable because the field stopped being CAPTURED — not because the groups
+     had no products.
+ 10. `entity_type <> 'Unresolved'` ON VILLAGE COUNTS AND VILLAGE LISTS ONLY. About
+     1,101 rows (7.6%) carry a synthetic Unresolved placeholder instead of a real
+     village. Those are REAL payments deliberately placed under their district so the
+     totals reconcile — applying the exclusion to a money, district, block or
+     programme total UNDERSTATES it. Count villages with COUNT(DISTINCT village_code),
+     never by name (3,384 codes vs 3,270 names).
+ 11. NEVER row-join v_focus_legacy to a PMAY, MGNREGA, Focus Plus or CM Elevate
+     fact/view — every fact pair in megh_db is prohibited. Focus Legacy x Focus Plus is
+     the most tempting and the most wrong: the two schemes share a NAME and nothing
+     else. Focus Plus holds no producer-group column at all, so there is no key, and a
+     name match between a person and a group is not a match.
+ 12. BANKING. bank_name is clean and institution-level — bank-wise analysis IS
+     legitimate here (unlike Focus Plus). 13 banks; two carry 92% of payments. 276 rows
+     have a NULL bank_name but DO have an ifsc_code — render them 'Not recorded' with
+     COALESCE, never merge them into another bank. One IFSC (SBIN0RRMEGB) covers 8,328
+     rows because it is a SPONSOR-BANK code, not a branch — never present IFSC counts
+     as branch counts. bank_details_current is TRUE or NULL and NEVER FALSE (the view's
+     LEFT JOIN carries the is_current predicate), so "paid to an old account" is
+     `bank_details_current IS NULL AND account_no_masked IS NOT NULL`.
+ 13. PII. NEVER select account_no or name_on_the_account — neither is on the view and
+     both are out of scope. account_no_masked is displayable for ONE named group's
+     payment history, never in a bulk export, and is NOT countable: masking is not
+     collision-free, so never COUNT(DISTINCT account_no_masked).
+ 14. NO STATUS DIMENSION EXISTS. Every row is a payment that HAPPENED — there is no
+     pending, approved, rejected or in-progress population, and none can be derived
+     from a NULL date or a missing product.
+ 15. MONEY UNIT IS UNVERIFIED. Read curated.dim_scheme.money_unit for the Focus Legacy
+     row before printing a currency symbol. Magnitudes (Rs 5,000/member, 950,000 max)
+     corroborate rupees; nothing in the extract confirms it.
+  Worked shapes:
+    -- the three counts together (the default shape for a bare "how many")
+    SELECT COUNT(*) AS payments, COUNT(DISTINCT pg_id) AS producer_groups,
+           SUM(no_of_pg_members) AS memberships, SUM(amount_disbursed) AS amount_disbursed
+    FROM curated.v_focus_legacy;
+    -- a BREAKDOWN by district, scoped to one FY: the year is a WHERE, the
+    -- district is a GROUP BY, and lgd_district is in the SELECT so the rows are
+    -- labelled
+    SELECT lgd_district,
+           SUM(amount_disbursed) AS amount_disbursed,
+           SUM(no_of_pg_members) AS memberships
+    FROM curated.v_focus_legacy
+    WHERE financial_year_short = '2021-22'
+    GROUP BY lgd_district
+    ORDER BY amount_disbursed DESC;
+    -- district money (membership travels with it; district literal UPPERCASE)
+    SELECT SUM(amount_disbursed) AS amount_disbursed, SUM(no_of_pg_members) AS memberships
+    FROM curated.v_focus_legacy WHERE lgd_district = 'WEST GARO HILLS';
+    -- find a group the user named (core name only, suffix stripped)
+    SELECT pg_id, MAX(pg_name) AS pg_name, MAX(lgd_district) AS lgd_district,
+           SUM(no_of_pg_members) AS memberships
+    FROM curated.v_focus_legacy
+    WHERE pg_name ILIKE '%sakania%'          -- NOT pg_name = 'Sakania Producer Group'
+    GROUP BY pg_id;
+    -- groups ranked, name shown safely
+    SELECT pg_id, MAX(pg_name) AS pg_name, SUM(amount_disbursed) AS amount_disbursed,
+           SUM(no_of_pg_members) AS memberships
+    FROM curated.v_focus_legacy GROUP BY pg_id ORDER BY amount_disbursed DESC LIMIT 10;
+    -- villages (the ONLY place the Unresolved filter belongs)
+    SELECT COUNT(DISTINCT village_code) AS villages FROM curated.v_focus_legacy
+    WHERE lgd_district = 'RI BHOI' AND entity_type <> 'Unresolved';
+    -- products (fold case; state the two-year coverage)
+    SELECT UPPER(TRIM(product_raw)) AS product, COUNT(*) AS payments
+    FROM curated.v_focus_legacy WHERE product_raw IS NOT NULL
+    GROUP BY UPPER(TRIM(product_raw)) ORDER BY payments DESC;
+""".strip()
+
+_FOCUSLEGACY_VOCAB = """
+FOCUS LEGACY BUSINESS VOCABULARY (source: focuslegacy_schema_partitions.yaml + focuslegacy_entity_resolver.yaml)
+  "payments" / "disbursements" / "records" / "transactions" -> COUNT(*)
+  "producer groups" / "groups" / "PGs" / "how many groups"  -> COUNT(DISTINCT pg_id)   (NEVER pg_name)
+  "members" / "membership" / "PG members"                   -> SUM(no_of_pg_members)   (memberships, NEVER "people")
+  "beneficiaries"  -> AMBIGUOUS: payments vs groups vs memberships. There is no person-level
+                     reading at all. Show all three rather than silently picking one.
+  "amount" / "disbursed" / "remitted" / "money" / "funds"   -> SUM(amount_disbursed)   (= memberships x 5000)
+  "rate" / "per member"                                     -> the CONSTANT 5000; state it, never compute it
+  "villages"                                                -> COUNT(DISTINCT village_code) + entity_type <> 'Unresolved'
+  "banks"                                                   -> COALESCE(bank_name, 'Not recorded')
+  "branch"                                                  -> prefer ifsc_code (on every row); branch_raw is 22% populated
+  "product" / "crop" / "commodity" / "activity"             -> UPPER(TRIM(product_raw)), FY2021-22 + FY2022-23 only
+  "group type" / "PG type" / "entity type"                  -> pg_entity_type (+ pg_entity_type_name for display); ENUMERATE, never guess the code
+  "programme" / "variant" / "additional" / "top-up"         -> programme_variant ('FOCUS' vs 'Focus (Addnl)'; the latter is ONE day in FY2025-26, not an era)
+  "LAMP" / "FOCUS" / "EXISTING"                             -> pg_id prefixes behind pg_entity_type; the LAMP reading is an UNCONFIRMED hypothesis, do not harden it
+  Financial years held: 2021-22, 2022-23, 2024-25, 2025-26 (FY2023-24 has NO rows — a gap, not a zero).
+""".strip()
+
+_CMELEVATELEGACY_TABLES = """
+CM ELEVATE LEGACY TABLES (source: data/cm_elevate_legacy/*.yaml)
+  curated.v_cm_elevate_disbursement  -- THE query surface, and ZERO JOINS for any ordinary
+      question. One row = one applicant's sanction-and-disbursement record under one of
+      13 schemes (2,823 rows - the full source; row 2392 was un-quarantined 2026-09-25). 38 columns:
+        cm_elevate_disb_fact_id, source_row_id, application_number, scheme_name,
+        year_key, financial_year, financial_year_short, year_note, geography_key,
+        village_code, lgd_village_name, lgd_block, lgd_district, entity_type, on_roster,
+        has_geo_conflict, sanctioned_amount, bank_sanctioned_amount,
+        subsidy_disbursement_1, subsidy_disbursement_date_1, subsidy_disbursement_2,
+        subsidy_disbursement_date_2, subsidy_disbursement_3, subsidy_disbursement_date_3,
+        total_subsidy_disbursement, loan_disbursement_1, loan_disbursement_date_1,
+        loan_disbursement_2, loan_disbursement_date_2, loan_disbursement_3,
+        loan_disbursement_date_3, total_loan_disbursement, total_disbursement,
+        loan_entity, loan_disbursed_status, desanctioned_reason_raw, refused_flag_raw,
+        refused_reason_text
+      dim_cm_elevate_disb_scheme, dim_geography and dim_year are PRE-JOINED (scheme_name,
+      lgd_district / lgd_block / lgd_village_name / entity_type, financial_year /
+      financial_year_short are on the row). Joining dim_year yourself with an INNER JOIN
+      deletes both Sericulture schemes (they carry no year) — never do it.
+  curated.dim_cm_elevate_disb_scheme  -- 13 rows. Already on the view as scheme_name.
+      DISTINCT from curated.dim_cm_elevate_scheme (15 rows, the OTHER CM Elevate dataset).
+  curated.dim_scheme  -- read ON ITS OWN (never joined per row) only to look up money_unit.
+  NEVER QUERY, NEVER JOIN: curated.fact_cm_elevate_disbursement (it carries applicant
+      first/middle/last names; the view drops them) and curated.v_cm_elevate /
+      curated.fact_cm_elevate_application (a DIFFERENT scheme with no shared key — the
+      fact-to-fact join is prohibited).
+""".strip()
+
+_CMELEVATELEGACY_RULES = """
+CM ELEVATE LEGACY RULES (breaking these produces a wrong number, not just an ugly query):
+  1. NOT THE CM ELEVATE APPLICATIONS DATASET. This is a separate scheme: 13 schemes (not 15),
+     sanction and disbursement money in RUPEES, and a financial year. It has NO data_verified,
+     onhold, is_withdraw, applicant_category, request_id, gender or application status —
+     those live in curated.v_cm_elevate. Never reference them here.
+  2. GRAIN AND COUNTING. One row = one applicant's sanction-and-disbursement record.
+     "applications", "beneficiaries", "cases" and "records" mean COUNT(*) AS records.
+     "SANCTIONED applications / cases" means COUNT(sanctioned_amount) AS
+     sanctioned_records — 3 records (all Any Business Venture, marked Refused) carry no
+     sanctioned amount and are NOT sanctioned, so COUNT(*) overstates it. Whenever a
+     question asks for sanctioned cases, output sanctioned_records as its own column
+     (alongside records when both are asked, e.g. a district summary). "Not sanctioned"
+     = COUNT(*) FILTER (WHERE sanctioned_amount IS NULL); report desanctioned records
+     (desanctioned_reason_raw Refused / Duplicate) beside it as withdrawn sanctions,
+     never as the "not sanctioned" figure. There is NO mandatory row filter (no
+     is_placeholder): do not invent one.
+  3. MONEY IS RUPEES (unverified — dim_scheme.money_unit is authoritative). Totals in crore:
+     ROUND(SUM(x) / 1e7, 2) AS <name>_cr. Per-record averages stay in rupees
+     (ROUND(AVG(x)) AS avg_<name>_rupees). Never confuse with MGNREGA's lakh.
+  4. STORED TOTALS ONLY. total_disbursement = subsidy + loan, total_subsidy_disbursement and
+     total_loan_disbursement are verified stored totals — never re-add them by hand and
+     never add the tranche columns (subsidy_disbursement_1..3, loan_disbursement_1..3) for a
+     money total. A tranche column is right ONLY when the question names that instalment.
+  5. "DISBURSED" IS THREE-WAY. A bare "disbursed" / "released" / "paid" returns subsidy_cr,
+     loan_cr and total_disbursed_cr side by side, with sanctioned_cr beside them.
+     "Subsidy" -> total_subsidy_disbursement; "loan" -> total_loan_disbursement; "total" /
+     "subsidy and loan together" -> total_disbursement. SANCTIONED IS NOT DISBURSED.
+     Desanctioned records stay IN money totals (the source file's totals include them)
+     unless the user asks to exclude them.
+  6. RATIOS. Utilisation / disbursed % = ROUND(100.0 * SUM(total_disbursement) /
+     NULLIF(SUM(sanctioned_amount), 0), 1), always with numerator and denominator shown.
+     "Pending" / "yet to be disbursed" = SUM(sanctioned_amount) - SUM(total_disbursement),
+     a DERIVED figure — label it pending_cr and keep negatives as calculated.
+  7. FINANCIAL YEAR is the STORED label: financial_year_short = '2024-25' / '2025-26' (only
+     two years exist; a resolved year_key also works). 395 records (both Sericulture schemes,
+     every row) have NO year: grouping by year MUST use
+     COALESCE(financial_year_short, '(no financial year)') AS financial_year with
+     GROUP BY financial_year_short ORDER BY financial_year_short NULLS LAST. NEVER derive a
+     year from a date (EXTRACT on a date is for date questions only). A date-range question
+     filters subsidy_disbursement_date_1 with a half-open range. Two years is a comparison,
+     not a trend. There is NO monthly grain.
+  8. GEOGRAPHY. lgd_district and lgd_block are UPPERCASE literals ('WEST GARO HILLS',
+     'UMLING'); Title Case returns zero rows silently. Municipal Board areas are separate
+     block values: 'RESUBELPARA-MUNICIPAL BOARD', 'WILLIAM NAGAR-MUNICIPAL BOARD',
+     'TURA MUNICIPAL BOARD-MUNICIPAL BOARD'. Regions are not a column: Garo Hills = EAST,
+     NORTH, SOUTH, SOUTH WEST and WEST GARO HILLS; Khasi Hills = EAST KHASI HILLS, EASTERN
+     WEST KHASI HILLS, SOUTH WEST KHASI HILLS, WEST KHASI HILLS; Jaintia Hills = EAST and
+     WEST JAINTIA HILLS; Ri Bhoi is its own group. "WKH" is WEST KHASI HILLS, not Eastern
+     West Khasi Hills.
+  9. VILLAGES. Count with COUNT(DISTINCT village_code) and add entity_type <> 'Unresolved'
+     to every village count and village list (404 records have no village). Group a village
+     list by lgd_village_name AND village_code (17 names are shared by different villages).
+     District, block and scheme totals KEEP the Unresolved rows — their district is known.
+ 10. SCHEME NAMES are exact stored literals — use the RESOLVED ENTITIES value when given.
+     The two Sericulture schemes differ by ONE SPACE: 'Meghalaya Sericulture & Weaving
+     Scheme (spinning)' (space) and 'Meghalaya Sericulture & Weaving Scheme(weaving)' (no
+     space). NEVER derive a scheme from the application_number prefix (MPDSI etc.).
+     13 schemes / 12 districts: show all rows, no LIMIT, for "each scheme / each district".
+ 11. LENDER. loan_entity holds only 'Bank', 'LIFCOM' or NULL: group with
+     COALESCE(loan_entity, '(not recorded)'). 'Bank' is a category, not a bank's name — no
+     bank or branch name exists. "Took a loan" / "received a loan" = total_loan_disbursement
+     > 0 (a recorded lender does not mean a loan was paid). Average loan size averages only
+     records with a loan: AVG(...) FILTER (WHERE total_loan_disbursement > 0).
+ 12. REFUSAL FIELDS DISAGREE. desanctioned_reason_raw ('Refused' / 'Duplicate' / NULL,
+     group with COALESCE(..., '(none recorded)')), refused_flag_raw (TRUE or NULL, NEVER
+     FALSE: use IS TRUE / IS DISTINCT FROM TRUE, never NOT refused_flag_raw) and
+     refused_reason_text (free text on ~7 rows: list it, never GROUP BY it). A bare
+     "refused" counts all three side by side. "Duplicate" is a recorded outcome, not
+     repeated rows (application_number is unique).
+ 13. ZERO IS NOT NULL. total_disbursement = 0 means nothing was paid — filter = 0, not IS
+     NULL. NULL means missing. AVG ignores NULLs; never COALESCE a measure to 0 before AVG.
+ 14. FIXED ENTITLEMENT SCHEMES (Piggery Rs 1,25,000 each, Dairy Rs 3,00,000 each, ...):
+     an average restates the constant — show the sanctioned_amount distribution instead
+     (GROUP BY sanctioned_amount). A statewide average is a Piggery average — break
+     averages down by scheme_name.
+ 15. RANKING. An explicit N -> LIMIT N. A plural "which districts / blocks ... most" with no
+     N -> top 5. A singular "which district" -> LIMIT 1 with a name tie-break. Keep the
+     record count beside any money ranking (the money leader is often a different scheme).
+ 16. bank_sanctioned_amount has NO confirmed meaning — never build a metric, share or
+     total on it.
+ 17. SANCTION RATE = ROUND(100.0 * COUNT(sanctioned_amount) / NULLIF(COUNT(*), 0), 2) AS
+     sanctioned_pct, with records and sanctioned_records beside it; the answer must say it
+     is a share of THIS dataset (applications that never reached sanction are in the
+     separate CM Elevate applications dataset). CONSTITUENCY: the view has no column —
+     JOIN curated.dim_geography g ON g.geography_key = v.geography_key and use g.ac_name
+     (filter UPPER(g.ac_name) = UPPER('<name>')); it is NOT the block of the same name.
+ 18. NOT HELD — answer that it is not held and offer the nearest real figure; never
+     improvise a number: applicant names (identify a record by application_number),
+     monthly figures, individual vs group applicants, loan repayment,
+     gender / caste / age, bank branch names, targets / budgets, jobs or business outcomes,
+     any link to the CM Elevate applications dataset, and any year other than FY2024-25 /
+     FY2025-26.
+""".strip()
+
+_CMELEVATELEGACY_VOCAB = """
+CM ELEVATE LEGACY BUSINESS VOCABULARY (source: cmelevatelegacy_schema_partitions.yaml + cmelevatelegacy_entity_resolver.yaml)
+  "applications" / "records" / "beneficiaries" / "cases" / "sanctions" -> COUNT(*)   (every row is a sanction)
+  "sanctioned" / "sanction amount" / "entitlement"  -> SUM(sanctioned_amount)   (NOT disbursed)
+  "disbursed" / "released" / "paid" / "money"       -> subsidy + loan + total side by side (rule 5)
+  "subsidy" / "grant"                               -> total_subsidy_disbursement
+  "loan" / "credit"                                 -> total_loan_disbursement (presence: > 0)
+  "lender" / "loan entity" / "LIFCOM" / "bank"      -> COALESCE(loan_entity, '(not recorded)')
+  "utilisation" / "% paid"                          -> total_disbursement / NULLIF(sanctioned_amount, 0)
+  "pending" / "outstanding"                         -> sanctioned - disbursed (derived, labelled)
+  "desanctioned" / "withdrawn sanction" / "refused" / "duplicate" -> desanctioned_reason_raw (+ rule 12)
+  "instalment" / "tranche" 1/2/3                    -> subsidy_disbursement_N / loan_disbursement_N (only when named)
+  "villages"                                        -> COUNT(DISTINCT village_code) + entity_type <> 'Unresolved'
+  "Piggery" / "Poultry" / "Dairy" / "Goat" / "Warehouse" / "PTV" / "PARV" / "spinning" / "weaving"
+                                                    -> the resolved scheme_name literal
+  "this year" / "current year" -> FY 2025-26 (say so);  "last year" -> FY 2024-25
+  Financial years held: 2024-25 (2,291 records), 2025-26 (137 records; only Prime Tourism
+  Vehicle, Agriculture Warehouse and Prime Agriculture Response Vehicle), none (395, Sericulture).
+""".strip()
+
 _CROSS_SCHEME = """
 CROSS-SCHEME TABLES (only relevant when the question spans more than one scheme together)
   curated.v_cross_scheme_money_district_year  -- MGNREGA vs PMAY spend, both normalised to CRORE
@@ -1122,11 +1535,28 @@ one closely, follow the procedure, do NOT pattern-match a near-miss example.
   cross join the four one-row CTEs: SELECT * FROM money, coverage, mgnrega_done, pmay_done.
 """.strip()
 
+_CMELEVATELEGACY_CROSS = """
+CM ELEVATE LEGACY IN A CROSS-SCHEME QUESTION — read first:
+  CM Elevate Legacy appears in NEITHER cross-scheme view (both are built from MGNREGA and
+  PMAY only), and every fact-to-fact join involving curated.v_cm_elevate_disbursement is
+  prohibited — including to curated.v_cm_elevate, the other CM Elevate dataset, with which
+  it shares a name and no key.
+  * MONEY compared or combined with another scheme (FAMILY A): do NOT build it. Return only
+    the CM Elevate Legacy figure(s) from its own view, and say the like-for-like comparison
+    is not available because no cross-scheme view covers this scheme.
+  * Any other per-scheme metric (FAMILY C): the CM Elevate Legacy figure is COUNT(*) FROM
+    curated.v_cm_elevate_disbursement, labelled "records" (sanction-and-disbursement
+    records), in its own bare SELECT joined to the others by UNION ALL — never added into a
+    combined total with another scheme's unit.
+""".strip()
+
 _SCHEME_BLOCKS = {
     "MGNREGA": (_MGNREGA_TABLES, _MGNREGA_RULES, _MGNREGA_VOCAB),
     "PMAY-G": (_PMAY_TABLES, _PMAY_RULES, _PMAY_VOCAB),
     "Focus Plus": (_FOCUSPLUS_TABLES, _FOCUSPLUS_RULES, _FOCUSPLUS_VOCAB),
     "CM Elevate": (_CMELEVATE_TABLES, _CMELEVATE_RULES, _CMELEVATE_VOCAB),
+    "Focus Legacy": (_FOCUSLEGACY_TABLES, _FOCUSLEGACY_RULES, _FOCUSLEGACY_VOCAB),
+    "CM Elevate Legacy": (_CMELEVATELEGACY_TABLES, _CMELEVATELEGACY_RULES, _CMELEVATELEGACY_VOCAB),
 }
 
 
@@ -1143,6 +1573,8 @@ def build_schema_context(schemes: list[str]) -> str:
 
     if len(schemes) > 1:
         parts.append(_CROSS_SCHEME)
+        if "CM Elevate Legacy" in schemes:
+            parts.append(_CMELEVATELEGACY_CROSS)
 
     parts.append(f"SHARED RULES:\n{_SHARED_RULES}")
     parts.append(_CLOSING)

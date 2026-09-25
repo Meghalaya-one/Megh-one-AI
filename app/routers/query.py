@@ -4,10 +4,11 @@ import time
 import uuid
 from datetime import date
 
-from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
+from fastapi import (APIRouter, Depends, File, Form, HTTPException,
+                     Request, UploadFile)
 from pydantic import BaseModel, Field, field_validator
 
-from app import auth, conversation_memory, conversation_store, llm
+from app import asr_guard, auth, conversation_memory, conversation_store, llm
 from app.cache import metrics, response_cache
 from app.config import settings
 from app.deps import current_scope, require_user
@@ -249,19 +250,63 @@ def _mirror_audit(scope, session_id, question, result, started, ip):
 
 
 @router.post("/api/query/transcribe")
-async def transcribe(file: UploadFile = File(...), scope: auth.UserScope = Depends(_identity)):
-    """Voice input -> text, via qwen3-asr on the model gateway."""
+async def transcribe(file: UploadFile = File(...),
+                     language: str = Form("en"),
+                     device: str = Form(""),
+                     scope: auth.UserScope = Depends(_identity)):
+    """Voice input -> text, via qwen3-asr on the model gateway.
+
+    `language` is already sent by the web UI (ai_query.html appends it to the
+    same FormData) and was previously discarded here, because FastAPI drops an
+    undeclared form field. Accepting it closes that contract mismatch; the
+    value is validated in llm._asr_language before it reaches the gateway,
+    which rejects unknown codes with a 400. Defaulted so any client that omits
+    the field keeps working.
+
+    Note this was NOT the cause of the "ASR can't convert" failure — that was
+    the AudioContext lifecycle bug in ai_query.html's blobToWav()."""
     audio = await file.read()
     if not audio:
         raise HTTPException(400, "empty audio upload")
     if len(audio) > _MAX_AUDIO_BYTES:
         raise HTTPException(413, "audio too large (max 10 MB)")
     try:
-        text = await llm.call_asr(audio, file.filename or "audio.wav")
+        text = await llm.call_asr(audio, file.filename or "audio.wav",
+                                  language=language or "en")
     except ModelBusyError as e:
         raise HTTPException(503, "The service is busy right now. Please retry in a few seconds.",
                             headers={"Retry-After": "5"}) from e
     except Exception as e:
         logger.exception("transcription failed")
         raise HTTPException(502, "transcription upstream error") from e
+    # The ASR answers audio with no speech in it with a stock phrase ("Okay.",
+    # "I'm not sure.") rather than an empty string. Returning that as the
+    # transcript typed it into the composer as if the user had said it.
+    # With the vocabulary prompt on, the same audio comes back as the prompt
+    # itself, verbatim — the cleaner of the two signals.
+    no_speech = (asr_guard.is_no_speech(text)
+                 or asr_guard.is_prompt_echo(text, settings.ASR_PROMPT))
+    _save_asr_sample(audio, text, no_speech, device)
+    if no_speech:
+        logger.info("transcribe: no speech (asr said %r, %d bytes)", text[:80], len(audio))
+        return {"text": "", "no_speech": True}
     return {"text": text}
+
+
+def _save_asr_sample(audio: bytes, text: str, no_speech: bool, device: str) -> None:
+    """settings.ASR_DEBUG_DIR only: keep the upload and the ASR's answer so a
+    bad transcript can be replayed and measured instead of guessed at."""
+    if not settings.ASR_DEBUG_DIR:
+        return
+    try:
+        import json
+        from pathlib import Path
+        d = Path(settings.ASR_DEBUG_DIR)
+        d.mkdir(parents=True, exist_ok=True)
+        stem = time.strftime("%Y%m%d-%H%M%S") + f"-{uuid.uuid4().hex[:6]}"
+        (d / f"{stem}.wav").write_bytes(audio)
+        (d / f"{stem}.json").write_text(json.dumps(
+            {"text": text, "no_speech": no_speech, "device": device, "bytes": len(audio)},
+            ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        logger.warning("could not save ASR debug sample", exc_info=True)

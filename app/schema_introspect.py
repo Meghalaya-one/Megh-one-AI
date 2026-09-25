@@ -22,7 +22,14 @@ _SUBJECT_TO_SCHEME = {"mgnrega": "MGNREGA", "pmay": "PMAY-G", "pmayg": "PMAY-G",
                       "focus_plus": "Focus Plus", "focusplus": "Focus Plus",
                       "focus plus": "Focus Plus", "focus+": "Focus Plus",
                       "cm_elevate": "CM Elevate", "cmelevate": "CM Elevate",
-                      "cm elevate": "CM Elevate", "cm-elevate": "CM Elevate"}
+                      "cm elevate": "CM Elevate", "cm-elevate": "CM Elevate",
+                      "focus_legacy": "Focus Legacy", "focuslegacy": "Focus Legacy",
+                      "focus legacy": "Focus Legacy", "focus-legacy": "Focus Legacy",
+                      "cm_elevate_legacy": "CM Elevate Legacy",
+                      "cmelevatelegacy": "CM Elevate Legacy",
+                      "cm elevate legacy": "CM Elevate Legacy",
+                      "cm_elevate_disbursement": "CM Elevate Legacy",
+                      "cm elevate disbursement": "CM Elevate Legacy"}
 
 _cache: dict = {
     "loaded": False, "tables": [], "glossary": [], "metrics": [], "joins": [],
@@ -43,7 +50,14 @@ _TABLE_NAME_TO_SCHEME = {
     "employment": "MGNREGA", "expenditure": "MGNREGA", "mgnrega": "MGNREGA",
     "pmay": "PMAY-G",
     "focus_plus": "Focus Plus",
+    # Before "cm_elevate": _table_matches_scheme returns on the FIRST substring
+    # hit, and every CM Elevate Legacy table name also contains "cm_elevate".
+    "cm_elevate_disb": "CM Elevate Legacy",
     "cm_elevate": "CM Elevate",
+    "focus_legacy": "Focus Legacy",
+    "producer_group": "Focus Legacy",
+    "pg_entity_type": "Focus Legacy",
+    "pg_bank_history": "Focus Legacy",
 }
 
 

@@ -53,6 +53,39 @@ async def collection_count() -> int:
         return -1
 
 
+async def distinct_schemes() -> set[str]:
+    """Every distinct `scheme` payload tag currently in the collection.
+
+    Used by kb_ingest to tell a merely-smaller collection from a stale one: a
+    scheme present in data/ but absent here can never be retrieved (search
+    filters on an exact scheme match), so its questions all answer "not
+    covered". Returns an empty set on any error, which the caller reads as
+    "cannot confirm" and rebuilds — the safe direction.
+    """
+    client = get_client()
+    schemes: set[str] = set()
+    offset = None
+    try:
+        while True:
+            points, offset = await client.scroll(
+                collection_name=settings.QDRANT_COLLECTION,
+                limit=512,
+                offset=offset,
+                with_payload=["scheme"],
+                with_vectors=False,
+            )
+            for p in points:
+                tag = (p.payload or {}).get("scheme")
+                if tag:
+                    schemes.add(tag)
+            if offset is None:
+                break
+    except Exception as e:  # noqa: BLE001 — missing/unreachable collection
+        logger.warning("qdrant: could not list scheme tags (%s)", e)
+        return set()
+    return schemes
+
+
 async def recreate_collection(dim: int) -> None:
     client = get_client()
     await client.recreate_collection(

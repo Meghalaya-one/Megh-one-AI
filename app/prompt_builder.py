@@ -33,7 +33,7 @@ before — a repair most often needs exactly the entity block it was missing.
 import re
 
 from app import schema_introspect
-from app.annotations import few_shot_examples, prohibited_joins_text
+from app.annotations import common_mistakes_text, few_shot_examples, prohibited_joins_text
 from app.schema_context import build_schema_context
 
 # Bare table name -> owning scheme, so the LIVE SCHEMA block is scoped the same
@@ -43,16 +43,27 @@ _CROSS_PREFIXES = ("v_cross_scheme",)
 _MGNREGA_EXACT = {"v_employment", "v_expenditure", "v_district_year_summary"}
 _FOCUSPLUS_EXACT = {"v_focus_plus"}
 _CMELEVATE_EXACT = {"v_cm_elevate", "dim_cm_elevate_scheme"}
+_FOCUSLEGACY_EXACT = {"v_focus_legacy", "dim_producer_group", "dim_pg_entity_type",
+                      "bridge_pg_bank_history"}
+# Checked BEFORE the CM Elevate substring test below: every one of these names
+# also contains "cm_elevate", and would otherwise be filed under the other,
+# unrelated CM Elevate dataset.
+_CMELEVATELEGACY_EXACT = {"v_cm_elevate_disbursement", "fact_cm_elevate_disbursement",
+                          "dim_cm_elevate_disb_scheme"}
 
 
 def _scheme_of(table: str) -> str:
-    """'MGNREGA' | 'PMAY-G' | 'Focus Plus' | 'CM Elevate' | 'shared' | 'cross' for
-    a bare (unqualified) table name."""
+    """'MGNREGA' | 'PMAY-G' | 'Focus Plus' | 'CM Elevate' | 'Focus Legacy' |
+    'CM Elevate Legacy' | 'shared' | 'cross' for a bare (unqualified) table name."""
     t = table.lower()
     if t.startswith(_SHARED_PREFIXES):
         return "shared"
     if t.startswith(_CROSS_PREFIXES):
         return "cross"
+    if "cm_elevate_disb" in t or t in _CMELEVATELEGACY_EXACT:
+        return "CM Elevate Legacy"
+    if "focus_legacy" in t or "focuslegacy" in t or t in _FOCUSLEGACY_EXACT:
+        return "Focus Legacy"
     if "focus_plus" in t or "focusplus" in t or t in _FOCUSPLUS_EXACT:
         return "Focus Plus"
     if "cm_elevate" in t or "cmelevate" in t or t in _CMELEVATE_EXACT:
@@ -83,7 +94,8 @@ def _live_schema_block(schemes: list[str]) -> str:
         owner = _scheme_of(bare)
         if owner == "cross" and not multi:
             continue
-        if owner in ("MGNREGA", "PMAY-G", "Focus Plus", "CM Elevate") and owner not in want:
+        if owner in ("MGNREGA", "PMAY-G", "Focus Plus", "CM Elevate",
+                     "Focus Legacy", "CM Elevate Legacy") and owner not in want:
             continue
         lines.append(f"  {qualified}({', '.join(c['column'] for c in cols)})")
 
@@ -113,9 +125,30 @@ def _fewshot_block(schemes: list[str], question: str = "") -> str:
                 'different metric (like a row count) to make it look answerable; state '
                 'plainly that the figure is not held in this warehouse.'
             )
+        elif ex.get("plan"):
+            plan = " -> ".join(ex["plan"])
+            parts.append(f'Q: "{ex["question"]}"\nPlan: {plan}\nSQL: {ex["sql"]}')
         else:
             parts.append(f'Q: "{ex["question"]}"\nSQL: {ex["sql"]}')
     return "\nEXAMPLES (verified SQL, and known-unanswerable questions):\n" + "\n\n".join(parts) + "\n"
+
+
+def _common_mistakes_block(schemes: list[str]) -> str:
+    text = common_mistakes_text(schemes)
+    if not text:
+        return ""
+    return ("\nCOMMON MISTAKES — each WRONG query below returns a wrong number or zero "
+            "rows; write the RIGHT shape:\n" + text + "\n")
+
+
+def _focus_legacy_only(schemes: "list[str] | None") -> bool:
+    """True when Focus Legacy is the ONLY scheme in play.
+
+    It reaches the assembly constituency through a dim_geography join rather
+    than a column on its own view, so the resolved-entity line has to spell out
+    a different filter than the MGNREGA one. A cross-scheme question also reads
+    MGNREGA, whose AC really is a column, so this is an exact-match test."""
+    return list(schemes or []) == ["Focus Legacy"]
 
 
 def _focus_plus_only(schemes: "list[str] | None") -> bool:
@@ -229,11 +262,46 @@ def _entities_block(entity_result: dict, question: str = "",
                     "village gets its own row in the result — do NOT sum them into one figure, "
                     "and do NOT filter on lgd_village_name instead.")
             elif k == "assembly_constituency":
-                lines.append(
-                    f"  UPPER(assembly_constituency_name) = UPPER({v!r})   -- this column "
-                    "exists ONLY in mgnrega_employment. If the question also needs "
-                    "expenditure, say that level isn't available there instead of silently "
-                    "switching to a block/district filter.")
+                if list(schemes or []) == ["CM Elevate Legacy"]:
+                    # Same shape as Focus Legacy: v_cm_elevate_disbursement has
+                    # no constituency column but carries geography_key, a
+                    # declared FK to dim_geography, which holds ac_name
+                    # (cmelevatelegacy_foreign_key_augmentation.yaml). The
+                    # join reproduces the source workbook's
+                    # mapped_constituency_name exactly (Mairang: 52 = 52).
+                    lines.append(
+                        f"  the {v!r} assembly constituency   -- v_cm_elevate_disbursement "
+                        "has NO constituency column. Join it: FROM "
+                        "curated.v_cm_elevate_disbursement v JOIN curated.dim_geography g "
+                        "ON g.geography_key = v.geography_key, then filter "
+                        f"UPPER(g.ac_name) = UPPER({v!r}). This is the constituency, NOT a "
+                        "block of the same name — never filter lgd_block for it. Records "
+                        "with no village carry no constituency; say the constituency comes "
+                        "from the geography registry.")
+                elif _focus_legacy_only(schemes):
+                    # v_focus_legacy has NO constituency column. The AC is
+                    # reached through the documented dimension join on
+                    # geography_key — a declared FK, explicitly permitted
+                    # (focuslegacy_schema_partitions.yaml constituency_rule /
+                    # sanctioned_patterns.constituency). Emitting the MGNREGA
+                    # column here made the filter unusable, so the constituency
+                    # the user had just picked was dropped and the pipeline
+                    # asked for a district instead (reported 2026-09-23).
+                    lines.append(
+                        f"  the {v!r} assembly constituency   -- v_focus_legacy has NO "
+                        "constituency column. Join it: FROM curated.v_focus_legacy f JOIN "
+                        "curated.dim_geography g ON g.geography_key = f.geography_key, then "
+                        f"filter UPPER(g.ac_name) = UPPER({v!r}). Also add "
+                        "f.entity_type <> 'Unresolved' — a placeholder row has no real "
+                        "village and so no meaningful constituency — and say the AC comes "
+                        "from the geography registry, so the total will not reconcile to "
+                        "the scheme total.")
+                else:
+                    lines.append(
+                        f"  UPPER(assembly_constituency_name) = UPPER({v!r})   -- this column "
+                        "exists ONLY in mgnrega_employment. If the question also needs "
+                        "expenditure, say that level isn't available there instead of silently "
+                        "switching to a block/district filter.")
                 # An assembly constituency is an electoral boundary that CUTS
                 # ACROSS the administrative hierarchy — it is not a parent of
                 # the block, and neither filter implies the other. When both
@@ -316,9 +384,13 @@ def _entities_block(entity_result: dict, question: str = "",
             elif k == "cm_scheme":
                 vals = v if isinstance(v, list) else [v]
                 quoted = ", ".join(f"'{s}'" for s in vals)
+                # Same entity key for both CM Elevate datasets (each resolves its
+                # own sub-scheme catalogue into it); only the label differs.
+                _label = ("CM Elevate Legacy scheme" if "CM Elevate Legacy" in (schemes or [])
+                          else "CM Elevate sub-scheme")
                 if len(vals) == 1:
-                    lines.append(f"  scheme_name = {quoted}   -- exact stored CM Elevate "
-                                 "sub-scheme name (mixed case, stored exactly); use it "
+                    lines.append(f"  scheme_name = {quoted}   -- exact stored {_label} "
+                                 "name (mixed case, stored exactly); use it "
                                  "verbatim, do NOT substitute the question's own spelling "
                                  "or wording for it")
                 else:
@@ -365,6 +437,7 @@ def build_sql_prompt(question: str, schemes: list[str], entity_result: dict) -> 
         (catalog + "\n") if catalog else "",
         _prohibited_block(schemes),
         _fewshot_block(schemes, _fewshot_ranking_text(question, entity_result)),
+        _common_mistakes_block(schemes),
         _entities_block(entity_result, question, schemes),
         f"\nThe user's question is about: {', '.join(schemes)}.\n",
         f'\nQuestion: "{question}"\nSQL:',
@@ -377,6 +450,7 @@ def build_repair_prompt(question: str, schemes: list[str], entity_result: dict,
         build_schema_context(schemes), "\n\n",
         _live_schema_block(schemes),
         _prohibited_block(schemes),
+        _common_mistakes_block(schemes),
         _entities_block(entity_result, question, schemes),
         "\nThe previous query FAILED and must be corrected.\n",
         f"Error: {error}\n",

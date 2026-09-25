@@ -36,7 +36,21 @@ _SCHEME_RX = {
     "MGNREGA": re.compile(r"\bmgnrega\b|\bmnrega\b|\bnrega\b", re.IGNORECASE),
     "PMAY-G": re.compile(r"\bpmay[\s-]?g?\b|\bawa+s?\b", re.IGNORECASE),
     "Focus Plus": re.compile(r"\bfocus[\s-]?plus\b|\bfocus\s*\+|\bfocusplus\b", re.IGNORECASE),
-    "CM Elevate": re.compile(r"\bcm[\s-]?elevate\b|\bcmelevate\b", re.IGNORECASE),
+    # Same lookarounds as pipeline._SCHEME_NAME_PATTERN: "CM Elevate Legacy" is
+    # the other CM Elevate dataset, not this one.
+    "CM Elevate": re.compile(
+        r"(?<!legacy )\bcm[\s-]?elevate\b(?![\s-]*(?:legacy|disbursements?)\b)|"
+        r"(?<!legacy )\bcmelevate\b(?![\s-]*(?:legacy|disbursements?)\b)",
+        re.IGNORECASE),
+    "Focus Legacy": re.compile(
+        r"\bfocus[\s-]?legacy\b|\bfocuslegacy\b|\blegacy[\s-]?focus\b|"
+        r"\bold[\s-]?focus\b|\bfocus[\s-]?pg\b|\bpg[\s-]?focus\b",
+        re.IGNORECASE),
+    "CM Elevate Legacy": re.compile(
+        r"\bcm[\s-]?elevate[\s-]*(?:legacy|disbursements?)\b|"
+        r"\bcmelevate[\s-]*(?:legacy|disbursements?)\b|"
+        r"\blegacy[\s-]+cm[\s-]?elevate\b|\belevate[\s-]?legacy\b",
+        re.IGNORECASE),
 }
 
 
@@ -56,7 +70,8 @@ def _primary_schemes(schemes: list[str], question: str) -> list[str]:
     if schemes:
         return schemes
     named = [s for s, rx in _SCHEME_RX.items() if rx.search(question or "")]
-    return named or ["MGNREGA", "PMAY-G", "Focus Plus", "CM Elevate"]
+    return named or ["MGNREGA", "PMAY-G", "Focus Plus", "CM Elevate", "Focus Legacy",
+                     "CM Elevate Legacy"]
 
 
 # ── answer grain (read off the generated SQL's GROUP BY) ────────────────────
@@ -353,12 +368,95 @@ def _cmelevate_data(question: str, ents: dict, grain: str | None = None,
     return [{"label": q, "question": q} for q in out]
 
 
+def _focuslegacy_data(question: str, ents: dict, grain: str | None = None,
+                      rows: list | None = None) -> list[dict]:
+    scope = _scope_phrase(ents)
+    gsuf = _grain_suffix(ents, grain)
+    out: list[str] = []
+
+    # 1. The complementary Focus Legacy metric to the one just asked. Amount and
+    # membership are the SAME measure here (amount = members x 5000), so asking
+    # one never offers the other as if it were a second finding — it offers the
+    # group/product/bank angle instead.
+    # Subject first, measure second. "How many producer groups were paid?" names
+    # BOTH a subject (groups) and a money-ish verb (paid), and the subject is the
+    # more specific signal — testing the money verbs first offered the user back
+    # the very count they had just asked for.
+    if _asked(question, "producer group", "how many group", "pg id", "pgs"):
+        out.append(f"How many PG members were covered{scope}{gsuf}?")
+    elif _asked(question, "member", "membership"):
+        out.append(f"How much was disbursed to producer groups{scope}{gsuf}?")
+    elif _asked(question, "amount", "disburs", "remit", "money", "fund"):
+        out.append(f"How many producer groups were paid{scope}{gsuf}?")
+    elif _asked(question, "product", "piggery", "ginger", "crop"):
+        out.append(f"How many producer groups were paid{scope}{gsuf}?")
+    else:
+        out.append(f"How much was disbursed to producer groups{scope}{gsuf}?")
+
+    # 2. Drill one level finer than what the user is looking at.
+    d = _drill_down(ents, grain, rows)
+    if d:
+        out.append(d["question"])
+
+    # 3. Another Focus Legacy metric. The group-count candidate is dropped when
+    # the question already asked it — _fill_metric compares against the UNSCOPED
+    # question, so "How many producer groups were paid?" would otherwise come
+    # back as "How many producer groups were paid in Meghalaya?".
+    fills = [
+        f"Show Focus Legacy payments by financial year{scope}.",
+        f"Which products do Focus Legacy groups work on{scope}?",
+        f"Which banks handle Focus Legacy payments{scope}?",
+        f"How many distinct villages have Focus Legacy payments{scope}?",
+    ]
+    if not _asked(question, "producer group", "how many group", "pgs"):
+        fills.insert(0, f"How many producer groups were paid{scope}{gsuf}?")
+    _fill_metric(out, question, fills)
+    return [{"label": q, "question": q} for q in out]
+
+
+def _cmelevatelegacy_data(question: str, ents: dict, grain: str | None = None,
+                          rows: list | None = None) -> list[dict]:
+    scope = _scope_phrase(ents)
+    gsuf = _grain_suffix(ents, grain)
+    out: list[str] = []
+
+    # 1. The complementary CM Elevate Legacy figure. Money questions are offered
+    # the record count or the lender split; counts are offered the money; a
+    # lender / refusal / year question is offered the scheme-wise money.
+    if _asked(question, "loan", "lender", "lifcom"):
+        out.append(f"How much subsidy was disbursed under CM Elevate Legacy{scope}{gsuf}?")
+    elif _asked(question, "refus", "desanction", "duplicate"):
+        out.append(f"Did any desanctioned CM Elevate Legacy records still receive money{scope}?")
+    elif _asked(question, "disburs", "amount", "money", "subsidy", "sanction", "paid"):
+        out.append(f"How much of the CM Elevate Legacy loan money went through Bank vs LIFCOM{scope}?")
+    elif _asked(question, "financial year", "fy", "2024", "2025"):
+        out.append(f"What is the CM Elevate Legacy disbursement by scheme{scope}?")
+    else:
+        out.append(f"What is the total amount disbursed under CM Elevate Legacy{scope}{gsuf}?")
+
+    # 2. Drill one level finer than what the user is looking at.
+    d = _drill_down(ents, grain, rows)
+    if d:
+        out.append(d["question"])
+
+    # 3. Another CM Elevate Legacy figure — keep the whole set metric-driven.
+    _fill_metric(out, question, [
+        f"How many CM Elevate Legacy records are there, by scheme{scope}?",
+        f"What share of the sanctioned amount has been disbursed under CM Elevate Legacy{scope}{gsuf}?",
+        f"Show CM Elevate Legacy disbursement by financial year{scope}.",
+        f"How many distinct villages have CM Elevate Legacy records{scope}?",
+    ])
+    return [{"label": q, "question": q} for q in out]
+
+
 def _cross_scheme_data(question: str, ents: dict, grain: str | None = None,
                        rows: list | None = None, schemes: list[str] | None = None) -> list[dict]:
     scope = _scope_phrase(ents)
     gsuf = _grain_suffix(ents, grain)
     has_fp = "Focus Plus" in (schemes or [])
     has_cme = "CM Elevate" in (schemes or [])
+    has_fl = "Focus Legacy" in (schemes or [])
+    has_cmel = "CM Elevate Legacy" in (schemes or [])
     # The cross-scheme VIEWS (spend, village coverage) cover MGNREGA and PMAY-G only —
     # Focus Plus and CM Elevate are each compared per-scheme, so their cross-scheme
     # chips are single-scheme questions, not a shared cross-scheme view lookup.
@@ -371,6 +469,10 @@ def _cross_scheme_data(question: str, ents: dict, grain: str | None = None,
         out.append(f"How much has been disbursed under Focus Plus{scope}{gsuf}?")
     if has_cme and not _asked(question, "cm elevate", "cmelevate"):
         out.append(f"How many CM Elevate applications are there{scope}{gsuf}?")
+    if has_fl and not _asked(question, "focus legacy", "producer group"):
+        out.append(f"How much was disbursed to producer groups{scope}{gsuf}?")
+    if has_cmel and not _asked(question, "cm elevate legacy", "cmelevate legacy"):
+        out.append(f"What is the total amount disbursed under CM Elevate Legacy{scope}{gsuf}?")
     d = _drill_down(ents, grain, rows)
     if d:
         out.append(d["question"])
@@ -384,6 +486,8 @@ def _cross_scheme_data(question: str, ents: dict, grain: str | None = None,
         fills.insert(1, f"How many Focus Plus payments were made{scope}{gsuf}?")
     if has_cme:
         fills.insert(1, f"How many CM Elevate applications are there{scope}{gsuf}?")
+    if has_fl:
+        fills.insert(1, f"How many producer groups were paid{scope}{gsuf}?")
     _fill_metric(out, question, fills)
     return [{"label": q, "question": q} for q in out]
 
@@ -396,7 +500,7 @@ _KNOWLEDGE_LADDER = {
     "Focus Plus": [
         (("what is", "about focus", "overview"), "What is FOCUS+ (Focus Plus)?"),
         (("eligib", "who can", "who qualifies"), "Who is eligible for FOCUS+?"),
-        (("producer group", "pg"), "What is a Producer Group under FOCUS+?"),
+        (("batch", "cohort", "93k", "12.5k"), "What are the FOCUS+ beneficiary cohorts?"),
         (("apply", "registration", "how do i", "meghalayaone"), "How does someone apply for FOCUS+?"),
         (("how much", "amount", "benefit", "dbt", "installment", "instalment"),
          "How much does FOCUS+ pay, and how is it disbursed?"),
@@ -426,6 +530,27 @@ _KNOWLEDGE_LADDER = {
         (("how much", "subsidy", "financial support", "project cost"),
          "How much financial support does CM-ELEVATE provide?"),
         (("implement", "prime", "who runs"), "Who implements CM-ELEVATE?"),
+    ],
+    "Focus Legacy": [
+        (("what is", "about focus", "overview"), "What is the FOCUS scheme in Meghalaya?"),
+        (("objective", "aim", "purpose", "goal"), "What is the main objective of FOCUS?"),
+        (("producer group", "what is a pg"), "What is the role of Producer Groups under FOCUS?"),
+        (("eligib", "who can", "who qualifies", "who benefit"), "Who can benefit under the FOCUS scheme?"),
+        (("assistance", "how much money", "support", "financial"),
+         "What type of financial assistance is provided under FOCUS?"),
+        (("apply", "registration", "how do i", "distribut"),
+         "How is financial assistance distributed under FOCUS?"),
+    ],
+    # CM Elevate Legacy is the same CM-ELEVATE programme's sanction and
+    # disbursement data, so its "how does it work" questions are the programme's
+    # (rag.py falls back to the CM Elevate reference docs for this scheme).
+    "CM Elevate Legacy": [
+        (("how much", "subsidy", "financial support", "loan", "credit"),
+         "How much financial support does CM-ELEVATE provide?"),
+        (("eligib", "who can", "who qualifies"), "Who is eligible for CM-ELEVATE?"),
+        (("how many scheme", "sub-scheme", "sectors covered"),
+         "How many individual schemes does CM-ELEVATE cover?"),
+        (("apply", "registration", "how do i"), "How does someone apply for CM-ELEVATE?"),
     ],
 }
 def _knowledge(question: str, schemes: list[str]) -> list[dict]:
@@ -469,6 +594,10 @@ def build_followups(route: str, question: str, schemes: list[str],
             opts = _focusplus_data(q, ents, grain, rows)
         elif primary[0] == "CM Elevate":
             opts = _cmelevate_data(q, ents, grain, rows)
+        elif primary[0] == "Focus Legacy":
+            opts = _focuslegacy_data(q, ents, grain, rows)
+        elif primary[0] == "CM Elevate Legacy":
+            opts = _cmelevatelegacy_data(q, ents, grain, rows)
         else:
             opts = _mgnrega_data(q, ents, grain, rows)
     else:
