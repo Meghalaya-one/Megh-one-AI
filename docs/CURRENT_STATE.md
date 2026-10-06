@@ -1,12 +1,19 @@
 # Current State
 
-**Last updated:** 2026-09-29 (early morning), by the conversational scheme-swap session (KI-180; code changed, uncommitted). Before that: 2026-09-29 (late night), by the CM Elevate Legacy use-case re-test session (no code changed; KI-166..168 opened). Before that: 2026-09-29 (night), by the Focus Legacy all-levels fix session (KI-020, KI-145..165, D-031; code changed, uncommitted). Before that: 2026-09-29, by the context-relevance / semantic-contract session (code changed, uncommitted; D-030, KI-030/032/034 and KI-130 to KI-135; **offline-verified only**, VPN down). Before that: 2026-09-28 (evening), by the CM Elevate all-blocks / all-villages fix session (code changed in `app/pipeline.py`, tests; uncommitted). Before that: 2026-09-28, by the PMAY-G fix session (code changed, uncommitted; D-029, KI-089 to KI-097). Before that: 2026-09-27 night, by the Focus Plus all-blocks / all-villages session (code changed in `app/pipeline.py`, tests in `tests/test_focusplus_usecase_fixes.py` and `tests/test_mgnrega_usecase_fixes.py`; **uncommitted**). Earlier the same day: the CM Elevate use-case QA **and fix** session (code changed in `app/pipeline.py` and `app/schema_context.py`, plus a new test file; **uncommitted**). Before that, the same day: the Focus Plus use-case QA **and fix** session (code changed in `app/pipeline.py` and `app/routers/query.py`, **uncommitted**, on top of the uncommitted 2026-09-26 MGNREGA and context work).
-**Branch / commit:** `main` @ `7064ab6` ("Added two new schemes", 2026-09-25). The working tree
-was clean before this session; this session added and changed Markdown only.
+**Last updated:** 2026-10-06, by the Focus Legacy duplicate-groups session (KI-187, D-032 confirmed 2026-10-07 = paid more than once; code changed, uncommitted). Earlier the same day: by the CM Elevate OFF-009 all-pairs re-test and KI-182 fix session (code changed, uncommitted). Before that: 2026-10-03, by the Focus Legacy FY-comparison report session (KI-183; code changed, uncommitted). Before that: 2026-09-29 (early morning), by the conversational scheme-swap session (KI-180; code changed, uncommitted). Before that: 2026-09-29 (late night), by the CM Elevate Legacy use-case re-test session (no code changed; KI-166..168 opened). Before that: 2026-09-29 (night), by the Focus Legacy all-levels fix session (KI-020, KI-145..165, D-031; code changed, uncommitted). Before that: 2026-09-29, by the context-relevance / semantic-contract session (code changed, uncommitted; D-030, KI-030/032/034 and KI-130 to KI-135; **offline-verified only**, VPN down). Before that: 2026-09-28 (evening), by the CM Elevate all-blocks / all-villages fix session (code changed in `app/pipeline.py`, tests; uncommitted). Before that: 2026-09-28, by the PMAY-G fix session (code changed, uncommitted; D-029, KI-089 to KI-097). Before that: 2026-09-27 night, by the Focus Plus all-blocks / all-villages session (code changed in `app/pipeline.py`, tests in `tests/test_focusplus_usecase_fixes.py` and `tests/test_mgnrega_usecase_fixes.py`; **uncommitted**). Earlier the same day: the CM Elevate use-case QA **and fix** session (code changed in `app/pipeline.py` and `app/schema_context.py`, plus a new test file; **uncommitted**). Before that, the same day: the Focus Plus use-case QA **and fix** session (code changed in `app/pipeline.py` and `app/routers/query.py`, **uncommitted**, on top of the uncommitted 2026-09-26 MGNREGA and context work).
+**Branch / commit:** `main` @ `f38ea1b` (2026-09-29), plus uncommitted work (VERIFIED by `git status` on 2026-10-05).
+`docs/HANDOFF.md` was restored on 2026-10-07 (it had been deleted in the working tree although CLAUDE.md
+requires it every session) — conflict RESOLVED, VERIFIED.
+Still outstanding on 2026-10-07: the QA evidence folders, 9 `.xlsx` test reports and
+`docs/CM_Elevate_Legacy_DB_Issues.md` remain **deleted in the working tree and not committed**, because this
+document and KNOWN_ISSUES.md still cite them as the evidence for specific KI numbers. Awaiting a decision on
+whether that evidence is retired (update the citing docs) or was removed by accident (restore it).
 
 ## Project status
 - **Stage (INFERRED):** internal UAT with live QA passes per scheme.
-- **Production deployment status:** UNKNOWN — NEEDS VERIFICATION. Not recorded in the repo.
+- **Production deployment status:** UNKNOWN — NEEDS VERIFICATION. Not recorded in the repo. A deployed instance
+  (`115.124.102.167:8300`, writing to the shared `megh_db` `app.*` schema) answered a question on 2026-10-03 that the
+  repo code answers correctly in every reproduction (KI-183), so it is INFERRED to run different code or configuration.
 
 ## Completed functionality (VERIFIED in code)
 - All six schemes wired end to end: MGNREGA, PMAY-G, Focus Plus, CM Elevate, Focus Legacy
@@ -32,6 +39,52 @@ was clean before this session; this session added and changed Markdown only.
 - Voice input with no-speech and prompt-echo guards (2026-09-25).
 - Auth, multi-tenancy, admin console, history (pin, archive, rename, delete), audit, caches,
   health and metrics.
+
+## Latest: complete architecture document (2026-10-05). Documentation only — no code changed.
+- New `docs/COMPLETE_ARCHITECTURE.md`: the whole system in one document — runtime topology, repo
+  layout, the full `/api/query` path, `_run_pipeline`'s numbered stages, `execute_with_repair`'s
+  31 rewrites + ~20 reject-and-repair asserts + verifier ordering, `compose_response`'s
+  faithfulness checks, the four conversation-state layers (D-022/023/024), entity resolution,
+  RAG, security, capacity, deployment and the dependency graph. Reconciled against the source,
+  not the docs; every count re-verified.
+- Added to the CLAUDE.md §3 documentation map.
+- Stale facts fixed on the way: `pipeline.py` is **15,214** lines, not "about 8,400" (CLAUDE.md §2
+  and ARCHITECTURE.md §1 both updated). Verified unchanged: `ai_query.html` 4,164 lines,
+  `.env.example` 94 keys, 26 pytest-style test files.
+- Remaining conflicts are recorded in the new doc's §20.1, not silently fixed: the `pipeline.py`
+  docstring still justifies the no-framework choice by "2 schemes"; `data/pmay/README.md` §9 still
+  says PMAY is not in `megh_db`; the newer `SCHEMA_FOR_DEVELOPERS.md` the scheme READMEs cite is
+  not in this repo.
+- No tests run: no code changed.
+
+## Latest: CM Elevate pending at a level = file_status 'Pending'; "unique" = distinct (2026-10-05, KI-186). Code changed, uncommitted. LIVE-VERIFIED.
+- User screenshot: "unique applications pending at level 1 for all of Meghalaya" -> 8,372 (every level-1 file, COUNT(*)). Now 8,307 (`current_level = 'level1' AND file_status = 'Pending'`, COUNT(DISTINCT request_id)). Level 2 = 165, level 0 = 0. Plain "pending" stays On Hold (user's choice). Decision recorded in DECISIONS.md D-027 amendment 2026-10-05.
+- Also fixed on the way: case-folded district / level literals, a 4B verifier false check-2, and a prompt-wording regression on plain "pending" (see KI-186, AI_PIPELINE.md).
+- Live: 871/871 pending questions; OFF-009 sample 150/150; tests 1,433 pytest, 14/14 scripts. The 2026-10-01 OFF-018 report used the old definition.
+
+## Latest: CM Elevate OFF-017 status distribution re-test (2026-10-05). No code changed.
+- 192 questions (12 districts x all programmes + each of 15): raw = DB 192/192, bot data correct 192/192, current_file_status used 192/192. PASS 130, 'no matching records' 61, FAIL 1 — same as 2026-10-01.
+- New: KI-184 (Sports & Wellness Centre named in full still asks "which scheme?", 12/12). Wording: KI-185. Report: `docs/CM_Elevate_OFF017_StatusDistribution_Retest_2026-10-05.xlsx`.
+
+## Latest: CM Elevate — a named programme with 0 applicants is stated as 0 (2026-10-05, KI-182). Code changed, uncommitted. LIVE-VERIFIED.
+- Question: "How many applicants are there in [district] under [program 1] and [program 2]?", tested on every ordered
+  pair: 12 districts x 15 x 14 = 2,520 questions. Raw (`CM_Elevate_AllSchemes_20260930_full.xlsx`) = DB in 2,520/2,520.
+- Before the fix: 1,131 FAIL. When one programme has 0 applicants in the district, GROUP BY scheme_name returns one row and
+  the answer named only the other programme ("Meghalaya Warehouse Scheme: 10 applicants.") or merged both under one figure.
+- Fix (answer text only, `app/pipeline.py`): `_cme_multi_scheme_total` also runs on a one-row result, and the new
+  `_cme_requested_zero_programmes` adds each programme named in the SQL's `scheme_name IN (…)` with no row as
+  "<P>: 0 (none recorded)". It does this only when absence provably means 0 (AI_PIPELINE.md §CM Elevate guarantees).
+- After the fix: **2,520 / 2,520 PASS** (the both-zero follow-up below included). SQL data correct 2,520/2,520. Pairs where both
+  programmes are non-zero are unchanged (1,094/1,094).
+- Both programmes 0 (user screenshot, same day): the result is empty, and the answer was "I couldn't find any matching
+  records for South West Khasi Hills, …". Now `compose_response` answers a CM Elevate empty result with
+  `_cme_zero_programmes_answer`: "There are no applicants under the Agro Tourism Villa Scheme or the Chief Minister's
+  Green Taxi Scheme in South West Khasi Hills — the data records 0 for each." This applies only when the place is
+  confirmed by the app's own bound lookup. Live: 282/282, and the screenshot question is answered as above.
+- One programme 0 (second user screenshot, same day): the appended "Cinema Theatre: 0 (none recorded); …" line read as a stub. When the only other filters are places and at most one status the wording can name (On Hold, Valid, level 0-2), `_cme_zero_breakdown_answer` rebuilds the whole answer: "There are 2 applicants in West Garo Hills across the 2 programmes you asked about:" + one line per programme in the question's order (the 0 one "0 — no applicants recorded in West Garo Hills") + where the applicants are. Any other filter keeps the appended line, so no filter is dropped from the wording.
+  Live: all 1,426 zero cases (1,144 one-zero + 282 both-zero) 1,426/1,426.
+- Tests: 1,405 pytest (+28), 14/14 scripts. Reports: `docs/CM_Elevate_OFF009_AllPermutations_Retest_2026-10-05.xlsx`
+  (before) and `docs/CM_Elevate_OFF009_AfterFix_KI182_2026-10-05.xlsx` (after).
 
 ## Latest: typed replies resume every chip pause (2026-09-29, morning, KI-181). Code changed, uncommitted. LIVE-VERIFIED.
 - Before: only the area/year/entity/ranking pauses and the which-scheme pauses were remembered. Any other pause with chips
@@ -99,6 +152,11 @@ was clean before this session; this session added and changed Markdown only.
 ## Latest: CM Elevate all blocks / all villages (2026-09-28)
 - **CM Elevate all districts / blocks / villages (2026-09-28): 7,364 / 7,364 on the final code** (round 1: 4,132 / 4,208). Every district (12), block (66) and village (2,087 x 3 phrasings) x the use-case question types, each figure checked against megh_db and the raw workbook. Report `docs/CM_Elevate_AllBlocks_AllVillages_Test_Report_2026-09-28.xlsx` (+ `_Evidence_2026-09-28/`).
   - Fixed: KI-074 decided (pending = On Hold only), KI-076 (intent cue), KI-106 to KI-120 (CM Elevate joined the village guards; urban bodies; literal / sector / programme-filter SQL guards; verifier false positives; twin-village chip; number words). All CM Elevate-gated except the literal- and FILTER-aware village WHERE rebuild (KI-108, also Focus Plus). pytest 1,053; context suite 43/43.
+
+## Latest: PMAY-G beneficiaries include zero-sanction records (2026-10-03, KI-127 decided), uncommitted
+- Beneficiary counts = every record; all other PMAY-G figures unchanged. Live-verified against raw + DB.
+- pytest 1,373 passed; 2 failing tests belong to the CM Elevate Legacy work (KI-173 widened
+  `_verifier_village_code_complaint_is_false`; two older tests still assert the old scope).
 
 ## Latest: PMAY-G plain year = calendar year (2026-09-29, KI-125 revised), uncommitted
 - "during 2017" → calendar 2017 in the answer, table and SQL; FY reading as a one-line note. Explicit FY unchanged.
@@ -325,6 +383,23 @@ was clean before this session; this session added and changed Markdown only.
 - **Known limitation, left on purpose:** the negated-level chip bug (KI-041) still affects the
   other five schemes. The user asked that they not be changed.
 
+## Focus Legacy duplicate producer groups (2026-10-07) — KI-187, D-032
+- Product owner's definition (confirmed 2026-10-07): a duplicate producer group is one PAID MORE THAN ONCE — "Yes — 2,655 of
+  the 11,906 … (2,647 paid twice, 8 paid 3 times) … 5,318 of the 14,569 payment records", no year split; a year / place in
+  the question narrows the rows. The 2026-10-06 same-year-only count (7) was withdrawn.
+- **Not yet on the deployed server (VERIFIED 2026-10-06):** `115.124.102.167:8300` still gave the old "0 duplicate payment
+  records" answer. Everything after commit `f38ea1b` (2026-09-29) is uncommitted and so not deployed. The local `:8300`
+  (127.0.0.1 only, `--reload`) runs the current code and is not what that address serves.
+
+## Focus Legacy FY comparison report (2026-10-03) — KI-183
+- Reported on the deployed server: "Compare total remittances between financial years 2023-24 and 2024-25 for Focus
+  Legacy" → "couldn't build a working query" (conv 51495). Not reproducible on the repo code in 20 in-process runs, the
+  exact 4-turn conversation through the real `/api/query` endpoint as the same user, or the `f38ea1b` / `7064ab6` builds.
+  The VM's code/config is UNKNOWN — NEEDS VERIFICATION; redeploy from this repo and re-test.
+- Fixed in the same flow: the composer's correct comparison was discarded by the hedge guard (the FY 2023-24 gap sentence
+  matched `_HEDGE_RE`) — now the answer reads "₹14.18 crore in FY 2022-23 and ₹11.50 crore in FY 2024-25 … no data for FY
+  2023-24" (5/5 live).
+
 ## Focus Legacy all blocks / villages / ACs / PGs (2026-09-29, night) — VERIFIED, code changed, uncommitted
 - **32,560/32,560** questions correct vs the live DB and the raw file (latest run of each): 56 blocks x3,
   12 district breakdowns, 55 ACs x3, 3,384 villages x2 (list + amount), 11,906 PGs x2 (exists + members),
@@ -370,8 +445,8 @@ was clean before this session; this session added and changed Markdown only.
   8 of 9 Focus Legacy re-verification checks pass. TC-F1 has an open question (KI-019).
 
 ## Partially complete / open
-- **PG alternate-spelling lookup:** the DB view `curated.v_focus_legacy_pg_search` exists, but
-  the bot does not use it yet (KI-020, PLANNED).
+- **PG alternate-spelling lookup:** done. `_focus_legacy_pg_name_answer` queries
+  `curated.v_focus_legacy_pg_search` (KI-020, fixed 2026-09-29; VERIFIED in code 2026-10-02).
 - **No accuracy benchmark** (KI-017).
 - **Security hardening gaps:**
   - generated SQL can reach `app.*` and the privacy tables (KI-004);

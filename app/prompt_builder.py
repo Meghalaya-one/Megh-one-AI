@@ -54,7 +54,8 @@ _CMELEVATELEGACY_EXACT = {"v_cm_elevate_disbursement", "fact_cm_elevate_disburse
 
 def _scheme_of(table: str) -> str:
     """'MGNREGA' | 'PMAY-G' | 'Focus Plus' | 'CM Elevate' | 'Focus Legacy' |
-    'CM Elevate Legacy' | 'shared' | 'cross' for a bare (unqualified) table name."""
+    'CM Elevate Legacy' | 'NRLM' | 'shared' | 'cross' for a bare (unqualified)
+    table name."""
     t = table.lower()
     if t.startswith(_SHARED_PREFIXES):
         return "shared"
@@ -68,6 +69,10 @@ def _scheme_of(table: str) -> str:
         return "Focus Plus"
     if "cm_elevate" in t or "cmelevate" in t or t in _CMELEVATE_EXACT:
         return "CM Elevate"
+    if "nrlm" in t:
+        # v_nrlm, fact_nrlm_shg, dim_* none. Checked before "mgnrega"/"pmay" only
+        # for symmetry with the rest of this ladder; no NRLM name collides.
+        return "NRLM"
     if "mgnrega" in t or t in _MGNREGA_EXACT:
         return "MGNREGA"
     if "pmay" in t:
@@ -95,7 +100,7 @@ def _live_schema_block(schemes: list[str]) -> str:
         if owner == "cross" and not multi:
             continue
         if owner in ("MGNREGA", "PMAY-G", "Focus Plus", "CM Elevate",
-                     "Focus Legacy", "CM Elevate Legacy") and owner not in want:
+                     "Focus Legacy", "CM Elevate Legacy", "NRLM") and owner not in want:
             continue
         lines.append(f"  {qualified}({', '.join(c['column'] for c in cols)})")
 

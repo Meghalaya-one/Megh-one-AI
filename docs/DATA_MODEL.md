@@ -122,6 +122,9 @@ and `origin/main` points at that commit (KI-022).
 8. **Row-grain views** need `SUM … GROUP BY`, never a raw row read (`_rowgrain_no_aggregate`).
 9. **PMAY:** `WHERE NOT is_placeholder`; completion comes from the `is_completed` /
    `is_in_progress` booleans; exclude the 126 `sanctioned_amount = 0` rows from rates.
+   **Exception (product decision 2026-10-03, KI-127):** the PMAY-G *beneficiary* count = every record,
+   the 126 zero-sanction placeholders included; houses sanctioned, money, stages and release counts
+   still exclude them.
    `amount_released` is NULL on 336 non-placeholder houses (nothing released yet): COALESCE it
    to 0 in every release count or sum (VERIFIED 2026-09-28). `v_pmay` equals the raw
    `PMAY_FullyMapped_with_dates.csv` row for row (171,107 rows by `source_house_id` = raw `id`).

@@ -3,6 +3,26 @@
 *For the next Claude session or account. Keep this short and overwrite it at the end of every
 significant session.*
 
+**Latest (2026-10-07): the accumulated 2026-09-29..10-07 work committed and pushed. No behaviour change in this commit.**
+- This session only committed what was already in the working tree (scheme QA fixes KI-182/186/187 and D-032, the
+  context/state work, the NRLM onboarding scaffolding, `docs/COMPLETE_ARCHITECTURE.md`, `tools/verify_wiring.py`).
+- Tests on the committed tree: pytest **1,498 passed** (26 files), plain scripts **14/14**. Matches the documented
+  2026-10-07 baseline. Live suites not re-run: no code changed in this session.
+- `.gitignore` now ignores root-level `*.csv` / `*.xlsx` (keeping `Use_Cases_-_Focus.csv`, already tracked). Several
+  raw extracts sitting in the repo root hold unmasked beneficiary names, mobile numbers, account numbers and IFSC
+  codes, and were never meant to be committed (KI-022).
+- `docs/HANDOFF.md` was restored: it was deleted in the working tree although CLAUDE.md requires it every session.
+  The CURRENT_STATE conflict note about it is now resolved.
+- **NOT committed, left for a decision (still deleted in the working tree):** 762 QA evidence screenshots, 9 `.xlsx`
+  test reports and `docs/CM_Elevate_Legacy_DB_Issues.md`. CURRENT_STATE.md and KNOWN_ISSUES.md still cite those
+  evidence folders as the record for specific KI numbers, so committing the deletions would break those references.
+  Decide whether that evidence is being retired (then update the citing docs in the same commit) or was removed by
+  accident (then `git checkout HEAD -- docs/` to bring it back).
+- **Pre-existing leak, NOT created here:** `Focus Legacy to share to BLH.csv` (14,569 rows, unmasked `account_no`,
+  `ifsc_code`, `name_on_the_account`) is tracked and was already pushed in `7064ab6`. Ignoring it now does not untrack
+  it. Removing it needs a history rewrite (`git filter-repo`) plus force-push coordination, and the accounts in it
+  should be treated as disclosed. Raised with the user; no action taken without instruction.
+
 **Latest (2026-09-29, morning): typed replies resume every chip pause (KI-181). Code changed, uncommitted. LIVE-VERIFIED.**
 - Files: `app/routers/query.py` (`remember_pause` generic branch, uses `SCOPE_MERGE_RULES`), `app/pipeline.py` (`SCOPE_MERGE_RULES`,
   `_resume_option_pause`, `_option_tokens`, `_paused_thread_antecedent`, step 0a'' in `_run_pipeline`, `_paused_state` thread override,

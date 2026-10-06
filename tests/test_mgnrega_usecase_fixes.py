@@ -523,9 +523,9 @@ def test_verifier_complaint_on_correct_village_sql_is_discarded():
     assert not p._verifier_village_code_complaint_is_false(issue, MG, resolved, good.replace("273990", "111"))
     assert not p._verifier_village_code_complaint_is_false(issue, MG, resolved, good.replace("2024", "2023"))
     # Focus Legacy joined this guard on 2026-09-29 (KI-161: the "district dropped"
-    # complaint beside a pinned village_code sent answers to the KB fallback);
-    # CM Elevate Legacy is still outside it.
-    assert not p._verifier_village_code_complaint_is_false(issue, ["CM Elevate Legacy"], resolved, good)
+    # complaint beside a pinned village_code sent answers to the KB fallback), and
+    # CM Elevate Legacy later (KI-173); a multi-scheme question is still outside it.
+    assert not p._verifier_village_code_complaint_is_false(issue, ["Focus Plus", "PMAY-G"], resolved, good)
 
 
 # ── all-villages QA: qualified names and "Garo" inside a village name ───────

@@ -1,0 +1,1182 @@
+# nrlm_few_shot.yaml
+#
+# Validated question-to-SQL pairs for NRLM - node 5.10.
+#
+# ===========================================================================
+# v1.0 - 2026-10-05 - FIRST VERSION, WRITTEN AGAINST THE CURATED STAR SCHEMA
+#
+# Every example runs against curated.v_nrlm (29 columns, one row per SHG).
+#
+# House rules encoded in every example below:
+#   FROM curated.v_nrlm                  never fact_nrlm_shg, except for lineage
+#   COUNT(*)                             is an SHG count - one row is one SHG
+#   SUM(total_members)                   is a member count - never COUNT(*)
+#   formation_financial_year_short       the ONLY year, and it is the FORMATION year
+#   money is never grouped or filtered by year - it is cumulative and undated
+#   lgd_district / lgd_block             UPPERCASE literals - dim_geography stores them so
+#   district_lgd_code / block_lgd_code   authoritative, and safe from the casing trap
+#   entity_type <> 'Unresolved'          on village counts, lists and rankings ONLY
+#   village_code                         for counting villages, never a name
+#   shg_code                             for a single SHG, never shg_name
+#   amounts are RUPEES (assumed, NR-07)  divide by 1e7 for crore, and say the unit
+#
+# Questions NRLM must refuse (money by year, growth, savings, federations,
+# members by name, formation date) have no SQL and are NOT in this file - they
+# are in nrlm_schema_partitions.yaml few_shot_examples with sql: null, and the
+# gate in nrlm_classification_rules.yaml catches them first.
+#
+# NOT ONE OF THESE QUERIES HAS BEEN EXECUTED against megh_db. They are correct
+# against the structure in SCHEMA_FOR_DEVELOPERS.md (2026-10-05) and the expected
+# values quoted in `expected` come from datasets/NRLM/NRLM.csv. Run them before
+# trusting a result.
+# ===========================================================================
+
+sql_generation_examples:
+
+# ---- SHG counts -----------------------------------------------------------
+- question: How many SHGs are there?
+  sql: |
+    SELECT COUNT(*) AS shgs
+    FROM curated.v_nrlm;
+  tables:
+  - curated.v_nrlm
+  expected: 40629
+- question: How many self help groups are there in Meghalaya, active and inactive?
+  sql: |
+    SELECT COUNT(*)                                AS shgs,
+           COUNT(*) FILTER (WHERE is_active)       AS active,
+           COUNT(*) FILTER (WHERE NOT is_active)   AS inactive
+    FROM curated.v_nrlm;
+  tables:
+  - curated.v_nrlm
+  expected: {shgs: 40629, active: 39432, inactive: 1197}
+- question: How many active SHGs are there?
+  sql: |
+    SELECT COUNT(*) AS active_shgs
+    FROM curated.v_nrlm
+    WHERE is_active;
+  tables:
+  - curated.v_nrlm
+  expected: 39432
+- question: How many inactive SHGs are there?
+  sql: |
+    SELECT COUNT(*) AS inactive_shgs
+    FROM curated.v_nrlm
+    WHERE NOT is_active;
+  tables:
+  - curated.v_nrlm
+  expected: 1197
+  note: is_active is NOT NULL, so NOT is_active is the exact complement - no IS DISTINCT FROM needed.
+- question: How many SHGs are there in East Khasi Hills?
+  sql: |
+    SELECT COUNT(*) AS shgs
+    FROM curated.v_nrlm
+    WHERE lgd_district = 'EAST KHASI HILLS';
+  tables:
+  - curated.v_nrlm
+  expected: 6768
+- question: How many SHGs are there in district 657?
+  sql: |
+    SELECT COUNT(*) AS shgs
+    FROM curated.v_nrlm
+    WHERE district_lgd_code = 657;
+  tables:
+  - curated.v_nrlm
+  expected: 2744
+  note: By LGD code. The source file names 12 of these SHGs 'Eastern West Khasi Hills', so a source-name count gives 2,732.
+- question: SHGs by district
+  sql: |
+    SELECT lgd_district, COUNT(*) AS shgs
+    FROM curated.v_nrlm
+    GROUP BY lgd_district
+    ORDER BY shgs DESC
+    LIMIT 12;
+  tables:
+  - curated.v_nrlm
+- question: Which district has the most SHGs?
+  sql: |
+    SELECT lgd_district, COUNT(*) AS shgs
+    FROM curated.v_nrlm
+    GROUP BY lgd_district
+    ORDER BY shgs DESC
+    LIMIT 1;
+  tables:
+  - curated.v_nrlm
+  expected: {lgd_district: EAST KHASI HILLS, shgs: 6768}
+- question: Which district has the fewest SHGs?
+  sql: |
+    SELECT lgd_district, COUNT(*) AS shgs
+    FROM curated.v_nrlm
+    GROUP BY lgd_district
+    ORDER BY shgs ASC
+    LIMIT 1;
+  tables:
+  - curated.v_nrlm
+  expected: {lgd_district: EASTERN WEST KHASI HILLS, shgs: 1610}
+- question: SHGs by block in West Jaintia Hills
+  sql: |
+    SELECT lgd_block, block_lgd_code, COUNT(*) AS shgs
+    FROM curated.v_nrlm
+    WHERE lgd_district = 'WEST JAINTIA HILLS'
+    GROUP BY lgd_block, block_lgd_code
+    ORDER BY shgs DESC;
+  tables:
+  - curated.v_nrlm
+- question: Top blocks by number of SHGs
+  sql: |
+    SELECT lgd_block, lgd_district, COUNT(*) AS shgs
+    FROM curated.v_nrlm
+    GROUP BY lgd_block, lgd_district
+    ORDER BY shgs DESC
+    LIMIT 5;
+  tables:
+  - curated.v_nrlm
+  note: No N supplied, so top 5. Laskein (1,880) leads.
+- question: How many SHGs are in Mawkyrwat block?
+  sql: |
+    SELECT COUNT(*) AS shgs
+    FROM curated.v_nrlm
+    WHERE lgd_block = 'MAWKYRWAT';
+  tables:
+  - curated.v_nrlm
+  expected: 1106
+  note: Mawkyrwat is also a constituency (1,092 SHGs) and a village. The word "block" settles it.
+- question: How many SHGs are in the Garo Hills?
+  sql: |
+    SELECT COUNT(*) AS shgs
+    FROM curated.v_nrlm
+    WHERE district_lgd_code IN (273, 656, 277, 663, 278);
+  tables:
+  - curated.v_nrlm
+  expected: 17565
+  note: Region expanded to its five districts by code. Name them in the answer.
+- question: How many SHGs are of each type?
+  sql: |
+    SELECT shg_type, COUNT(*) AS shgs
+    FROM curated.v_nrlm
+    GROUP BY shg_type
+    ORDER BY CASE shg_type WHEN 'Pre-Nrlm' THEN 1 WHEN 'Revived' THEN 2 WHEN 'New' THEN 3 END;
+  tables:
+  - curated.v_nrlm
+- question: How many revived SHGs are active?
+  sql: |
+    SELECT COUNT(*) AS active_revived_shgs
+    FROM curated.v_nrlm
+    WHERE shg_type = 'Revived'
+      AND is_active;
+  tables:
+  - curated.v_nrlm
+  expected: 1689
+- question: Share of SHGs active by district
+  sql: |
+    SELECT lgd_district,
+           COUNT(*) AS shgs,
+           COUNT(*) FILTER (WHERE is_active) AS active,
+           ROUND(100.0 * COUNT(*) FILTER (WHERE is_active) / NULLIF(COUNT(*), 0), 2) AS active_pct
+    FROM curated.v_nrlm
+    GROUP BY lgd_district
+    ORDER BY active_pct ASC
+    LIMIT 12;
+  tables:
+  - curated.v_nrlm
+
+# ---- formation year (the only year) ----------------------------------------
+- question: How many SHGs were formed in 2020-21?
+  sql: |
+    SELECT COUNT(*) AS shgs_formed
+    FROM curated.v_nrlm
+    WHERE formation_financial_year_short = '2020-21';
+  tables:
+  - curated.v_nrlm
+  expected: 11354
+- question: How many SHGs were formed each year?
+  sql: |
+    SELECT CASE WHEN formation_financial_year_short < '2014-15' THEN 'before 2014-15'
+                ELSE formation_financial_year_short END AS formation_year,
+           COUNT(*) AS shgs_formed
+    FROM curated.v_nrlm
+    GROUP BY 1
+    ORDER BY MIN(formation_financial_year_short);
+  tables:
+  - curated.v_nrlm
+  note: >
+    Default groups the sparse early years (931 SHGs) so the chart is readable. Order by
+    MIN(year), not by the label - 'before 2014-15' would otherwise sort LAST, because
+    digits sort before letters.
+- question: How many SHGs were formed before NRLM started?
+  sql: |
+    SELECT COUNT(*) AS shgs_formed_before_2011_12
+    FROM curated.v_nrlm
+    WHERE formation_financial_year_short < '2011-12';
+  tables:
+  - curated.v_nrlm
+  expected: 645
+  note: Only after the gate settled that the user means the YEAR, not shg_type = 'Pre-Nrlm' (432).
+- question: How many SHGs were formed after 2019-20 in Ri Bhoi?
+  sql: |
+    SELECT COUNT(*) AS shgs
+    FROM curated.v_nrlm
+    WHERE formation_financial_year_short > '2019-20'
+      AND lgd_district = 'RI BHOI';
+  tables:
+  - curated.v_nrlm
+- question: In which year were the most SHGs formed?
+  sql: |
+    SELECT formation_financial_year_short, COUNT(*) AS shgs_formed
+    FROM curated.v_nrlm
+    GROUP BY formation_financial_year_short
+    ORDER BY shgs_formed DESC
+    LIMIT 1;
+  tables:
+  - curated.v_nrlm
+  expected: {formation_financial_year_short: '2020-21', shgs_formed: 11354}
+- question: Compare SHGs formed in 2019-20 and 2020-21 by district
+  sql: |
+    SELECT lgd_district,
+           COUNT(*) FILTER (WHERE formation_financial_year_short = '2019-20') AS formed_2019_20,
+           COUNT(*) FILTER (WHERE formation_financial_year_short = '2020-21') AS formed_2020_21
+    FROM curated.v_nrlm
+    WHERE formation_financial_year_short IN ('2019-20', '2020-21')
+    GROUP BY lgd_district
+    ORDER BY lgd_district;
+  tables:
+  - curated.v_nrlm
+  note: A cohort comparison of COUNTS. Allowed. The same comparison of money is refused.
+- question: Revived SHGs formed in 2019-20
+  sql: |
+    SELECT COUNT(*) AS shgs
+    FROM curated.v_nrlm
+    WHERE shg_type = 'Revived'
+      AND formation_financial_year_short = '2019-20';
+  tables:
+  - curated.v_nrlm
+
+# ---- members --------------------------------------------------------------
+- question: How many SHG members are there?
+  sql: |
+    SELECT SUM(total_members) AS members
+    FROM curated.v_nrlm;
+  tables:
+  - curated.v_nrlm
+  expected: 410847
+  note: Members are a column. COUNT(*) would return 40,629 - the number of groups.
+- question: How many women are members of SHGs?
+  sql: |
+    SELECT SUM(female_members) AS women_members,
+           ROUND(100.0 * SUM(female_members) / NULLIF(SUM(total_members), 0), 2) AS women_pct
+    FROM curated.v_nrlm;
+  tables:
+  - curated.v_nrlm
+  expected: {women_members: 409249, women_pct: 99.61}
+- question: Members by district
+  sql: |
+    SELECT lgd_district,
+           SUM(total_members)  AS members,
+           SUM(female_members) AS women,
+           SUM(male_members)   AS men
+    FROM curated.v_nrlm
+    GROUP BY lgd_district
+    ORDER BY members DESC
+    LIMIT 12;
+  tables:
+  - curated.v_nrlm
+- question: Average members per SHG by block in East Garo Hills
+  sql: |
+    SELECT lgd_block, COUNT(*) AS shgs, ROUND(AVG(total_members), 1) AS avg_members
+    FROM curated.v_nrlm
+    WHERE lgd_district = 'EAST GARO HILLS'
+    GROUP BY lgd_block
+    ORDER BY avg_members DESC;
+  tables:
+  - curated.v_nrlm
+- question: How many SHGs have male members?
+  sql: |
+    SELECT COUNT(*) AS shgs_with_men
+    FROM curated.v_nrlm
+    WHERE male_members > 0;
+  tables:
+  - curated.v_nrlm
+  expected: 705
+- question: How many all-women SHGs are there?
+  sql: |
+    SELECT COUNT(*) AS all_women_shgs
+    FROM curated.v_nrlm
+    WHERE male_members = 0
+      AND female_members > 0;
+  tables:
+  - curated.v_nrlm
+  expected: 39919
+  note: male_members = 0 alone gives 39,924 - it also includes the 5 SHGs with no members at all.
+- question: How many SHGs have membership outside the NRLM norm?
+  sql: |
+    SELECT CASE WHEN total_members = 0 THEN '0 members'
+                WHEN total_members < 5 THEN '1-4 members'
+                ELSE 'above 20 members' END AS band,
+           COUNT(*) AS shgs
+    FROM curated.v_nrlm
+    WHERE member_count_out_of_norm
+    GROUP BY 1
+    ORDER BY 1;
+  tables:
+  - curated.v_nrlm
+  expected: {'0 members': 5, '1-4 members': 74, 'above 20 members': 99}
+- question: Which SHGs have no members recorded?
+  sql: |
+    SELECT shg_code, shg_name, lgd_district, lgd_block, is_active
+    FROM curated.v_nrlm
+    WHERE total_members = 0
+    ORDER BY shg_code;
+  tables:
+  - curated.v_nrlm
+  expected_rows: 5
+- question: Distribution of SHG size
+  sql: |
+    SELECT total_members, COUNT(*) AS shgs
+    FROM curated.v_nrlm
+    GROUP BY total_members
+    ORDER BY total_members;
+  tables:
+  - curated.v_nrlm
+
+# ---- funds (cumulative, undated) ---------------------------------------------
+- question: What is the total Revolving Fund received by SHGs?
+  sql: |
+    SELECT ROUND(SUM(revolving_fund_amount) / 1e7, 2) AS rf_cr
+    FROM curated.v_nrlm;
+  tables:
+  - curated.v_nrlm
+  expected: 50.86
+  note: Cumulative to the extract date, rupees assumed. Say both in the answer.
+- question: What is the total Community Investment Fund?
+  sql: |
+    SELECT ROUND(SUM(cif_amount) / 1e7, 2) AS cif_cr
+    FROM curated.v_nrlm;
+  tables:
+  - curated.v_nrlm
+  expected: 98.48
+- question: Total RF and CIF by district
+  sql: |
+    SELECT lgd_district,
+           ROUND(SUM(revolving_fund_amount) / 1e7, 2) AS rf_cr,
+           ROUND(SUM(cif_amount) / 1e7, 2)            AS cif_cr
+    FROM curated.v_nrlm
+    GROUP BY lgd_district
+    ORDER BY cif_cr DESC
+    LIMIT 12;
+  tables:
+  - curated.v_nrlm
+- question: Which district received the most CIF?
+  sql: |
+    SELECT lgd_district, ROUND(SUM(cif_amount) / 1e7, 2) AS cif_cr
+    FROM curated.v_nrlm
+    GROUP BY lgd_district
+    ORDER BY cif_cr DESC
+    LIMIT 1;
+  tables:
+  - curated.v_nrlm
+  expected: {lgd_district: WEST JAINTIA HILLS, cif_cr: 18.89}
+- question: Total community funds (RF plus CIF) in Ri Bhoi
+  sql: |
+    SELECT ROUND(SUM(revolving_fund_amount + cif_amount) / 1e7, 2) AS total_funds_cr
+    FROM curated.v_nrlm
+    WHERE lgd_district = 'RI BHOI';
+  tables:
+  - curated.v_nrlm
+  expected: 14.10
+- question: How many SHGs have received Revolving Fund?
+  sql: |
+    SELECT COUNT(*) FILTER (WHERE revolving_fund_amount > 0) AS shgs_with_rf,
+           ROUND(100.0 * COUNT(*) FILTER (WHERE revolving_fund_amount > 0) / COUNT(*), 2) AS rf_coverage_pct
+    FROM curated.v_nrlm;
+  tables:
+  - curated.v_nrlm
+  expected: {shgs_with_rf: 33700, rf_coverage_pct: 82.95}
+- question: How many SHGs have not received CIF?
+  sql: |
+    SELECT COUNT(*) AS shgs_without_cif,
+           COUNT(*) FILTER (WHERE NOT is_active) AS of_which_inactive
+    FROM curated.v_nrlm
+    WHERE cif_amount = 0;
+  tables:
+  - curated.v_nrlm
+  expected: {shgs_without_cif: 29788, of_which_inactive: 1197}
+- question: Active SHGs that have not received Revolving Fund, by district
+  sql: |
+    SELECT lgd_district, COUNT(*) AS active_shgs_without_rf
+    FROM curated.v_nrlm
+    WHERE is_active
+      AND revolving_fund_amount = 0
+    GROUP BY lgd_district
+    ORDER BY active_shgs_without_rf DESC
+    LIMIT 12;
+  tables:
+  - curated.v_nrlm
+  note: Excludes inactive SHGs on purpose - they all show 0 RF and would swamp the result.
+- question: What is the average CIF per SHG?
+  sql: |
+    SELECT ROUND(AVG(cif_amount), 0)                               AS avg_cif_all_shgs,
+           ROUND(AVG(cif_amount) FILTER (WHERE cif_amount > 0), 0) AS avg_cif_among_recipients
+    FROM curated.v_nrlm;
+  tables:
+  - curated.v_nrlm
+  expected: {avg_cif_all_shgs: 24238, avg_cif_among_recipients: 90836}
+- question: Distribution of Revolving Fund amounts
+  sql: |
+    SELECT revolving_fund_amount, COUNT(*) AS shgs
+    FROM curated.v_nrlm
+    GROUP BY revolving_fund_amount
+    ORDER BY shgs DESC;
+  tables:
+  - curated.v_nrlm
+  note: Ten values; Rs 15,000 is the norm (33,241 SHGs). Shows why RF totals track RF-receiving SHG counts.
+- question: Top 10 SHGs by CIF
+  sql: |
+    SELECT shg_code, shg_name, lgd_district, lgd_block, cif_amount
+    FROM curated.v_nrlm
+    ORDER BY cif_amount DESC
+    LIMIT 10;
+  tables:
+  - curated.v_nrlm
+  note: All ten exceed Rs 5 lakh and are unconfirmed by the client (NR-25). Carry the caveat.
+- question: CIF held by SHGs of each type
+  sql: |
+    SELECT shg_type,
+           COUNT(*) AS shgs,
+           ROUND(SUM(cif_amount) / 1e7, 2) AS cif_cr,
+           ROUND(AVG(cif_amount) FILTER (WHERE cif_amount > 0), 0) AS avg_cif_among_recipients
+    FROM curated.v_nrlm
+    GROUP BY shg_type
+    ORDER BY cif_cr DESC;
+  tables:
+  - curated.v_nrlm
+- question: Funds held by SHGs formed in 2017-18
+  sql: |
+    SELECT COUNT(*) AS shgs,
+           ROUND(SUM(revolving_fund_amount) / 1e7, 2) AS rf_held_cr,
+           ROUND(SUM(cif_amount) / 1e7, 2)            AS cif_held_cr
+    FROM curated.v_nrlm
+    WHERE formation_financial_year_short = '2017-18';
+  tables:
+  - curated.v_nrlm
+  note: >
+    Allowed ONLY because it asks what a FORMATION COHORT holds today. The answer must say
+    "held to date by SHGs formed in 2017-18", never "released in 2017-18". If the user's
+    words were "released in 2017-18", the gate refuses first.
+- question: Total funds by block in South West Khasi Hills
+  sql: |
+    SELECT lgd_block,
+           ROUND(SUM(revolving_fund_amount) / 1e5, 2) AS rf_lakh,
+           ROUND(SUM(cif_amount) / 1e5, 2)            AS cif_lakh
+    FROM curated.v_nrlm
+    WHERE lgd_district = 'SOUTH WEST KHASI HILLS'
+    GROUP BY lgd_block
+    ORDER BY cif_lakh DESC;
+  tables:
+  - curated.v_nrlm
+  note: Block totals fall below one crore, so lakh is the default unit.
+
+# ---- villages ---------------------------------------------------------------
+- question: How many villages have an SHG?
+  sql: |
+    SELECT COUNT(DISTINCT village_code) AS villages
+    FROM curated.v_nrlm
+    WHERE entity_type <> 'Unresolved';
+  tables:
+  - curated.v_nrlm
+  expected: 4976
+- question: How many SHGs have no village recorded?
+  sql: |
+    SELECT lgd_district, COUNT(*) AS shgs_without_village
+    FROM curated.v_nrlm
+    WHERE entity_type = 'Unresolved'
+    GROUP BY lgd_district
+    ORDER BY shgs_without_village DESC;
+  tables:
+  - curated.v_nrlm
+  expected_total: 2032
+- question: Villages with the most SHGs
+  sql: |
+    SELECT village_code, lgd_village_name, lgd_block, COUNT(*) AS shgs
+    FROM curated.v_nrlm
+    WHERE entity_type <> 'Unresolved'
+    GROUP BY village_code, lgd_village_name, lgd_block
+    ORDER BY shgs DESC
+    LIMIT 5;
+  tables:
+  - curated.v_nrlm
+  note: Grouped by code with name and block for display - 197 names are shared. Barato (Laskein, 104) leads.
+- question: Villages per block in Ri Bhoi
+  sql: |
+    SELECT lgd_block,
+           COUNT(DISTINCT village_code) FILTER (WHERE entity_type <> 'Unresolved') AS villages,
+           COUNT(*) AS shgs
+    FROM curated.v_nrlm
+    WHERE lgd_district = 'RI BHOI'
+    GROUP BY lgd_block
+    ORDER BY villages DESC;
+  tables:
+  - curated.v_nrlm
+  note: SHG count keeps the Unresolved rows; village count drops them. Both in one query.
+- question: SHGs in Nongbah village, Thadlaskein block
+  sql: |
+    SELECT shg_code, shg_name, shg_type, is_active, total_members,
+           revolving_fund_amount, cif_amount
+    FROM curated.v_nrlm
+    WHERE village_code = 279159
+    ORDER BY shg_name
+    LIMIT 100;
+  tables:
+  - curated.v_nrlm
+  note: Nongbah exists in two blocks; the resolver returned code 279159 once the block was given.
+
+# ---- constituency and GP ------------------------------------------------------
+- question: How many SHGs are in Mawkyrwat constituency?
+  sql: |
+    SELECT COUNT(*) AS shgs
+    FROM curated.v_nrlm
+    WHERE constituency_name_raw = 'Mawkyrwat';
+  tables:
+  - curated.v_nrlm
+  expected: 1092
+- question: SHGs in constituency number 23
+  sql: |
+    SELECT constituency_name_raw, constituency_number_raw, COUNT(*) AS shgs
+    FROM curated.v_nrlm
+    WHERE constituency_number_raw LIKE '23 %'
+    GROUP BY constituency_name_raw, constituency_number_raw;
+  tables:
+  - curated.v_nrlm
+  expected: {constituency_name_raw: Sohing, constituency_number_raw: 23 SOHIONG, shgs: 837}
+  note: The trailing space in '23 %' stops '2' or '3' matching wider numbers.
+- question: SHGs and members by constituency
+  sql: |
+    SELECT constituency_number_raw, COUNT(*) AS shgs, SUM(total_members) AS members
+    FROM curated.v_nrlm
+    WHERE constituency_name_raw IS NOT NULL
+    GROUP BY constituency_number_raw
+    ORDER BY shgs DESC
+    LIMIT 10;
+  tables:
+  - curated.v_nrlm
+  note: 2,032 SHGs have no constituency; the breakdown sums to 38,597. State it.
+- question: How many SHGs are in Barato GP?
+  sql: |
+    SELECT lgd_block, COUNT(*) AS shgs
+    FROM curated.v_nrlm
+    WHERE gp_name ILIKE 'Barato'
+    GROUP BY lgd_block;
+  tables:
+  - curated.v_nrlm
+  note: GP is free text and may repeat across blocks - group by block so a split is visible.
+
+# ---- single SHG and name lookups --------------------------------------------------
+- question: Show details of SHG 3329
+  sql: |
+    SELECT shg_code, shg_name, shg_type, is_active, formation_financial_year_short,
+           lgd_district, lgd_block, lgd_village_name, gp_name,
+           male_members, female_members, total_members,
+           revolving_fund_amount, cif_amount
+    FROM curated.v_nrlm
+    WHERE shg_code = 3329;
+  tables:
+  - curated.v_nrlm
+  expected_rows: 1
+- question: Find SHGs named Kyrshanlang
+  sql: |
+    SELECT shg_code, shg_name, lgd_district, lgd_block, lgd_village_name, is_active
+    FROM curated.v_nrlm
+    WHERE shg_name ILIKE 'Kyrshanlang%'
+    ORDER BY lgd_district, lgd_block, lgd_village_name
+    LIMIT 100;
+  tables:
+  - curated.v_nrlm
+  note: Names are not unique. Return the list with codes and places; never assume one.
+- question: How many SHGs share the name Iatreilang Shg?
+  sql: |
+    SELECT lgd_district, COUNT(*) AS shgs
+    FROM curated.v_nrlm
+    WHERE shg_name = 'Iatreilang Shg'
+    GROUP BY lgd_district
+    ORDER BY shgs DESC;
+  tables:
+  - curated.v_nrlm
+  expected_total: 295
+- question: List SHGs in Laskein block formed in 2021-22
+  sql: |
+    SELECT shg_code, shg_name, shg_type, is_active, lgd_village_name, total_members,
+           revolving_fund_amount, cif_amount
+    FROM curated.v_nrlm
+    WHERE lgd_block = 'LASKEIN'
+      AND formation_financial_year_short = '2021-22'
+    ORDER BY lgd_village_name, shg_name
+    LIMIT 100;
+  tables:
+  - curated.v_nrlm
+
+# ---- data quality -----------------------------------------------------------------
+- question: Which SHGs look like duplicate registrations?
+  sql: |
+    SELECT shg_code, shg_name, lgd_village_name, lgd_block, lgd_district,
+           formation_financial_year_short, total_members
+    FROM curated.v_nrlm
+    WHERE is_possible_duplicate
+    ORDER BY shg_name, shg_code;
+  tables:
+  - curated.v_nrlm
+  expected_rows: 10
+  note: 5 pairs, unconfirmed (NR-24). Both rows of each pair are real until the client says otherwise.
+- question: Which SHGs have a district name that disagrees with the LGD code?
+  sql: |
+    SELECT f.shg_code, f.district_name_raw, f.block_name_raw,
+           f.district_lgd_code, f.block_lgd_code
+    FROM curated.fact_nrlm_shg f
+    WHERE f.has_name_code_conflict
+    ORDER BY f.shg_code;
+  tables:
+  - curated.fact_nrlm_shg
+  expected_rows: 12
+  note: Lineage question - the source names live on the fact only. The view exposes the corrected geography.
+
+# ---- cross-scheme, aggregated separately ----------------------------------------------
+- question: Villages with both SHGs and PMAY houses
+  sql: |
+    WITH n AS (
+      SELECT village_code, COUNT(*) AS shgs
+      FROM curated.v_nrlm
+      WHERE entity_type <> 'Unresolved'
+      GROUP BY village_code
+    ), p AS (
+      SELECT village_code, COUNT(*) AS pmay_houses
+      FROM curated.v_pmay
+      WHERE NOT is_placeholder
+      GROUP BY village_code
+    )
+    SELECT COUNT(*) FILTER (WHERE n.village_code IS NOT NULL AND p.village_code IS NOT NULL) AS both_schemes,
+           COUNT(*) FILTER (WHERE p.village_code IS NULL)                                AS nrlm_only,
+           COUNT(*) FILTER (WHERE n.village_code IS NULL)                                AS pmay_only
+    FROM n
+    FULL JOIN p ON p.village_code = n.village_code;
+  tables:
+  - curated.v_nrlm
+  - curated.v_pmay
+  note: >
+    Each scheme aggregated to village_code FIRST, then the aggregates joined - never the
+    rows. PMAY's mandatory NOT is_placeholder still applies inside its own CTE.
+- question: SHGs and MGNREGA person-days by district
+  sql: |
+    WITH n AS (
+      SELECT lgd_district, COUNT(*) AS shgs, SUM(total_members) AS shg_members
+      FROM curated.v_nrlm
+      GROUP BY lgd_district
+    ), m AS (
+      SELECT lgd_district, SUM(person_days) AS person_days
+      FROM curated.v_employment
+      WHERE financial_year_short = '2024-25'
+      GROUP BY lgd_district
+    )
+    SELECT COALESCE(n.lgd_district, m.lgd_district) AS lgd_district,
+           n.shgs, n.shg_members, m.person_days
+    FROM n
+    FULL JOIN m ON m.lgd_district = n.lgd_district
+    ORDER BY lgd_district;
+  tables:
+  - curated.v_nrlm
+  - curated.v_employment
+  note: >
+    The NRLM side is a current snapshot with no year; the MGNREGA side is one financial
+    year. Say so - they are side by side, not like for like.
+
+# ===========================================================================
+# v1.1 - 2026-10-05 - 40 MORE EXAMPLES. Every expected value is computed from
+# datasets/NRLM/NRLM.csv, grouped by LGD code as curated.v_nrlm stores it.
+# ===========================================================================
+
+# ---- blocks ---------------------------------------------------------------
+- question: Which block has received the most CIF?
+  sql: |
+    SELECT lgd_block, lgd_district, ROUND(SUM(cif_amount) / 1e7, 2) AS cif_cr
+    FROM curated.v_nrlm
+    GROUP BY lgd_block, lgd_district
+    ORDER BY cif_cr DESC
+    LIMIT 1;
+  tables:
+  - curated.v_nrlm
+  expected: {lgd_block: LASKEIN, lgd_district: WEST JAINTIA HILLS, cif_cr: 11.85}
+- question: Which blocks have no SHG with CIF at all?
+  sql: |
+    SELECT lgd_block, lgd_district, COUNT(*) AS shgs
+    FROM curated.v_nrlm
+    GROUP BY lgd_block, lgd_district
+    HAVING SUM(cif_amount) = 0
+    ORDER BY shgs DESC;
+  tables:
+  - curated.v_nrlm
+  expected_rows: 7
+  expected: ["SOHIONG 726", "GAMBEGRE 584", "DADENGGIRI 528", "SHELLA BHOLAGANJ 527", "BATABARI 441", "MAWPAT 265", "ADOKGRE 148"]
+  note: Seven whole blocks hold zero CIF. A real coverage gap worth stating, not a data error.
+- question: Which block has the lowest share of active SHGs?
+  sql: |
+    SELECT lgd_block, lgd_district, COUNT(*) AS shgs,
+           ROUND(100.0 * COUNT(*) FILTER (WHERE is_active) / COUNT(*), 2) AS active_pct
+    FROM curated.v_nrlm
+    GROUP BY lgd_block, lgd_district
+    ORDER BY active_pct ASC
+    LIMIT 1;
+  tables:
+  - curated.v_nrlm
+  expected: {lgd_block: DADENGGIRI, lgd_district: WEST GARO HILLS, shgs: 528, active_pct: 84.66}
+- question: Which blocks have the most villages with SHGs?
+  sql: |
+    SELECT lgd_block, lgd_district,
+           COUNT(DISTINCT village_code) FILTER (WHERE entity_type <> 'Unresolved') AS villages
+    FROM curated.v_nrlm
+    GROUP BY lgd_block, lgd_district
+    ORDER BY villages DESC
+    LIMIT 3;
+  tables:
+  - curated.v_nrlm
+  expected: ["UMLING 181", "RONGRAM 156", "BAJENGDOBA 154"]
+- question: Which blocks have the most SHGs without a village recorded?
+  sql: |
+    SELECT lgd_block, lgd_district, COUNT(*) AS shgs_without_village
+    FROM curated.v_nrlm
+    WHERE entity_type = 'Unresolved'
+    GROUP BY lgd_block, lgd_district
+    ORDER BY shgs_without_village DESC
+    LIMIT 5;
+  tables:
+  - curated.v_nrlm
+  expected: ["UMSNING 316", "THADLASKEIN 183", "DALU 131", "DEMDEMA 120", "NONGSTOIN 113"]
+  note: Umsning has 316 of its 1,035 SHGs (31%) without a village, so its village figures are the weakest.
+- question: Blocks of Eastern West Khasi Hills with SHGs, members and funds
+  sql: |
+    SELECT lgd_block, COUNT(*) AS shgs, SUM(total_members) AS members,
+           ROUND(SUM(revolving_fund_amount) / 1e5, 2) AS rf_lakh,
+           ROUND(SUM(cif_amount) / 1e5, 2)            AS cif_lakh
+    FROM curated.v_nrlm
+    WHERE district_lgd_code = 740
+    GROUP BY lgd_block
+    ORDER BY shgs DESC;
+  tables:
+  - curated.v_nrlm
+  expected:
+  - {lgd_block: MAIRANG, shgs: 1069, members: 11149, rf_lakh: 145.84, cif_lakh: 515.92}
+  - {lgd_block: MAWTHADRAISHAN, shgs: 541, members: 5594, rf_lakh: 77.10, cif_lakh: 206.20}
+- question: Where are the SHGs that hold Rs 30,000 Revolving Fund?
+  sql: |
+    SELECT lgd_block, lgd_district, COUNT(*) AS shgs_at_30000
+    FROM curated.v_nrlm
+    WHERE revolving_fund_amount = 30000
+    GROUP BY lgd_block, lgd_district
+    ORDER BY shgs_at_30000 DESC
+    LIMIT 4;
+  tables:
+  - curated.v_nrlm
+  expected: ["GASUAPARA 154", "RESUBELPARA 50", "RONGRAM 13", "AMLAREM 5"]
+  note: 204 of the 246 sit in two blocks, which looks like a block-level second round rather than chance.
+- question: Which blocks hold the SHGs with more than Rs 5 lakh CIF?
+  sql: |
+    SELECT lgd_block, lgd_district, COUNT(*) AS shgs_above_5_lakh,
+           ROUND(MAX(cif_amount) / 1e5, 2) AS max_cif_lakh
+    FROM curated.v_nrlm
+    WHERE cif_amount > 500000
+    GROUP BY lgd_block, lgd_district
+    ORDER BY shgs_above_5_lakh DESC;
+  tables:
+  - curated.v_nrlm
+  expected_total: 39
+  expected_top: ["PYNURSLA 13 (max 13.60 lakh)", "MAWSHYNRUT 7", "MAWKYNREW 5"]
+  note: Unconfirmed values (NR-25). A third of them are in one block, Pynursla, which is worth raising with MSRLS.
+
+# ---- districts ------------------------------------------------------------
+- question: Which district has the most inactive SHGs?
+  sql: |
+    SELECT lgd_district, COUNT(*) AS inactive_shgs
+    FROM curated.v_nrlm
+    WHERE NOT is_active
+    GROUP BY lgd_district
+    ORDER BY inactive_shgs DESC
+    LIMIT 1;
+  tables:
+  - curated.v_nrlm
+  expected: {lgd_district: WEST GARO HILLS, inactive_shgs: 278}
+- question: What share of SHGs in each district have received CIF?
+  sql: |
+    SELECT lgd_district,
+           COUNT(*) FILTER (WHERE cif_amount > 0) AS shgs_with_cif,
+           ROUND(100.0 * COUNT(*) FILTER (WHERE cif_amount > 0) / COUNT(*), 2) AS cif_coverage_pct
+    FROM curated.v_nrlm
+    GROUP BY lgd_district
+    ORDER BY cif_coverage_pct DESC
+    LIMIT 12;
+  tables:
+  - curated.v_nrlm
+  expected_top: {lgd_district: SOUTH WEST KHASI HILLS, shgs_with_cif: 977, cif_coverage_pct: 52.33}
+  expected_bottom: {lgd_district: EAST KHASI HILLS, shgs_with_cif: 795, cif_coverage_pct: 11.75}
+  note: East Khasi Hills has the most SHGs and the lowest CIF coverage. Worth surfacing.
+- question: Which district has the largest average SHG size?
+  sql: |
+    SELECT lgd_district, ROUND(AVG(total_members), 1) AS avg_members
+    FROM curated.v_nrlm
+    GROUP BY lgd_district
+    ORDER BY avg_members DESC
+    LIMIT 1;
+  tables:
+  - curated.v_nrlm
+  expected: {lgd_district: SOUTH WEST KHASI HILLS, avg_members: 10.5}
+- question: Where are male SHG members concentrated?
+  sql: |
+    SELECT lgd_district,
+           COUNT(*) FILTER (WHERE male_members > 0) AS shgs_with_men,
+           SUM(male_members) AS men
+    FROM curated.v_nrlm
+    GROUP BY lgd_district
+    ORDER BY men DESC
+    LIMIT 3;
+  tables:
+  - curated.v_nrlm
+  expected:
+  - {lgd_district: WEST JAINTIA HILLS, shgs_with_men: 186, men: 458}
+  - {lgd_district: EAST KHASI HILLS, shgs_with_men: 192, men: 376}
+  - {lgd_district: EAST JAINTIA HILLS, shgs_with_men: 158, men: 367}
+- question: Women's share of SHG membership by district
+  sql: |
+    SELECT lgd_district,
+           ROUND(100.0 * SUM(female_members) / NULLIF(SUM(total_members), 0), 2) AS women_pct
+    FROM curated.v_nrlm
+    GROUP BY lgd_district
+    ORDER BY women_pct ASC;
+  tables:
+  - curated.v_nrlm
+  expected_bottom: {lgd_district: EAST JAINTIA HILLS, women_pct: 98.62}
+  expected_top: {lgd_district: EAST GARO HILLS, women_pct: 100.00}
+- question: Which districts have the most revived SHGs?
+  sql: |
+    SELECT lgd_district, COUNT(*) AS revived_shgs
+    FROM curated.v_nrlm
+    WHERE shg_type = 'Revived'
+    GROUP BY lgd_district
+    ORDER BY revived_shgs DESC
+    LIMIT 3;
+  tables:
+  - curated.v_nrlm
+  expected: ["WEST GARO HILLS 622", "RI BHOI 265", "NORTH GARO HILLS 253"]
+- question: Pre-NRLM SHGs by district
+  sql: |
+    SELECT lgd_district, COUNT(*) AS pre_nrlm_shgs
+    FROM curated.v_nrlm
+    WHERE shg_type = 'Pre-Nrlm'
+    GROUP BY lgd_district
+    ORDER BY pre_nrlm_shgs DESC;
+  tables:
+  - curated.v_nrlm
+  expected_top: ["EAST GARO HILLS 116", "EAST KHASI HILLS 108", "EASTERN WEST KHASI HILLS 80"]
+  note: East and West Jaintia Hills have no Pre-NRLM SHGs. They return no row, not a zero row.
+- question: Active SHGs that have not received Revolving Fund, by district
+  sql: |
+    SELECT lgd_district, COUNT(*) AS active_without_rf
+    FROM curated.v_nrlm
+    WHERE is_active
+      AND revolving_fund_amount = 0
+    GROUP BY lgd_district
+    ORDER BY active_without_rf DESC
+    LIMIT 3;
+  tables:
+  - curated.v_nrlm
+  expected: ["WEST GARO HILLS 1662", "EAST KHASI HILLS 1446", "NORTH GARO HILLS 583"]
+- question: Compare East and West Jaintia Hills
+  sql: |
+    SELECT lgd_district, COUNT(*) AS shgs, SUM(total_members) AS members,
+           ROUND(SUM(revolving_fund_amount) / 1e7, 2) AS rf_cr,
+           ROUND(SUM(cif_amount) / 1e7, 2)            AS cif_cr
+    FROM curated.v_nrlm
+    WHERE district_lgd_code IN (657, 275)
+    GROUP BY lgd_district;
+  tables:
+  - curated.v_nrlm
+  expected:
+  - {lgd_district: EAST JAINTIA HILLS, shgs: 2744, members: 26601, rf_cr: 3.76, cif_cr: 7.75}
+  - {lgd_district: WEST JAINTIA HILLS, shgs: 4055, members: 41049, rf_cr: 5.67, cif_cr: 18.89}
+- question: SHGs, members and funds by region
+  sql: |
+    SELECT CASE WHEN district_lgd_code IN (274, 740, 658, 279)      THEN 'Khasi Hills'
+                WHEN district_lgd_code IN (273, 656, 277, 663, 278) THEN 'Garo Hills'
+                WHEN district_lgd_code IN (657, 275)                THEN 'Jaintia Hills'
+                ELSE 'Ri Bhoi' END AS region,
+           COUNT(*) AS shgs, SUM(total_members) AS members,
+           ROUND(SUM(revolving_fund_amount) / 1e7, 2) AS rf_cr,
+           ROUND(SUM(cif_amount) / 1e7, 2)            AS cif_cr
+    FROM curated.v_nrlm
+    GROUP BY 1
+    ORDER BY shgs DESC;
+  tables:
+  - curated.v_nrlm
+  expected:
+  - {region: Garo Hills, shgs: 17565, members: 174459, rf_cr: 20.83, cif_cr: 27.67}
+  - {region: Khasi Hills, shgs: 12557, members: 130462, rf_cr: 15.34, cif_cr: 35.31}
+  - {region: Jaintia Hills, shgs: 6799, members: 67650, rf_cr: 9.44, cif_cr: 26.64}
+  - {region: Ri Bhoi, shgs: 3708, members: 38276, rf_cr: 5.25, cif_cr: 8.85}
+  note: Garo Hills has the most SHGs and Khasi Hills the most CIF. Jaintia Hills holds almost as much CIF as Garo Hills with 39% as many SHGs.
+
+# ---- formation cohorts ----------------------------------------------------
+- question: Which district formed the most SHGs in 2022-23?
+  sql: |
+    SELECT lgd_district, COUNT(*) AS shgs_formed
+    FROM curated.v_nrlm
+    WHERE formation_financial_year_short = '2022-23'
+    GROUP BY lgd_district
+    ORDER BY shgs_formed DESC
+    LIMIT 1;
+  tables:
+  - curated.v_nrlm
+  expected: {lgd_district: EAST KHASI HILLS, shgs_formed: 450}
+- question: SHG formation by year in West Garo Hills since 2015-16
+  sql: |
+    SELECT formation_financial_year_short, COUNT(*) AS shgs_formed
+    FROM curated.v_nrlm
+    WHERE lgd_district = 'WEST GARO HILLS'
+      AND formation_financial_year_short >= '2015-16'
+    GROUP BY formation_financial_year_short
+    ORDER BY formation_financial_year_short;
+  tables:
+  - curated.v_nrlm
+  expected: {'2015-16': 233, '2016-17': 472, '2017-18': 667, '2018-19': 347, '2019-20': 985, '2020-21': 1654, '2021-22': 1574, '2022-23': 230}
+- question: What do SHGs hold, by the year they were formed?
+  sql: |
+    SELECT formation_financial_year_short, COUNT(*) AS shgs,
+           COUNT(*) FILTER (WHERE cif_amount > 0) AS with_cif,
+           ROUND(SUM(revolving_fund_amount) / 1e7, 2) AS rf_held_cr,
+           ROUND(SUM(cif_amount) / 1e7, 2)            AS cif_held_cr
+    FROM curated.v_nrlm
+    WHERE formation_financial_year_short >= '2015-16'
+    GROUP BY formation_financial_year_short
+    ORDER BY formation_financial_year_short;
+  tables:
+  - curated.v_nrlm
+  expected:
+  - {formation_financial_year_short: '2017-18', shgs: 3634, with_cif: 1645, rf_held_cr: 4.44, cif_held_cr: 25.08}
+  - {formation_financial_year_short: '2020-21', shgs: 11354, with_cif: 1936, rf_held_cr: 15.64, cif_held_cr: 11.30}
+  - {formation_financial_year_short: '2022-23', shgs: 1680, with_cif: 3, rf_held_cr: 1.06, cif_held_cr: 0.03}
+  note: >
+    A COHORT view: what each formation year's SHGs hold TODAY. Label it "held to date by
+    SHGs formed in", never "released in". The 2017-18 cohort holds the most CIF (Rs 25.08 Cr)
+    although the 2020-21 cohort is three times larger, because older groups have had more rounds.
+- question: How many SHGs formed before 2011-12 are still active?
+  sql: |
+    SELECT COUNT(*) AS formed_before_2011_12,
+           COUNT(*) FILTER (WHERE is_active) AS still_active
+    FROM curated.v_nrlm
+    WHERE formation_financial_year_short < '2011-12';
+  tables:
+  - curated.v_nrlm
+  expected: {formed_before_2011_12: 645, still_active: 624}
+- question: How many SHGs did Eastern West Khasi Hills form in 2015-16?
+  sql: |
+    SELECT COUNT(*) AS shgs_formed
+    FROM curated.v_nrlm
+    WHERE district_lgd_code = 740
+      AND formation_financial_year_short = '2015-16';
+  tables:
+  - curated.v_nrlm
+  expected: 109
+
+# ---- distributions -----------------------------------------------------------
+- question: How is CIF distributed across SHGs?
+  sql: |
+    SELECT CASE WHEN cif_amount = 0       THEN '0'
+                WHEN cif_amount <= 50000  THEN '1 - 50,000'
+                WHEN cif_amount <= 100000 THEN '50,001 - 1 lakh'
+                WHEN cif_amount <= 200000 THEN '1 - 2 lakh'
+                WHEN cif_amount <= 500000 THEN '2 - 5 lakh'
+                ELSE 'above 5 lakh' END AS cif_band,
+           COUNT(*) AS shgs
+    FROM curated.v_nrlm
+    GROUP BY 1
+    ORDER BY MIN(cif_amount);
+  tables:
+  - curated.v_nrlm
+  expected: {'0': 29788, '1 - 50,000': 5991, '50,001 - 1 lakh': 1587, '1 - 2 lakh': 2768, '2 - 5 lakh': 456, 'above 5 lakh': 39}
+- question: How big are SHGs? Show membership bands
+  sql: |
+    SELECT CASE WHEN total_members = 0   THEN '0'
+                WHEN total_members <= 4  THEN '1-4'
+                WHEN total_members <= 9  THEN '5-9'
+                WHEN total_members <= 20 THEN '10-20 (norm)'
+                ELSE 'above 20' END AS size_band,
+           COUNT(*) AS shgs
+    FROM curated.v_nrlm
+    GROUP BY 1
+    ORDER BY MIN(total_members);
+  tables:
+  - curated.v_nrlm
+  expected: {'0': 5, '1-4': 74, '5-9': 10899, '10-20 (norm)': 29552, 'above 20': 99}
+- question: Which SHG has the most members?
+  sql: |
+    SELECT shg_code, shg_name, lgd_block, lgd_district, total_members
+    FROM curated.v_nrlm
+    ORDER BY total_members DESC
+    LIMIT 1;
+  tables:
+  - curated.v_nrlm
+  expected: {shg_code: 8666, shg_name: Mahila Bhobisshot Ujjwala, lgd_block: MAWSYNRAM, total_members: 38}
+  note: 38 members is far above the norm of 20, so the SHG is flagged member_count_out_of_norm.
+- question: What is the median CIF among SHGs that received it?
+  sql: |
+    SELECT PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY cif_amount) AS median_cif
+    FROM curated.v_nrlm
+    WHERE cif_amount > 0;
+  tables:
+  - curated.v_nrlm
+  expected: 50000
+  note: The median is Rs 50,000 against a mean of Rs 90,836. The high values pull the mean up.
+
+# ---- villages ---------------------------------------------------------------
+- question: Which village has received the most CIF?
+  sql: |
+    SELECT village_code, lgd_village_name, lgd_block, COUNT(*) AS shgs,
+           ROUND(SUM(cif_amount) / 1e5, 2) AS cif_lakh
+    FROM curated.v_nrlm
+    WHERE entity_type <> 'Unresolved'
+    GROUP BY village_code, lgd_village_name, lgd_block
+    ORDER BY cif_lakh DESC
+    LIMIT 1;
+  tables:
+  - curated.v_nrlm
+  expected: {village_code: 279247, lgd_village_name: Kyndongtuber, lgd_block: LASKEIN, shgs: 92, cif_lakh: 90.40}
+- question: Villages in Laskein block with the most SHGs
+  sql: |
+    SELECT village_code, lgd_village_name, COUNT(*) AS shgs
+    FROM curated.v_nrlm
+    WHERE block_lgd_code = 1997
+      AND entity_type <> 'Unresolved'
+    GROUP BY village_code, lgd_village_name
+    ORDER BY shgs DESC
+    LIMIT 3;
+  tables:
+  - curated.v_nrlm
+  expected: ["Barato 104", "Kyndongtuber 92", "Thadmuthlong A 77"]
+- question: How many villages have only one SHG?
+  sql: |
+    SELECT COUNT(*) AS villages_with_one_shg
+    FROM (
+      SELECT village_code
+      FROM curated.v_nrlm
+      WHERE entity_type <> 'Unresolved'
+      GROUP BY village_code
+      HAVING COUNT(*) = 1
+    ) v;
+  tables:
+  - curated.v_nrlm
+  expected: 400
+- question: What is the average number of SHGs per village?
+  sql: |
+    SELECT ROUND(COUNT(*)::numeric / COUNT(DISTINCT village_code), 2) AS shgs_per_village
+    FROM curated.v_nrlm
+    WHERE entity_type <> 'Unresolved';
+  tables:
+  - curated.v_nrlm
+  expected: 7.76
+  note: Unresolved SHGs are out of both numerator and denominator; otherwise the average is overstated.
+- question: SHGs in Jarain village, Saipung block
+  sql: |
+    SELECT COUNT(*) AS shgs
+    FROM curated.v_nrlm
+    WHERE village_code = 279522;
+  tables:
+  - curated.v_nrlm
+  expected: 18
+  note: Jarain is three different villages (Saipung 18, Amlarem 14, Khatarshnong Laitkroh 4). Naming the block picked the code.
+
+# ---- constituency ------------------------------------------------------------
+- question: Which constituency has the most SHGs?
+  sql: |
+    SELECT constituency_number_raw, COUNT(*) AS shgs
+    FROM curated.v_nrlm
+    WHERE constituency_name_raw IS NOT NULL
+    GROUP BY constituency_number_raw
+    ORDER BY shgs DESC
+    LIMIT 1;
+  tables:
+  - curated.v_nrlm
+  expected: {constituency_number_raw: 6 KHLIEHRIAT, shgs: 1357}
+- question: Which constituencies have the fewest SHGs?
+  sql: |
+    SELECT constituency_number_raw, COUNT(*) AS shgs
+    FROM curated.v_nrlm
+    WHERE constituency_name_raw IS NOT NULL
+    GROUP BY constituency_number_raw
+    ORDER BY shgs ASC
+    LIMIT 3;
+  tables:
+  - curated.v_nrlm
+  expected: ["14 PYNTHORUMKHRAH 37", "21 NONGTHYMMAI 65", "22 NONGKREM 73"]
+  note: All three are Shillong-area, largely urban seats with few rural SHGs. Not a performance gap.
+- question: Constituencies where no SHG has CIF
+  sql: |
+    SELECT constituency_number_raw, COUNT(*) AS shgs
+    FROM curated.v_nrlm
+    WHERE constituency_name_raw IS NOT NULL
+    GROUP BY constituency_number_raw
+    HAVING SUM(cif_amount) = 0
+    ORDER BY shgs DESC;
+  tables:
+  - curated.v_nrlm
+  expected_rows: 7
+  expected: ["23 SOHIONG 837", "47 RAJABALA 586", "13 MAWRYNGKNENG 527", "26 SHELLA 408", "22 NONGKREM 73", "21 NONGTHYMMAI 65", "14 PYNTHORUMKHRAH 37"]
+  note: Exact zeros, checked against the source - not amounts that round to 0.00 crore.
+- question: Mawkyrwat block and Mawkyrwat constituency side by side
+  sql: |
+    SELECT 'block' AS level, COUNT(*) AS shgs FROM curated.v_nrlm WHERE lgd_block = 'MAWKYRWAT'
+    UNION ALL
+    SELECT 'constituency', COUNT(*) FROM curated.v_nrlm WHERE constituency_name_raw = 'Mawkyrwat';
+  tables:
+  - curated.v_nrlm
+  expected: {block: 1106, constituency: 1092}
+  note: Same name, different area. Show both only when the user asked for the comparison.
+
+# ---- name lookups -------------------------------------------------------------
+- question: Where are the SHGs named Chibasal Shg?
+  sql: |
+    SELECT lgd_district, COUNT(*) AS shgs
+    FROM curated.v_nrlm
+    WHERE shg_name = 'Chibasal Shg'
+    GROUP BY lgd_district
+    ORDER BY shgs DESC;
+  tables:
+  - curated.v_nrlm
+  expected_total: 125
+  expected_top: ["SOUTH GARO HILLS 32", "WEST GARO HILLS 25", "NORTH GARO HILLS 24"]
+  note: A Garo name, so it clusters in the Garo Hills, while Iatreilang Shg (295) is entirely in the Khasi-Jaintia districts and Ri Bhoi.
+- question: How many SHGs have a name starting with Kyrshanlang?
+  sql: |
+    SELECT lgd_district, COUNT(*) AS shgs
+    FROM curated.v_nrlm
+    WHERE shg_name ILIKE 'Kyrshanlang%'
+    GROUP BY lgd_district
+    ORDER BY shgs DESC;
+  tables:
+  - curated.v_nrlm
+  expected_total: 203
+  expected_top: ["RI BHOI 49", "EAST JAINTIA HILLS 40", "WEST JAINTIA HILLS 39"]
+- question: Show SHG 7194
+  sql: |
+    SELECT shg_code, shg_name, shg_type, is_active, formation_financial_year_short,
+           lgd_village_name, lgd_block, lgd_district, total_members,
+           revolving_fund_amount, cif_amount
+    FROM curated.v_nrlm
+    WHERE shg_code = 7194;
+  tables:
+  - curated.v_nrlm
+  expected: {shg_name: Sun Flower, shg_type: New, is_active: false, formation_financial_year_short: '2017-18', lgd_village_name: Rogu Alda, lgd_block: DAMBO RONGJENG, total_members: 9, revolving_fund_amount: 0, cif_amount: 0}
+  note: Inactive, so both funds are 0. Say the source records inactive SHGs that way (NR-15).
+- question: SHGs in Rogu Alda village
+  sql: |
+    SELECT shg_code, shg_name, is_active, total_members, revolving_fund_amount
+    FROM curated.v_nrlm
+    WHERE village_code = 274777
+    ORDER BY shg_code;
+  tables:
+  - curated.v_nrlm
+  expected_rows: 5
+  expected: ["7194 Sun Flower inactive 9 RF 0", "7197 Evergreen active 10 RF 0", "22441 Nikwatgre Shg active 11 RF 15000", "22442 Chiring Chambil active 9 RF 15000", "40257 Tawar Gittim Shg active 10 RF 15000"]
+  note: 7197 Evergreen is ACTIVE with no RF - one of the 5,732 active SHGs still at 0. Not every zero is an inactive group.

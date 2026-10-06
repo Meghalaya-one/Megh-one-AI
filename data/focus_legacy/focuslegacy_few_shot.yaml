@@ -584,13 +584,11 @@ sql_generation_examples:
     SELECT COUNT(DISTINCT pg_id) AS producer_groups,
            COUNT(*)              AS payments,
            (SELECT COUNT(*) FROM (SELECT pg_id FROM curated.v_focus_legacy
-                                  GROUP BY pg_id HAVING COUNT(*) > 1) r) AS groups_paid_more_than_once,
-           (SELECT COUNT(*) FROM (SELECT pg_id, date_of_remittance FROM curated.v_focus_legacy
-                                  GROUP BY pg_id, date_of_remittance HAVING COUNT(*) > 1) d) AS duplicate_payment_records
+                                  GROUP BY pg_id HAVING COUNT(*) > 1) r) AS duplicate_producer_groups
     FROM curated.v_focus_legacy;
   tables:
   - curated.v_focus_legacy
-  note: 'A group paid more than once is a REPEAT PAYMENT in a later tranche, not a duplicate group. Duplicate records (same pg_id, same date) are 0. Expect 11,906 groups, 14,569 payments, 2,655 paid more than once.'
+  note: 'A DUPLICATE producer group is one PAID MORE THAN ONCE (product owner, confirmed 2026-10-07, KI-187, D-032). Expect 11,906 groups, 14,569 payments, 2,655 duplicates (2,647 paid twice, 8 three times), no year split. The pipeline answers the plain / place / year form deterministically (_focus_legacy_duplicate_groups_answer); this example guides a constituency-filtered variant.'
 
 - question: Which groups were paid in more than one financial year?
   sql: |

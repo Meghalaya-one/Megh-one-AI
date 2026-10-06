@@ -1,12 +1,13 @@
 # Schemes — Megh One AI
 
-*Reconciled against the code on 2026-09-26. **Six** schemes are wired end to end (VERIFIED:
+*Reconciled against the code on 2026-10-06. **Seven** schemes are wired end to end (VERIFIED:
 `schema_context.SCHEME_CATALOG`, `annotations._SCHEME_DIRS`, `entity_resolver._RESOLVER_FILE`,
-`auth.ROLE_PERMISSIONS`).*
+`auth.ROLE_PERMISSIONS`; NRLM added 2026-10-06, see
+[SCHEME_ONBOARD_NRLM.md](SCHEME_ONBOARD_NRLM.md) for the step-by-step record).*
 
 Scheme identifiers are the **canonical display strings** used everywhere in code: `"MGNREGA"`,
-`"PMAY-G"`, `"Focus Plus"`, `"CM Elevate"`, `"Focus Legacy"`, `"CM Elevate Legacy"`. No enum
-exists. The strings are compared literally, and the Qdrant KB `scheme` tag must match them
+`"PMAY-G"`, `"Focus Plus"`, `"CM Elevate"`, `"Focus Legacy"`, `"CM Elevate Legacy"`, `"NRLM"`.
+No enum exists. The strings are compared literally, and the Qdrant KB `scheme` tag must match them
 exactly.
 
 The per-scheme SME contract lives in `data/<folder>/README.md` and its YAMLs. That contract is
@@ -23,6 +24,7 @@ are in `app/schema_context.py` (`_<X>_TABLES`, `_<X>_RULES`, `_<X>_VOCAB`).
 | CM Elevate | `data/cm_elevate` | `v_cm_elevate` | application | **none** | **none** | no | `cmelevate_few_shot.yaml` (155) | reference + FAQ |
 | Focus Legacy | `data/focus_legacy` | `v_focus_legacy` | payment to a producer group | unverified (= members × 5000) | 2021-22, 2022-23, 2024-25, 2025-26 (**no 2023-24**) | yes (via `dim_geography.ac_name`) | `focuslegacy_few_shot.yaml` (86) | reference + FAQ |
 | CM Elevate Legacy | `data/cm_elevate_legacy` | `v_cm_elevate_disbursement` | applicant sanction + disbursement | ₹ | 2024-25, 2025-26 | yes (via `dim_geography.ac_name`) | `cmelevatelegacy_prompt_few_shots.yaml` (132) | **shares CM Elevate's** |
+| NRLM | `data/NRLM` (upper case) | `v_nrlm` | **one Self Help Group** | ₹, **cumulative, no year** | **formation year only**, 1984-85…2022-23 | yes (`constituency_name_raw`, no join) | `nrlm_few_shot.yaml` (103) | reference + FAQ |
 
 Notes on the table:
 - Few-shot counts are the examples **actually loaded** by `annotations.load_all()` (VERIFIED on
@@ -30,6 +32,12 @@ Notes on the table:
   not 71. A raw grep for `question:` over-counts.
 - FY lists are the `_SCHEME_DATA_YEARS` defaults. At startup, `refresh_scheme_years` replaces
   them with the DB's distinct `year_key` values.
+- **NRLM's "FY" is not a reporting year.** It is the year each SHG was FORMED
+  (`formation_financial_year_short`), and it is valid only for SHG-count, member and formation
+  questions. NRLM is the only scheme whose money column must NEVER be filtered, grouped or
+  trended by it — see the NRLM section below.
+- NRLM is the only **group-grained** fact in `megh_db`: one row is one SHG, so `COUNT(*)` is a
+  count of groups, never of people.
 
 ## Name collisions — must never be guessed
 
@@ -89,7 +97,8 @@ Notes on the table:
   - `v_pmay_monthly_sanctions` (statewide, crore, **no geography**);
   - `dim_pmay_house_status` (6 stages).
 - **Rules:**
-  - `WHERE NOT is_placeholder`;
+  - `WHERE NOT is_placeholder` — except the beneficiary count, which includes the zero-sanction
+    records (decided 2026-10-03, KI-127);
   - "completed" / "in progress" come from the booleans;
   - exclude `sanctioned_amount = 0` from rates;
   - "expenditure" means `amount_released`;
@@ -173,8 +182,18 @@ Notes on the table:
     = On Hold, and approved/rejected on `file_status`;
   - answer guarantees after the composer: `_cm_elevate_answer_guarantees`;
   - "PRIME SEED" routes to CM Elevate.
-  - "Pending" is still On Hold. A single-figure pending answer also states the file-status
-    count (KI-074 interim).
+  - "Pending" = On Hold only (KI-074 decided 2026-09-28; the interim file-status line was removed).
+  - Two or more named programmes: each figure plus the combined total (KI-069). A named programme
+    with no applications is stated as 0 (KI-182, fixed 2026-10-05) — with only place filters (plus On Hold /
+    Valid / level 0-2) the whole answer is rebuilt as a clear breakdown (`_cme_zero_breakdown_answer`). When ALL named programmes
+    are 0 (empty result) the answer says "There are no applicants under … in <place> — the data records 0"
+    instead of "no matching records", once the place is confirmed in the data (`_cme_zero_programmes_answer`).
+- **OFF-009 all ordered programme pairs (2026-10-05):** 2,520 questions (12 districts x 15P2). Before the KI-182 fix
+  1,131 FAIL; after it and the empty-result zero answer, 2,520 / 2,520 PASS. Raw = DB and the SQL figures
+  were correct in 2,520/2,520 both times.
+- **Pending AT a level (KI-186, decided 2026-10-05):** `current_level = 'levelN'` AND `file_status = 'Pending'` — level 1 = 8,307,
+  level 2 = 165, level 0 = 0 (all 90 level-0 files are Send Back). Plain "pending" stays On Hold. "Unique applications" =
+  COUNT(DISTINCT request_id).
 - **Status = `current_file_status`** (Forward / Sent back / Resubmit; decided 2026-09-28, KI-123). Pending stays `data_verified = 'On Hold'`; verified = 'Valid'.
 - **All districts / blocks / villages (2026-09-28): 7,364 / 7,364** on the final code (KI-106..120). CM Elevate is a village-grained scheme (`_village_scheme`); urban bodies are stored as blocks ("<TOWN>-MUNICIPAL BOARD" / "-TOWN COMMITTEE") and the block catalogue lags the data (21 of 66 missing) — `_cm_elevate_blocks_to_data` maps to the stored spelling. "Pending" = On Hold only (decided 2026-09-28).
 - **QA (2026-09-27):** the use cases (`CM Elevate.csv`, CM-ELEVATE-OFF-001..030).
@@ -182,8 +201,7 @@ Notes on the table:
     `docs/CM_Elevate_UseCase_Test_Report_2026-09-27.xlsx`.
   - After the same-day fixes (KI-068 to KI-075, D-027): **30 / 30** (55 / 55) on 2 of 2 live
     runs. Report: `docs/CM_Elevate_UseCase_Test_Report_2026-09-27_v2_after_fixes.xlsx`.
-  - KI-074, what "pending" means, still needs a product decision. There is an interim that
-    states both readings.
+  - KI-074, what "pending" means, was decided on 2026-09-28: On Hold only.
   - The raw workbook `CM_Elevate_AllSchemes_20260927_full.xlsx` equals `v_cm_elevate` exactly:
     8,627 rows and 8,600 distinct `request_id`.
   - VERIFIED 2026-09-27: `scheme_specific` also holds `file_status` (Pending 8,472, Send Back 90,
@@ -214,6 +232,10 @@ Notes on the table:
     that names it substitutes the nearest year that holds data (`_apply_year_gap`).
   - Dates are treasury batches (30 distinct dates), so no monthly trends.
   - Bank-wise analysis is allowed via `bank_name`.
+  - **Duplicate producer groups = groups paid more than once** (product owner, confirmed 2026-10-07, D-032):
+    2,655 of 11,906 statewide (2,647 twice, 8 three times), no year split. Answered deterministically by
+    `_focus_legacy_duplicate_groups_answer` (place / year filtered). "Duplicate payments / records" (the same
+    pg_id paid twice on the same date: 0) is a different question.
 - **Special logic:**
   - `_focus_legacy_pg_name_answer` gives **deterministic** answers to "is there a PG named X" /
     "members in X";
@@ -288,15 +310,92 @@ Notes on the table:
   (`_SCHEME_FIT`, copied from the reference FAQs).
 - Unsupported named schemes (PM-KISAN, Ujjwala, …) → `_unsupported_scheme_clarification`.
 
+## NRLM — the Self Help Group register (added 2026-10-06)
+
+National Rural Livelihoods Mission (DAY-NRLM, "Aajeevika"), run in Meghalaya by **MSRLS**
+under the C&RD Department. Query surface `curated.v_nrlm` (29 columns, 40,629 rows), lineage
+fact `curated.fact_nrlm_shg`, reconciliation `meta.v_reconciliation_nrlm`.
+
+Three facts decide almost every NRLM query, and all three differ from the other six schemes:
+
+**1. One row is one SHG — not a person, a house or a payment.**
+`COUNT(*)` counts groups. People are a COLUMN: `SUM(total_members)` (410,847),
+`SUM(female_members)` (409,249), `SUM(male_members)`. Reading `COUNT(*)` as people understates
+members roughly tenfold. `shg_name` is **display only** — 27,692 names for 40,629 groups, and
+'Iatreilang Shg' alone is 295 different SHGs; `shg_code` is the key.
+
+**2. The only year is the year the SHG was FORMED.**
+`formation_financial_year_short`, char(7), `'1984-85'`…`'2022-23'`. There is no reporting year,
+no release date and no extract-date column. It compares correctly as text. `'Pre-Nrlm'` is a
+stored **type**, not a year filter (432 typed vs 645 formed before 2011-12 — the sets differ).
+
+**3. Money is cumulative and undated — the scheme's highest-risk rule.**
+`revolving_fund_amount` (RF) and `cif_amount` (CIF) are what each SHG has received **in total**
+as at the extract, in rupees. They add across SHGs, so a sum by district, block, type or status
+is sound. They can never be placed in a year: *"RF released in 2021-22"*, *"growth in CIF"*,
+*"fund utilisation"* and *"has RF increased since last extract"* have **no answer**, because
+filtering money by the formation year returns what SHGs formed that year *hold today* — a
+different figure that looks exactly like the one asked for. The one allowed form is the
+**cohort view**, used only when the user asks for it or accepts the offer, with the sums
+aliased `*_held_cr` / `*_held_lakh` so the result cannot be misread.
+
+Because prose rules alone have repeatedly failed under sampling (CLAUDE.md §5), this is
+enforced in three places: `_NRLM_RULES` rule 3 in the SQL prompt, the few-shot refusals in
+`nrlm_schema_partitions.yaml`, and the absence of any money-plus-year offer in the follow-up
+builder, the edge starters and the UI chips (pinned by `tests/test_nrlm_onboarding.py`).
+
+### The other NRLM traps
+
+| Trap | Rule |
+|---|---|
+| **2,032 SHGs have no village** (`entity_type = 'Unresolved'`, 5.0%) | they carry a correct block and district, so they stay **in** every state / district / block total; add `entity_type <> 'Unresolved'` **only** to village counts, lists, rankings and per-village averages |
+| `constituency_name_raw` is NULL on **the same** 2,032 rows | a constituency breakdown adds `IS NOT NULL` and sums to **38,597**, not 40,629 — say so |
+| 197 village names belong to more than one village | identity is `village_code`; `COUNT(DISTINCT village_code)`, never by name |
+| `lgd_district` / `lgd_block` are **UPPERCASE** | a mixed-case equality filter returns zero rows **silently** |
+| `constituency_number_raw` holds `'36 MAWKYRWAT'` | never cast to integer; match `LIKE '36 %'` (the trailing space stops `'3 %'` matching `'36'`) |
+| A block and its same-name constituency | cover **different areas** (Mawkyrwat: 1,106 SHGs as a block, 1,092 as a constituency) — 26 block names are also constituency names |
+| `gp_name` | free text, no code, **not** an LGD level; differs from the LGD village on ~23-28% of rows. Use only when the user says GP / panchayat / dorbar |
+| Zero is a recorded value, never NULL | "received" is `> 0`, "not received" is `= 0`. 73.3% of SHGs hold no CIF, so show the average over **both** populations |
+| All 1,197 inactive SHGs show 0 RF and 0 CIF (NR-15) | a fund question filtered to inactive SHGs returns zero — report it with the caveat, never as a funding finding |
+| EASTERN WEST KHASI HILLS (740) | a real district, distinct from WEST KHASI HILLS (279) |
+| Unconfirmed values | the rupee unit itself (NR-07), 39 SHGs with CIF above ₹5 lakh (NR-25), 5 duplicate pairs (NR-24) |
+
+### Not held by NRLM
+
+Savings, corpus, internal lending, bank linkage, loans, credit, repayment, NPA; federations
+(Village Organisation / Cluster Level Federation); member names or any member-level detail;
+social category, disability; livelihood activity; training; grading, meetings, Panchasutra;
+the formation **date** or month (the source column was empty on every row); households,
+population, per-capita, saturation; targets, budgets, fund utilisation; other states; urban
+livelihoods (DAY-NULM).
+
+**RF and CIF must never be presented as savings or loans** — they are Mission grants. This is
+the likeliest NRLM mistake, so it is in the prompt's NOT-HELD list and in `SCHEME_METRICS`.
+
+### Why "SHG" is not a scheme-name pattern
+
+`_SCHEME_NAME_PATTERN["NRLM"]` matches `nrlm`, `day-nrlm`, `aajeevika`, `msrls`, `srlm` and the
+spelled-out mission name — but **not** a bare "SHG". An SHG is the unit NRLM counts, and CM
+Elevate also accepts SHG applicants (an `applicant_category` value), so a bare "SHG" must not
+name the scheme. It is scheme-specific **vocabulary** instead (`_NRLM_ONLY_TERMS`), which only
+fires when no scheme is named — so *"How many CM Elevate applications came from SHGs?"* stays
+with CM Elevate.
+
 ## Adding a scheme
 
 Schemes are hand-registered. As of 2026-09-26, missing any one registry leaves the scheme
 half-wired. The symbols below were VERIFIED to exist.
 
 1. `data/<scheme>/`: the 7 SME YAMLs + README. KB docs go in `data/reference/`, tagged with the
-   canonical name.
+   canonical name. (NRLM's folder is upper-case `data/NRLM/`, as delivered.)
 2. `app/annotations.py`: `_SCHEME_DIRS`, `_FEW_SHOT_FILE`, `_FK_FILE`.
-3. `app/entity_resolver.py`: `_RESOLVER_FILE`, `_ACTIVITY_VIEWS`.
+3. `app/entity_resolver.py`: `_RESOLVER_FILE`, `_ACTIVITY_VIEWS`, `_AC_CONTENTS_SQL` +
+   `AC_CONTENTS_SOURCE` if the scheme answers assembly-constituency questions, and
+   `_DIMENSION_ALIASES` if the resolver file names a dimension differently from the six names
+   `load_all()` reads (`district`, `block`, `year`, `assembly_constituency`, `tranche_label`,
+   `cm_scheme`). NRLM needed the latter: its file says `constituency` and `formation_year`.
+   **Miss the alias and the dimension loads as empty, silently** — for NRLM that meant 55
+   constituencies resolving to nothing and AC questions falling back to the same-name block.
 4. `app/schema_context.py`: `SCHEME_CATALOG`, `SCHEME_METRICS`, `_<X>_TABLES/_RULES/_VOCAB`,
    `_SCHEME_BLOCKS`.
 5. `app/pipeline.py`:
@@ -307,7 +406,10 @@ half-wired. The symbols below were VERIFIED to exist.
    - `_CROSS_SCHEME_MONEY_SQL` if the scheme has money;
    - `_bank_clarification`;
    - `_AC_CAPABLE_SCHEMES` if AC is answerable;
-   - every regex whose scheme name is a prefix of the new one.
+   - every regex whose scheme name is a prefix of the new one;
+   - `_SCHEME_DISPLAY_NAME` and `_MEASURE_PLAIN` if the scheme joins the money ranking;
+   - the scheme-option lists in `_scheme_clarification` — **both** the generic ask and the
+     AC-specific (KI-148) ask, and note the generic option block appears **twice** in the file.
 6. `app/followups.py`: `_SCHEME_RX`, `_primary_schemes`, the knowledge ladder, a
    `_<x>_data()` builder + its dispatch.
 7. `app/edge.py`: scheme regexes, capability blurbs, `STARTERS`, `_DOMAIN_WORDS`.

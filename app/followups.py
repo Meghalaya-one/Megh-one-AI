@@ -51,6 +51,15 @@ _SCHEME_RX = {
         r"\bcmelevate[\s-]*(?:legacy|disbursements?)\b|"
         r"\blegacy[\s-]+cm[\s-]?elevate\b|\belevate[\s-]?legacy\b",
         re.IGNORECASE),
+    # Mirrors pipeline._SCHEME_NAME_PATTERN["NRLM"]. A bare "SHG" is deliberately
+    # NOT here: this map answers "which scheme did the user NAME", and the unit
+    # word does not name the scheme (see pipeline._NRLM_ONLY_TERMS).
+    "NRLM": re.compile(
+        r"\bnrlm\b|\bn\.r\.l\.m\b|\bday[\s-]?nrlm\b|\bnrlm[\s-]?shgs?\b|"
+        r"\baajeevika\b|\bajeevika\b|\bajivika\b|\bmsrls\b|\bsrlm\b|"
+        r"\bnational rural livelihoods? missions?\b|"
+        r"\bstate rural livelihoods? (?:society|missions?)\b",
+        re.IGNORECASE),
 }
 
 
@@ -71,7 +80,7 @@ def _primary_schemes(schemes: list[str], question: str) -> list[str]:
         return schemes
     named = [s for s, rx in _SCHEME_RX.items() if rx.search(question or "")]
     return named or ["MGNREGA", "PMAY-G", "Focus Plus", "CM Elevate", "Focus Legacy",
-                     "CM Elevate Legacy"]
+                     "CM Elevate Legacy", "NRLM"]
 
 
 # ── answer grain (read off the generated SQL's GROUP BY) ────────────────────
@@ -449,6 +458,53 @@ def _cmelevatelegacy_data(question: str, ents: dict, grain: str | None = None,
     return [{"label": q, "question": q} for q in out]
 
 
+def _nrlm_data(question: str, ents: dict, grain: str | None = None,
+               rows: list | None = None) -> list[dict]:
+    """NRLM next steps. Two NRLM-specific constraints shape every offer here:
+
+    1. NEVER offer money beside a year. RF and CIF are cumulative with no release
+       date, so "RF in FY 2021-22" is the one question this scheme cannot answer
+       (nrlm_schema_partitions.yaml; schema_context _NRLM_RULES rule 3). Fund
+       offers are therefore always worded "received to date" and carry no `gsuf`
+       year phrase, and the formation-year offer is a COUNT offer, never a money
+       one.
+    2. Never offer a trend. One snapshot, no history — so no "over the years",
+       no growth, no "since last extract"."""
+    scope = _scope_phrase(ents)
+    gsuf = _grain_suffix(ents, grain)
+    out: list[str] = []
+
+    # 1. The complementary NRLM figure, chosen from what was just asked.
+    if _asked(question, "revolving", " rf", "rf ", "cif", "community investment",
+              "fund", "money", "amount"):
+        # Money was asked -> offer the COUNT side, not another money cut.
+        out.append(f"How many SHGs have received the Revolving Fund{scope}{gsuf}?")
+    elif _asked(question, "member", "women", "woman", "female", "male", "men"):
+        out.append(f"What is the average number of members per SHG{scope}{gsuf}?")
+    elif _asked(question, "active", "inactive", "dormant", "defunct"):
+        out.append(f"What share of SHGs are active{scope}{gsuf}?")
+    elif _asked(question, "formed", "formation", "year"):
+        out.append(f"How many SHGs were formed in each financial year{scope}?")
+    elif _asked(question, "village"):
+        out.append(f"How many villages have an SHG{scope}?")
+    else:
+        out.append(f"How many SHG members are there{scope}{gsuf}?")
+
+    # 2. Drill one level finer than what the user is looking at.
+    d = _drill_down(ents, grain, rows)
+    if d:
+        out.append(d["question"])
+
+    # 3. Another NRLM figure — metric-driven, and never money-by-year.
+    _fill_metric(out, question, [
+        f"How many SHGs are there of each type — New, Revived and Pre-NRLM{scope}?",
+        f"What Revolving Fund and CIF have SHGs received to date{scope}?",
+        f"How many SHGs are active and how many inactive{scope}?",
+        f"What share of SHGs have received CIF{scope}?",
+    ])
+    return [{"label": q, "question": q} for q in out]
+
+
 def _cross_scheme_data(question: str, ents: dict, grain: str | None = None,
                        rows: list | None = None, schemes: list[str] | None = None) -> list[dict]:
     scope = _scope_phrase(ents)
@@ -552,6 +608,15 @@ _KNOWLEDGE_LADDER = {
          "How many individual schemes does CM-ELEVATE cover?"),
         (("apply", "registration", "how do i"), "How does someone apply for CM-ELEVATE?"),
     ],
+    "NRLM": [
+        (("what is", "about nrlm", "how does"), "What is NRLM and who runs it in Meghalaya?"),
+        (("eligib", "who can", "who qualifies", "join", "member"),
+         "Who can join an NRLM Self Help Group?"),
+        (("fund", "money", "revolving", "cif", "how much", "financial support"),
+         "What funds does an NRLM Self Help Group receive?"),
+        (("form", "start", "how do i", "registration"),
+         "How is a new Self Help Group formed under NRLM?"),
+    ],
 }
 def _knowledge(question: str, schemes: list[str]) -> list[dict]:
     out: list[str] = []
@@ -598,6 +663,8 @@ def build_followups(route: str, question: str, schemes: list[str],
             opts = _focuslegacy_data(q, ents, grain, rows)
         elif primary[0] == "CM Elevate Legacy":
             opts = _cmelevatelegacy_data(q, ents, grain, rows)
+        elif primary[0] == "NRLM":
+            opts = _nrlm_data(q, ents, grain, rows)
         else:
             opts = _mgnrega_data(q, ents, grain, rows)
     else:

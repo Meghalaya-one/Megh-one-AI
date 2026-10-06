@@ -44,7 +44,7 @@ def test_bare_focus_swap_keeps_the_word_focus():
 def test_remaining_schemes_excludes_the_previous_one_and_its_shared_kb_twin():
     out = p._rest_of_schemes_rewrite(_Prev("how to apply for cm elevate"),
                                      "give same like for remaining schemes")
-    assert out == "how to apply for MGNREGA, PMAY-G, Focus Plus and Focus Legacy"
+    assert out == "how to apply for MGNREGA, PMAY-G, Focus Plus, Focus Legacy and NRLM"
 
 
 def test_remaining_schemes_on_a_data_turn_keeps_cm_elevate_legacy():
@@ -55,7 +55,8 @@ def test_remaining_schemes_on_a_data_turn_keeps_cm_elevate_legacy():
 
 def test_all_schemes_lists_every_scheme_once_and_keeps_names_intact():
     out = p._rest_of_schemes_rewrite(_Prev("how to apply for cm elevate"), "same for all schemes")
-    assert out == "how to apply for MGNREGA, PMAY-G, Focus Plus, CM Elevate and Focus Legacy"
+    assert out == ("how to apply for MGNREGA, PMAY-G, Focus Plus, CM Elevate, "
+                   "Focus Legacy and NRLM")
 
 
 @pytest.mark.parametrize("followup", ["what about Focus Plus", "for 2024-25", "same for Ri Bhoi"])
@@ -92,4 +93,4 @@ def test_the_reported_conversation(monkeypatch):
         asyncio.run(p._run_pipeline("for focus", session=sess))
     assert pause.value.rule == "focus-scheme-ambiguous"
     r = ask("give same like for remaining schemes")
-    assert r["answer"] == "KB:MGNREGA,PMAY-G,Focus Plus,Focus Legacy"
+    assert r["answer"] == "KB:MGNREGA,PMAY-G,Focus Plus,Focus Legacy,NRLM"

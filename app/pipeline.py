@@ -583,6 +583,14 @@ _SCHEME_HEADLINE_OFFERS: "dict[str, list[tuple[str, str]]]" = {
                            "What is the total sanctioned amount under CM Elevate Legacy{scope}?"),
                           ("Total disbursed",
                            "What is the total amount disbursed under CM Elevate Legacy{scope}?")],
+    # NRLM's offers are deliberately COUNT-and-MEMBER first. A money offer that
+    # carried the {scope} year phrase would read as "RF in FY 2021-22", which is
+    # exactly the question this scheme cannot answer (money has no release date),
+    # so the fund offer is worded as the cumulative total it really is.
+    "NRLM": [("Number of SHGs", "How many SHGs are there{scope}?"),
+             ("Members", "How many SHG members are there{scope}?"),
+             ("Funds received to date",
+              "What Revolving Fund and CIF have SHGs received to date{scope}?")],
 }
 # CM Elevate (applications) records no financial year at all (SCHEME_METRICS),
 # so a carried year is left out of its offers rather than paused on again.
@@ -987,6 +995,19 @@ _SCHEME_NAME_PATTERN = {
         r"\bfocus[\s-]?legacy\b|\bfocuslegacy\b|\blegacy[\s-]?focus\b|"
         r"\bold[\s-]?focus\b|\bfocus[\s-]?pg\b|\bpg[\s-]?focus\b",
         re.IGNORECASE),
+    # NRLM = the Self Help Group register (National Rural Livelihoods Mission,
+    # run in the State by MSRLS). "DAY-NRLM" is the programme's full current name
+    # and "Aajeevika" / "SRLM" / "MSRLS" are the names officials use for the same
+    # thing. NOT matched here: a bare "SHG" or "self help group" — that is the
+    # UNIT this scheme counts, not its name, and CM Elevate also accepts SHG
+    # applicants, so a bare "SHG" must stay ambiguous and reach the scheme ask.
+    # It is handled as scheme-specific VOCABULARY in _NRLM_ONLY_TERMS instead.
+    "NRLM": re.compile(
+        r"\bnrlm\b|\bn\.r\.l\.m\b|\bday[\s-]?nrlm\b|\bnrlm[\s-]?shgs?\b|"
+        r"\baajeevika\b|\bajeevika\b|\bajivika\b|\bmsrls\b|\bsrlm\b|"
+        r"\bnational rural livelihoods? missions?\b|"
+        r"\bstate rural livelihoods? (?:society|missions?)\b",
+        re.IGNORECASE),
 }
 # Fuzzy fallback for a scheme name the exact regex above misses because it's
 # misspelled ("manrega", "pamay") — mirrors the RapidFuzz tolerance
@@ -1006,6 +1027,10 @@ _SCHEME_FUZZY_ALIASES = {
     "CM Elevate": ["cmelevate"],
     "Focus Legacy": ["focuslegacy"],
     "CM Elevate Legacy": ["cmelevatelegacy"],
+    # Only words of 5+ letters are fuzzy-matched (see _fuzzy_named_schemes), so
+    # the 4-letter "nrlm" can never be reached here and is deliberately absent:
+    # listing it would be dead weight. The longer spoken forms CAN be typo'd.
+    "NRLM": ["aajeevika", "ajeevika", "nrlmshg", "msrls"],
 }
 _FUZZY_SCHEME_ACCEPT = 80
 
@@ -1025,6 +1050,7 @@ _SCHEME_CANONICAL_SPELLING = {
     "MGNREGA": "MGNREGA", "PMAY-G": "PMAY-G",
     "Focus Plus": "Focus Plus", "CM Elevate": "CM Elevate",
     "Focus Legacy": "Focus Legacy", "CM Elevate Legacy": "CM Elevate Legacy",
+    "NRLM": "NRLM",
 }
 
 
@@ -1231,6 +1257,38 @@ _FOCUSLEGACY_ONLY_TERMS = re.compile(
 )
 
 
+# ── NRLM: the words only the SHG register can answer ──────────────────
+# NRLM is the only GROUP-grained membership fact in megh_db, so its vocabulary is
+# genuinely its own: no other scheme holds a Self Help Group, a Revolving Fund, a
+# Community Investment Fund or a formation year.
+#
+# "SHG" / "self help group" IS included here even though CM Elevate accepts SHG
+# applicants, because in CM Elevate an SHG is only an APPLICANT CATEGORY value
+# (applicant_category) while in NRLM it is the row itself: "how many SHGs" can
+# only sensibly mean the register. The scheme name itself is matched separately
+# by _SCHEME_NAME_PATTERN["NRLM"].
+#
+# NOT included, deliberately:
+#   * bare "members" / "women" — Focus Legacy counts PG memberships and Focus Plus
+#     pays individual members; a bare member word must stay ambiguous.
+#   * bare "fund" / "funds" / "amount" — five schemes hold money.
+#   * bare "active" / "inactive" — generic status words.
+# RF and CIF are spelled out because the acronyms are unambiguous in this corpus;
+# a bare "RF" is NRLM's Revolving Fund and nothing else in megh_db.
+_NRLM_ONLY_TERMS = re.compile(
+    r"\bnrlm\b|\bday[\s-]?nrlm\b|\baajeevika\b|\bajeevika\b|\bmsrls\b|\bsrlm\b|"
+    r"\bnational rural livelihoods? missions?\b|"
+    r"\bself[\s-]?help[\s-]?groups?\b|\bshgs?\b|\bshg[\s-]?codes?\b|"
+    r"\bshg[\s-]?names?\b|\bshg[\s-]?types?\b|\bshg[\s-]?members?\b|"
+    r"\brevolving[\s-]?funds?\b|\brf[\s-]?amounts?\b|"
+    r"\bcommunity[\s-]?investment[\s-]?funds?\b|\bcifs?\b|\bcif[\s-]?amounts?\b|"
+    r"\bpre[\s-]?nrlm\b|\brevived[\s-]?(?:shgs?|groups?)\b|"
+    r"\bformation[\s-]?(?:year|financial[\s-]?year|fy)\b|"
+    r"\byear[\s-]?(?:of[\s-]?)?formation\b|\bformed[\s-]?in[\s-]?(?:fy|19|20)\d",
+    re.IGNORECASE,
+)
+
+
 # ── The two CM Elevate datasets ─────────────────────────────────────────────
 # "CM Elevate" names TWO schemes that share nothing but the name
 # (cmelevatelegacy_entity_resolver.yaml scheme.disambiguation):
@@ -1347,6 +1405,7 @@ def _infer_scheme_from_terms(question: str) -> list[str] | None:
             ("CM Elevate", _CMELEVATE_ONLY_TERMS),
             ("Focus Legacy", _FOCUSLEGACY_ONLY_TERMS),
             ("CM Elevate Legacy", _CMELEVATELEGACY_ONLY_TERMS),
+            ("NRLM", _NRLM_ONLY_TERMS),
         ) if rx.search(question)
     ]
     # A CM Elevate sub-scheme word ("piggery", "dairy") belongs to BOTH CM
@@ -1389,12 +1448,14 @@ def _scheme_clarification(question: str) -> "ClarificationNeeded":
         # only these schemes hold a constituency (KI-148)
         return ClarificationNeeded(
             "Which scheme does your question concern? Assembly-constituency figures are held for "
-            "MGNREGA, Focus Legacy and CM Elevate Legacy.",
+            "MGNREGA, Focus Legacy, CM Elevate Legacy and NRLM.",
             options=[{"label": "MGNREGA (rural employment)", "question": _scheme_option_question(stem, "MGNREGA")},
                      {"label": "Focus Legacy (producer group payments)",
                       "question": _scheme_option_question(stem, "Focus Legacy")},
                      {"label": "CM Elevate Legacy (sanctions & disbursements)",
-                      "question": _scheme_option_question(stem, "CM Elevate Legacy")}],
+                      "question": _scheme_option_question(stem, "CM Elevate Legacy")},
+                     {"label": "NRLM (Self Help Groups)",
+                      "question": _scheme_option_question(stem, "NRLM")}],
             rule="scheme-not-specified")
     options = [
         {"label": "MGNREGA (rural employment)",
@@ -1409,14 +1470,16 @@ def _scheme_clarification(question: str) -> "ClarificationNeeded":
          "question": _scheme_option_question(stem, "Focus Legacy")},
         {"label": "CM Elevate Legacy (sanctions & disbursements)",
          "question": _scheme_option_question(stem, "CM Elevate Legacy")},
+        {"label": "NRLM (Self Help Groups)",
+         "question": _scheme_option_question(stem, "NRLM")},
         {"label": "Compare across schemes",
          "question": (f"{stem} across MGNREGA, PMAY-G, Focus Plus, CM Elevate, "
-                      f"Focus Legacy and CM Elevate Legacy")},
+                      f"Focus Legacy, CM Elevate Legacy and NRLM")},
     ]
     return ClarificationNeeded(
         "Which scheme does your question concern — MGNREGA, PMAY-G, Focus Plus, "
-        "CM Elevate, Focus Legacy, or CM Elevate Legacy? Please select one, or choose "
-        "to compare across schemes.",
+        "CM Elevate, Focus Legacy, CM Elevate Legacy, or NRLM? Please select one, or "
+        "choose to compare across schemes.",
         options=options,
         rule="scheme-not-specified",
     )
@@ -2442,14 +2505,112 @@ async def _focus_legacy_list_total(sql: str, rows: list[dict]) -> "tuple[int, st
     return int(n), subject
 
 
+# ── Focus Legacy: "Are there any duplicate Producer Groups?" (KI-187) ───────
+# The product owner's definition (confirmed 2026-10-07): a producer group PAID
+# MORE THAN ONCE is a duplicate — 2,655 of 11,906 statewide, with no year split.
+# This replaces the 2026-09-25 TC-12 reading ("0 duplicate payment records",
+# read as "no" and "yes" at once) and the 2026-10-06 same-year-only count (7),
+# which the owner then withdrew. A year / place in the question narrows the rows
+# first, so "in FY 2025-26" counts groups paid more than once in that year. The
+# answer is fully determined by the data, so it is written here from a
+# parameter-bound query, never composed. "Duplicate PAYMENTS / records" questions
+# are a different question (identical payment rows, 0) and keep the model path.
+_DUPLICATE_GROUPS_Q = re.compile(
+    r"\bduplicat\w*\s+(?:producer\s+groups?|pgs?|groups?)\b|"
+    r"\b(?:producer\s+groups?|pgs?|groups?)\b[^?.]{0,40}\bduplicat\w*|"
+    r"\brepeated\s+(?:producer\s+)?groups?\b", re.IGNORECASE)
+_DUPLICATE_RECORDS_Q = re.compile(r"\b(?:payments?|records?|entries|rows?|remittances?)\b", re.IGNORECASE)
+_FL_DUP_FILTERS = {"district": "lgd_district", "block": "lgd_block", "village_code": "village_code",
+                   "year_key": "financial_year_short"}
+
+
+def _is_duplicate_groups_question(question: str) -> bool:
+    q = question or ""
+    return bool(_DUPLICATE_GROUPS_Q.search(q)) and not _DUPLICATE_RECORDS_Q.search(q)
+
+
+def _fl_fy_label(year_key: int) -> str:
+    return f"{int(year_key)}-{(int(year_key) + 1) % 100:02d}"
+
+
+async def _focus_legacy_duplicate_groups_answer(question: str, resolved: dict,
+                                                display: dict) -> "dict | None":
+    """Duplicate producer groups = groups paid more than once, among the rows of
+    the place / year the question names (district, block, village, year), else
+    statewide across every year. None when the question is not this shape or
+    carries a filter this answer does not apply (a constituency, a year list, …)
+    — the model path then answers it."""
+    if not _is_duplicate_groups_question(question):
+        return None
+    resolved = resolved or {}
+    if any(v for k, v in resolved.items() if k not in _FL_DUP_FILTERS):
+        return None
+    where, params = [], []
+    for key, col in _FL_DUP_FILTERS.items():
+        val = resolved.get(key)
+        if val in (None, "", [], ()):
+            continue
+        if isinstance(val, (list, tuple)):
+            return None
+        if key == "village_code":
+            params.append(int(val))
+            where.append(f"{col} = ${len(params)}")
+        elif key == "year_key":
+            params.append(_fl_fy_label(val))
+            where.append(f"{col} = ${len(params)}")
+        else:
+            params.append(str(val).upper())
+            where.append(f"UPPER({col}) = ${len(params)}")
+    cond = (" WHERE " + " AND ".join(where)) if where else ""
+    sql = ("SELECT pg_id, MAX(pg_name) AS pg_name, MAX(lgd_district) AS district, MAX(lgd_block) AS block, "
+           "COUNT(*) AS payments, SUM(amount_disbursed) AS amount_disbursed, "
+           "STRING_AGG(DISTINCT financial_year_short, ', ' ORDER BY financial_year_short) AS financial_years "
+           f"FROM curated.v_focus_legacy{cond} GROUP BY pg_id ORDER BY COUNT(*) DESC, pg_id")
+    groups = await fetch_rows(sql, params)
+    dups = [g for g in groups if int(g["payments"]) > 1]
+    total_groups, total_payments = len(groups), sum(int(g["payments"]) for g in groups)
+    bits = [f"{display[k]}{suffix}" for k, suffix in
+            (("village", " village"), ("block", " block"), ("district", "")) if display.get(k)]
+    place = (f" in {', '.join(bits)}" if bits else "") + (f" in {display['year']}" if display.get("year") else "")
+    if not groups:
+        answer = f"No Focus Legacy producer groups are recorded{place}, so there are no duplicates to report."
+    elif not dups:
+        answer = (f"No — none of the {total_groups:,} Focus Legacy producer groups{place} is a duplicate: "
+                  f"each was paid exactly once ({total_payments:,} payments).")
+    else:
+        by_times = {}
+        for g in dups:
+            by_times[int(g["payments"])] = by_times.get(int(g["payments"]), 0) + 1
+        split = ", ".join(f"{n:,} paid {'twice' if t == 2 else f'{t} times'}"
+                          for t, n in sorted(by_times.items()))
+        dup_rows = sum(int(g["payments"]) for g in dups)
+        answer = (f"Yes — {len(dups):,} of the {total_groups:,} Focus Legacy producer groups{place} are "
+                  f"duplicates: each was paid more than once ({split}). Together they account for "
+                  f"{dup_rows:,} of the {total_payments:,} payment records; the other "
+                  f"{total_groups - len(dups):,} groups were paid once. The duplicate groups are listed in the table.")
+    rows = [{"pg_id": g["pg_id"], "pg_name": g["pg_name"], "district": g["district"], "block": g["block"],
+             "payments": int(g["payments"]), "amount_disbursed": _as_number(g["amount_disbursed"]),
+             "financial_years": g["financial_years"]} for g in dups]
+    logger.info("Focus Legacy duplicate groups: %d of %d (filters %s)", len(dups), total_groups, where or "none")
+    return {"route": "data", "intent": "DATA", "confidence": "high", "schemes": ["Focus Legacy"],
+            "resolved_entities": resolved, "sql": sql, "sql_query": sql, "row_count": len(rows),
+            "rows": rows[:20], "data": rows, "answer": answer}
+
+
 def _focus_legacy_answer_notes(question: str) -> list[str]:
+    if _is_duplicate_groups_question(question):
+        # the model path only sees this shape when a year / AC filter is attached
+        return ["A DUPLICATE producer group is a group PAID MORE THAN ONCE (product owner's definition, "
+                "confirmed 2026-10-07): count the pg_ids with more than one payment in the filtered rows "
+                "and call them duplicates. Do not lead with identical payment records."]
     if not _DUPLICATE_Q.search(question or ""):
         return []
-    return ["A producer group paid more than once is a REPEAT PAYMENT in a later tranche, NOT a "
-            "duplicate group — never call those groups duplicates. A duplicate RECORD would be the "
-            "same pg_id paid twice on the same date; report that count as the duplicates figure "
-            "(0 means there are no duplicates), and mention the repeat-paid groups separately as "
-            "legitimate repeat payments."]
+    # A question about duplicate PAYMENTS / records (not groups): an identical record
+    # is the same pg_id paid twice on the same date. Groups paid more than once are
+    # duplicate GROUPS by the product owner's definition (KI-187), not duplicate records.
+    return ["A duplicate PAYMENT RECORD is the same pg_id paid twice on the same date; report that "
+            "count as the duplicate-records figure (0 means none). If the answer also mentions groups "
+            "paid more than once, call them duplicate producer groups (the product owner's definition)."]
 
 
 # ── Focus Legacy: rows a per-place breakdown left out (KI-145) ──────────────
@@ -3001,6 +3162,11 @@ _SCHEME_USER_SUMMARY = {
                          "poultry, dairy, warehouse, tourism vehicles and more) and the "
                          "subsidy and loans actually paid, FY 2024-25 and 2025-26. "
                          "Different from CM Elevate, which holds the applications.",
+    "NRLM": "National Rural Livelihoods Mission (DAY-NRLM), run in Meghalaya by MSRLS "
+            "— the register of Self Help Groups: 40,629 groups with their members, "
+            "type, active status, the year each was formed, and the Revolving Fund and "
+            "Community Investment Fund each has received to date. One row is one GROUP, "
+            "not one person, and the figures are a snapshot, not a yearly series.",
 }
 
 # "What schemes are available?" / "what can you help with?" — answered directly
@@ -3249,6 +3415,12 @@ _SCHEME_FIT = {
         "get support for a venture in one of 15 sectors — piggery, poultry, dairy, goat "
         "farming, warehousing, tourism vehicles and more — or under the \"Any Business "
         "Venture\" category; you apply on the MeghalayaOne portal."),
+    "NRLM": (
+        "joining a women's Self Help Group",
+        "rural women organise into a Self Help Group of usually 10 to 20 members; the "
+        "group then receives a Revolving Fund (normally ₹15,000) and, later, a larger "
+        "Community Investment Fund for its members' livelihood activity — the group "
+        "is formed and supported through MSRLS and the C&RD Block office."),
 }
 # (profile, what it says about the user, pattern, schemes in order of fit)
 _PROFILE_RULES = (
@@ -3747,9 +3919,11 @@ def _unsupported_scheme_clarification(question: str, name: str) -> "Clarificatio
          "question": _scheme_option_question(stem, "Focus Legacy")},
         {"label": "CM Elevate Legacy (sanctions & disbursements)",
          "question": _scheme_option_question(stem, "CM Elevate Legacy")},
+        {"label": "NRLM (Self Help Groups)",
+         "question": _scheme_option_question(stem, "NRLM")},
         {"label": "Compare across schemes",
          "question": (f"{stem} across MGNREGA, PMAY-G, Focus Plus, CM Elevate, "
-                      f"Focus Legacy and CM Elevate Legacy")},
+                      f"Focus Legacy, CM Elevate Legacy and NRLM")},
     ]
     # Names the scheme asked for, says plainly that it is outside what is
     # loaded, then points somewhere useful. Deliberately about SCHEME COVERAGE
@@ -4501,6 +4675,25 @@ _SCHEME_DATA_YEARS: dict[str, list[str]] = {
     # "all financial years" answer still includes them because it applies no
     # year filter (cmelevatelegacy_schema_partitions.yaml year_key rules).
     "CM Elevate Legacy": ["2024-25", "2025-26"],
+    # NRLM's year is the year the SHG was FORMED, and NOTHING else: there is no
+    # reporting year, no release date and no extract-date column
+    # (nrlm_schema_partitions.yaml). 30 formation years are held, 1984-85..2022-23.
+    #
+    # The FULL span is listed, not just the dense tail, because this one list
+    # feeds BOTH the year chips AND the out-of-range guard: trimming it to
+    # 2014-15+ would make the guard refuse "SHGs formed in 2008-09", which is a
+    # real question with a real answer. 931 SHGs sit before 2014-15 and the
+    # per-year SQL groups them as 'before 2014-15' (schema_context rule 14).
+    #
+    # CRITICAL: a year here is valid ONLY for SHG-count, member and formation
+    # questions. A year beside MONEY is not a narrower question but a DIFFERENT
+    # one, because RF and CIF carry no date — see _NRLM_MONEY_YEAR_RX /
+    # _nrlm_money_year_clarification() and schema_context _NRLM_RULES rule 3.
+    "NRLM": ["1984-85", "1998-99", "1999-00", "2000-01", "2001-02", "2002-03",
+             "2003-04", "2004-05", "2005-06", "2006-07", "2007-08", "2008-09",
+             "2009-10", "2010-11", "2011-12", "2012-13", "2013-14", "2014-15",
+             "2015-16", "2016-17", "2017-18", "2018-19", "2019-20", "2020-21",
+             "2021-22", "2022-23"],
 }
 
 
@@ -4535,6 +4728,13 @@ async def refresh_scheme_years() -> None:
         "CM Elevate Legacy": (
             "SELECT DISTINCT year_key FROM curated.v_cm_elevate_disbursement "
             "WHERE year_key IS NOT NULL"
+        ),
+        # NRLM probes the FORMATION year key. It is the only year the register
+        # has, so the chips and the guard track it — but a year is still only
+        # answerable for counts, members and formation, never for money.
+        "NRLM": (
+            "SELECT DISTINCT formation_year_key AS year_key FROM curated.v_nrlm "
+            "WHERE formation_year_key IS NOT NULL"
         ),
         # CM Elevate deliberately has no entry here — curated.v_cm_elevate has no
         # year_key column at all (not merely NULL), so there is nothing to probe.
@@ -4948,13 +5148,19 @@ SELECT 'CM Elevate Legacy' AS scheme,
        ROUND(SUM(total_disbursement) / 1e7, 2) AS amount_crore,
        'subsidy and loan disbursed to sanctioned applicants, rupees' AS measure_semantics
 FROM curated.v_cm_elevate_disbursement
+UNION ALL
+SELECT 'NRLM' AS scheme,
+       ROUND(SUM(revolving_fund_amount + cif_amount) / 1e7, 2) AS amount_crore,
+       'Revolving Fund plus CIF held by SHGs to date, cumulative with no year, rupees'
+           AS measure_semantics
+FROM curated.v_nrlm
 ORDER BY amount_crore DESC
 """.strip()
 
 _SCHEME_DISPLAY_NAME = {"MGNREGA": "MGNREGA", "PMAY": "PMAY-G", "PMAY-G": "PMAY-G",
                         "Focus Plus": "Focus Plus", "CM Elevate": "CM Elevate",
                         "Focus Legacy": "Focus Legacy",
-                        "CM Elevate Legacy": "CM Elevate Legacy"}
+                        "CM Elevate Legacy": "CM Elevate Legacy", "NRLM": "NRLM"}
 # Plain-English rendering of each scheme's measure_semantics. The stored strings
 # are written for the SQL prompt ("annual FLOW (lakh rupees)", "an EVENT, not a
 # clean annual flow") and read as database jargon in a chat bubble; the caveat
@@ -4965,6 +5171,10 @@ _MEASURE_PLAIN = {
     "Focus Plus": "cash disbursed to farmers (DBT)",
     "Focus Legacy": "cash remitted to producer groups",
     "CM Elevate Legacy": "subsidy and loans disbursed to sanctioned applicants",
+    # Worded as a STOCK, not a flow: every other scheme's figure is money moved in
+    # a period, NRLM's is money the groups hold to date. The ranking answer must
+    # not read as "NRLM spent this much this year".
+    "NRLM": "Revolving Fund and CIF held by SHGs to date (cumulative, no year)",
 }
 
 
@@ -6148,7 +6358,10 @@ _AC_INCAPABLE_METRIC = re.compile(
 # Legacy reaches it the same way as Focus Legacy (geography_key -> dim_geography,
 # a declared FK), and the join matches the source workbook's own
 # mapped_constituency_name exactly (Mairang 52 = 52, verified 2026-09-25).
-_AC_CAPABLE_SCHEMES = ("MGNREGA", "Focus Legacy", "CM Elevate Legacy")
+# NRLM carries constituency_name_raw / constituency_number_raw on v_nrlm itself
+# (55 constituencies; NULL on the 2,032 SHGs that have no village), so it needs no
+# dim_geography join — see entity_resolver._AC_CONTENTS_SQL["NRLM"].
+_AC_CAPABLE_SCHEMES = ("MGNREGA", "Focus Legacy", "CM Elevate Legacy", "NRLM")
 
 
 # The tail a village-disambiguation chip writes: ", RERAPARA block, SOUTH WEST
@@ -9100,7 +9313,16 @@ def _pmay_facts_query(question: str, schemes: list[str], resolved: dict,
         return None
 
     params: list = []
-    where = ["NOT is_placeholder"]
+    # Beneficiaries include the records with a sanctioned amount of 0 (product decision
+    # 2026-10-03, KI-127: LASKEIN 5,251 = every record, not 5,232). Only the beneficiary
+    # count changes: for a beneficiary question the placeholder exclusion moves from WHERE
+    # into every OTHER column, so houses, money, stages and release counts are unchanged
+    # (a ₹0 / ₹0 record would otherwise count as "fully paid"). Other questions keep the
+    # exact same SQL.
+    _all_benef = bool(re.search(r"beneficiar", question or "", re.I)) and "houses" in metrics
+    _P = "NOT is_placeholder AND " if _all_benef else ""
+    _PF = " FILTER (WHERE NOT is_placeholder)" if _all_benef else ""
+    where = [] if _all_benef else ["NOT is_placeholder"]
     if dim == "village":
         params.append([int(e) for e in ents]); where.append(f"village_code = ANY(${len(params)}::int[])")
         key, name = "village_code", "MAX(lgd_village_name) AS name, MAX(lgd_block) AS block, MAX(lgd_district) AS district"
@@ -9125,25 +9347,27 @@ def _pmay_facts_query(question: str, schemes: list[str], resolved: dict,
     rel = "COALESCE(amount_released, 0)"
     cols = [
         f"{key} AS entity_key", name,
-        "COUNT(*) AS houses",
-        "COALESCE(SUM(sanctioned_amount), 0) AS sanctioned",
-        f"COALESCE(SUM({rel}), 0) AS released",
-        f"COALESCE(SUM({rel}) FILTER (WHERE sanctioned_amount > 0), 0) AS released_on_sanctioned",
-        "COALESCE(SUM(sanctioned_amount) FILTER (WHERE sanctioned_amount > 0), 0) AS sanctioned_positive",
-        "COUNT(*) FILTER (WHERE is_completed) AS completed",
-        "COUNT(*) FILTER (WHERE NOT COALESCE(is_completed, FALSE)) AS incomplete",
-        "COUNT(*) FILTER (WHERE status_name IS NULL) AS no_status",
-        f"COUNT(*) FILTER (WHERE {rel} >= sanctioned_amount) AS full_release",
-        f"COUNT(*) FILTER (WHERE {rel} > 0 AND {rel} < sanctioned_amount) AS part_release",
-        f"COUNT(*) FILTER (WHERE {rel} = 0) AS no_release",
-        f"COUNT(*) FILTER (WHERE {rel} >= sanctioned_amount AND NOT COALESCE(is_completed, FALSE)) AS full_not_done",
-        "COUNT(DISTINCT sanction_no) AS sanction_numbers",
+        f"COUNT(*){_PF} AS houses",
+        "COUNT(*) AS beneficiaries",
+        f"COALESCE(SUM(sanctioned_amount){_PF}, 0) AS sanctioned",
+        f"COALESCE(SUM({rel}){_PF}, 0) AS released",
+        f"COALESCE(SUM({rel}) FILTER (WHERE {_P}sanctioned_amount > 0), 0) AS released_on_sanctioned",
+        f"COALESCE(SUM(sanctioned_amount) FILTER (WHERE {_P}sanctioned_amount > 0), 0) AS sanctioned_positive",
+        f"COUNT(*) FILTER (WHERE {_P}is_completed) AS completed",
+        f"COUNT(*) FILTER (WHERE {_P}NOT COALESCE(is_completed, FALSE)) AS incomplete",
+        f"COUNT(*) FILTER (WHERE {_P}status_name IS NULL) AS no_status",
+        f"COUNT(*) FILTER (WHERE {_P}{rel} >= sanctioned_amount) AS full_release",
+        f"COUNT(*) FILTER (WHERE {_P}{rel} > 0 AND {rel} < sanctioned_amount) AS part_release",
+        f"COUNT(*) FILTER (WHERE {_P}{rel} = 0) AS no_release",
+        f"COUNT(*) FILTER (WHERE {_P}{rel} >= sanctioned_amount AND NOT COALESCE(is_completed, FALSE)) AS full_not_done",
+        f"COUNT(DISTINCT sanction_no){_PF} AS sanction_numbers",
     ]
     for st, c in _PMAY_STAGE_COL.items():
-        cols.append(f"COUNT(*) FILTER (WHERE status_name = '{st}') AS {c}")
-        cols.append(f"COUNT(*) FILTER (WHERE status_name = '{st}' AND {rel} >= sanctioned_amount) AS fnd_{c}")
+        cols.append(f"COUNT(*) FILTER (WHERE {_P}status_name = '{st}') AS {c}")
+        cols.append(f"COUNT(*) FILTER (WHERE {_P}status_name = '{st}' AND {rel} >= sanctioned_amount) AS fnd_{c}")
     group = "" if dim == "state" else f"\nGROUP BY {key}"
-    sql = ("SELECT " + ",\n       ".join(cols) + "\nFROM curated.v_pmay\nWHERE " + "\n  AND ".join(where) + group)
+    sql = ("SELECT " + ",\n       ".join(cols) + "\nFROM curated.v_pmay"
+           + ("\nWHERE " + "\n  AND ".join(where) if where else "") + group)
     shown = sql
     for i, p in reversed(list(enumerate(params, 1))):
         lit = (("ARRAY[" + ", ".join(str(x) if isinstance(x, int) else "'" + str(x).replace("'", "''") + "'"
@@ -9152,9 +9376,16 @@ def _pmay_facts_query(question: str, schemes: list[str], resolved: dict,
         shown = re.sub(rf"\${i}(?:::\w+\[\])?(?!\d)", lit, shown)
     return {"sql": sql, "params": params, "shown": shown, "metrics": metrics, "dim": dim,
             "entities": ents, "year_key": None if calendar_year is not None else yk, "date": day, "stages": stages,
-            "calendar_year": calendar_year, "bare_year": bare_year,
+            "calendar_year": calendar_year, "bare_year": bare_year, "all_beneficiaries": _all_benef,
             "word": "beneficiaries" if re.search(r"beneficiar", question or "", re.I) else "houses",
             "question": question}
+
+
+def _pmay_head(spec: dict, row: dict) -> int:
+    """The count a "houses"/"beneficiaries" figure shows: every record (zero-sanction
+    ones included) for a beneficiary question, houses with a sanction otherwise (KI-127)."""
+    v = row.get("beneficiaries") if spec.get("all_beneficiaries") else None
+    return int(row["houses"] if v is None else v)
 
 
 def _pmay_money(v) -> str:
@@ -9235,7 +9466,7 @@ def _pmay_stage_split(row: dict, prefix: str = "") -> str:
 
 def _pmay_lines(spec: dict, row: dict) -> list[str]:
     """One line per requested metric for one entity."""
-    h = int(row["houses"])
+    h = _pmay_head(spec, row)
     word = spec["word"]
     L: list[str] = []
     for m in spec["metrics"]:
@@ -9335,6 +9566,9 @@ def _pmay_display_rows(spec: dict, rows: list[dict]) -> list[dict]:
                     if int(r.get(c) or 0):
                         d[st] = int(r[c])
                 continue
+            if m == "houses" and spec.get("all_beneficiaries"):
+                d["beneficiaries"] = _pmay_head(spec, r)      # every record, zero-sanction ones too (KI-127)
+                continue
             for col, fn in _PMAY_ROW_COLS.get(m, []):
                 d[col] = fn(r)
         out.append(d)
@@ -9348,12 +9582,12 @@ def _pmay_facts_answer(spec: dict, rows: list[dict]) -> "str | None":
     ordered = []
     for e in spec["entities"]:
         r = by_key.get(str(e).upper())
-        if r is None or not int(r["houses"]):
+        if r is None or not _pmay_head(spec, r):
             if (spec.get("date") is None and spec.get("year_key") is None and spec.get("calendar_year") is None
                     and not spec.get("stages")):
                 return None          # the place holds no PMAY-G rows under this name: let the model path handle it
             r = r or {"entity_key": e, "name": e, "houses": 0, **{k: 0 for k in (
-                "sanctioned", "released", "released_on_sanctioned", "sanctioned_positive", "completed", "incomplete",
+                "beneficiaries", "sanctioned", "released", "released_on_sanctioned", "sanctioned_positive", "completed", "incomplete",
                 "no_status", "full_release", "part_release", "no_release", "full_not_done", "sanction_numbers")},
                 **{c: 0 for c in _PMAY_STAGE_COL.values()}, **{"fnd_" + c: 0 for c in _PMAY_STAGE_COL.values()}}
         ordered.append(r)
@@ -9362,7 +9596,7 @@ def _pmay_facts_answer(spec: dict, rows: list[dict]) -> "str | None":
     if len(ordered) == 1:
         r = ordered[0]
         where = "Meghalaya (statewide)" if spec["dim"] == "state" else _pmay_entity_name(spec, r)
-        if not int(r["houses"]):
+        if not _pmay_head(spec, r):
             return (f"No PMAY-G houses were sanctioned in {where} {period}{stage_note}: 0 houses — there are no "
                     "PMAY-G records for that period, so every figure is zero.")
         lines = _pmay_lines(spec, r)
@@ -9381,7 +9615,9 @@ def _pmay_facts_answer(spec: dict, rows: list[dict]) -> "str | None":
         if m == "status" or m not in _PMAY_CMP:
             continue
         fn, label, money = _PMAY_CMP[m]
-        vals = [fn(r) for r in ordered]
+        vals = [(_pmay_head(spec, r) if m == "houses" else fn(r)) for r in ordered]
+        if m == "houses" and spec.get("all_beneficiaries"):
+            label = "beneficiaries"
         if any(v is None for v in vals):
             continue
         if len(ordered) == 2:
@@ -9965,6 +10201,30 @@ _GEO_LITERAL_RE = re.compile(
 )
 
 
+_CME_FOLDED_GEO_RE = re.compile(r"\b(?:LOWER|UPPER)\s*\(\s*((?:\w+\.)?lgd_(?:district|block))\s*\)(?=\s*(?:=|!=|<>|\bIN\b))",
+                                re.IGNORECASE)
+_CME_LEVEL_LITERAL_RE = re.compile(r"(?:(?:LOWER|UPPER)\s*\(\s*)?((?:\w+\.)?current_level)\s*\)?\s*=\s*"
+                                   r"'\s*level\s*[-_ ]?\s*(\d)\s*'", re.IGNORECASE)
+
+
+def _cm_elevate_case_safe_literals(schemes: list[str], sql: str) -> str:
+    """KI-186 live re-test (2026-10-05, "pending at level 1 in North Garo Hills"):
+    the generator wrote LOWER(lgd_district) = 'NORTH GARO HILLS' — a lower-cased
+    column against an upper-case value can never match — and the verifier rejected
+    it on all 4 attempts ("couldn't build a working query"); another run wrote
+    current_level = 'level 1' (stored 'level1' / 'Level1') and answered a false 0
+    against 1,624. lgd_district / lgd_block are stored upper-case, so the fold is
+    dropped (_uppercase_geo_literals then upper-cases the value); a level literal
+    becomes the canonical LOWER(current_level) = 'levelN'."""
+    if schemes != ["CM Elevate"] or not sql:
+        return sql
+    out = _CME_FOLDED_GEO_RE.sub(lambda m: m.group(1), sql)
+    out = _CME_LEVEL_LITERAL_RE.sub(lambda m: f"LOWER({m.group(1)}) = 'level{m.group(2)}'", out)
+    if out != sql:
+        logger.info("CM Elevate: case-folded district/block or level literal made matchable (KI-186)")
+    return out
+
+
 def _uppercase_geo_literals(sql: str) -> str:
     changed = _GEO_LITERAL_RE.sub(lambda m: m.group("pre") + m.group("lits").upper(), sql)
     if changed != sql:
@@ -10294,23 +10554,55 @@ _CME_LEVEL_PENDING_Q = re.compile(
 _CME_ON_HOLD_PRED = r"(?:\w+\.)?data_verified\s*=\s*'On Hold'"
 
 
+_CME_FILE_PENDING_PRED = "scheme_specific ->> 'file_status' = 'Pending'"
+_CME_FILE_PENDING_RE = re.compile(r"(?:\w+\.)?scheme_specific\s*->>\s*'file_status'\s*=\s*'Pending'", re.IGNORECASE)
+
+
 def _cm_elevate_level_pending(question: str, schemes: list[str], sql: str) -> str:
     """KI-070 (CM-ELEVATE-OFF-018a): "applications pending at level 2" was read
     as level 2 AND data_verified = 'On Hold' — 0 rows (no level-2 application
-    is on hold) — and composed as "the data doesn't cover" it. An application
-    pending AT a level is one whose file currently sits at that level
-    (current_level); all 165 level-2 applications have file_status 'Pending'.
-    Drop the On Hold conjunct when the level itself is the scope. An explicit
-    "on hold" in the question keeps it."""
+    is on hold) — and composed as "the data doesn't cover" it. Drop the On Hold
+    conjunct when the level itself is the scope. An explicit "on hold" in the
+    question keeps it.
+    KI-186 (user decision 2026-10-05, screenshot "unique applications pending at
+    level 1 for all of Meghalaya" -> 8,372 = every level-1 file): pending AT a
+    level = the file sits at that level (current_level) AND its decision state is
+    still Pending (scheme_specific ->> 'file_status' = 'Pending'), so the 64
+    Rejected and 1 Approved level-1 files are not "pending" — level 1 = 8,307.
+    current_file_status holds no pending value (forward / sendback / resubmit).
+    Plain "pending" with no level stays data_verified = 'On Hold' (KI-074)."""
     if (schemes != ["CM Elevate"] or not sql or not _CME_LEVEL_PENDING_Q.search(question or "")
             or re.search(r"\bon[\s-]?hold\b", question or "", re.IGNORECASE)
-            or not re.search(r"\bcurrent_level\b", sql, re.IGNORECASE)
-            or not re.search(_CME_ON_HOLD_PRED, sql, re.IGNORECASE)):
+            or not re.search(r"\bcurrent_level\b", sql, re.IGNORECASE)):
         return sql
-    out = _drop_where_conjunct(sql, _CME_ON_HOLD_PRED)
-    if out != sql:
-        logger.info("CM Elevate: 'pending at level N' — dropped the On Hold filter, level is the scope")
+    out = sql
+    if re.search(_CME_ON_HOLD_PRED, out, re.IGNORECASE):
+        out = _drop_where_conjunct(out, _CME_ON_HOLD_PRED)
+        if out != sql:
+            logger.info("CM Elevate: 'pending at level N' — dropped the On Hold filter, level is the scope")
+    if not _CME_FILE_PENDING_RE.search(out) and re.search(_CME_LEVEL_PRED, out, re.IGNORECASE):
+        # every level test (WHERE or COUNT FILTER) carries the Pending state with it
+        out = re.sub(_CME_LEVEL_PRED, lambda m: f"({m.group(0)} AND {_CME_FILE_PENDING_PRED})", out,
+                     flags=re.IGNORECASE)
+        logger.info("CM Elevate: 'pending at level N' — added file_status = 'Pending' (KI-186)")
     return out
+
+
+_CME_UNIQUE_Q = re.compile(r"\b(?:unique|distinct)\s+(?:cm\s+elevate\s+)?(?:applications?|requests?|records?)\b",
+                           re.IGNORECASE)
+_CME_COUNT_STAR_RE = re.compile(r"\bCOUNT\s*\(\s*\*\s*\)", re.IGNORECASE)
+
+
+def _cm_elevate_unique_applications(question: str, schemes: list[str], sql: str) -> str:
+    """KI-186 (same screenshot): "unique applications" came back as COUNT(*)
+    (8,372 rows) although the vocabulary maps it to COUNT(DISTINCT request_id) —
+    request_id repeats (27 duplicates). Only an explicit "unique / distinct
+    applications" is rewritten; a plain "applications" stays the row count."""
+    if schemes != ["CM Elevate"] or not sql or not _CME_UNIQUE_Q.search(question or "") \
+            or not _CME_COUNT_STAR_RE.search(_mask_sql_literals(sql)):
+        return sql
+    logger.info("CM Elevate: 'unique applications' — COUNT(*) -> COUNT(DISTINCT request_id) (KI-186)")
+    return _CME_COUNT_STAR_RE.sub("COUNT(DISTINCT request_id)", sql)
 
 
 # Product decision 2026-09-28 (tester sheet OFF-015/016/017/030): CM Elevate
@@ -10410,6 +10702,59 @@ def _cm_elevate_pending_without_level(question: str, schemes: list[str], sql: st
     # current_level = 'level12' (final pass 2026-09-28, KI-120)
     logger.info("CM Elevate: plain 'pending' was filtered on current_level — restored data_verified = 'On Hold'")
     return re.sub(_CME_ANY_LEVEL_PRED, "data_verified = 'On Hold'", sql, flags=re.IGNORECASE)
+
+
+_CME_FILE_STATUS_WORDS_Q = re.compile(r"\bstatus\b|sen[dt][\s-]*back|\bforward\w*|\bresubmit\w*|\blevels?\b|\bstage\b",
+                                      re.IGNORECASE)
+
+
+def _cm_elevate_plain_pending_file_status(question: str, schemes: list[str], sql: str) -> str:
+    """KI-186 regression check (2026-10-05): after the "pending at level N" rule was
+    added to the prompt, "Which CM ELEVATE programs have the highest number of
+    pending applications?" came back 4 times in 6 as
+    WHERE LOWER(current_file_status) LIKE 'sendback%' OR current_file_status IS NULL
+    ("Tourism Vehicle 89" against the true On Hold leader Piggery 472). A plain
+    "pending" (no level / stage / status / sent-back word) is data_verified =
+    'On Hold' (KI-074): a WHERE whose conjunct tests only current_file_status is
+    swapped back. Anything mixing other columns into that test is left alone."""
+    q = question or ""
+    if (schemes != ["CM Elevate"] or not sql or not re.search(r"\bpending\b|\bpendency\b", q, re.IGNORECASE)
+            or _CME_FILE_STATUS_WORDS_Q.search(q) or re.search(r"on[\s-]?hold", q, re.IGNORECASE)
+            or re.search(_CME_ON_HOLD_PRED, sql, re.IGNORECASE)):
+        return sql
+    span = _top_level_where_span(sql)
+    if not span:
+        return sql
+    masked = _mask_sql_literals(sql)
+    body_m = masked[span[1]:span[2]]
+    # top-level AND split (parentheses kept whole)
+    parts, depth, start = [], 0, 0
+    for m in re.finditer(r"[()]|\bAND\b", body_m, re.IGNORECASE):
+        if m.group(0) == "(":
+            depth += 1
+        elif m.group(0) == ")":
+            depth -= 1
+        elif depth == 0:
+            parts.append((start, m.start()))
+            start = m.end()
+    parts.append((start, len(body_m)))
+    out_parts, swapped = [], False
+    for a, b in parts:
+        conj, conj_m = sql[span[1] + a:span[1] + b], body_m[a:b]
+        cols = {c.lower() for c in re.findall(r"\b(?:current_file_status|lgd_\w+|scheme_name|data_verified|current_level|"
+                                              r"village_code|entity_type|scheme_specific|\w+_id)\b", conj_m, re.IGNORECASE)}
+        if cols == {"current_file_status"}:
+            if not swapped:
+                out_parts.append(" data_verified = 'On Hold' ")
+                swapped = True
+            continue
+        if "current_file_status" in cols:
+            return sql                      # mixed with another column: not ours to rewrite
+        out_parts.append(conj)
+    if not swapped:
+        return sql
+    logger.info("CM Elevate: plain 'pending' was filtered on current_file_status — restored data_verified = 'On Hold'")
+    return sql[:span[1]] + " " + " AND ".join(p.strip() for p in out_parts) + " " + sql[span[2]:].lstrip()
 
 
 # CM Elevate Legacy constituency SQL joins curated.dim_geography for ac_name, and
@@ -11633,6 +11978,28 @@ def _verifier_scheme_specific_complaint_is_false(issue: str, schemes: list[str],
                 not any((resolved or {}).get(k) for k in ("district", "block", "village_code"))
                 or _cme_resolved_places_in_sql(resolved, sql)):
             return True
+    # KI-186 live re-test (2026-10-05): "pending at level 1 in North Garo Hills" filtered
+    # lgd_district = 'NORTH GARO HILLS' verbatim, yet the verifier claimed on all four
+    # attempts that the SQL "uses LOWER(lgd_district) = 'NORTH GARO HILLS'" (misreading the
+    # LOWER(current_level) beside the new file_status test) -> "couldn't build a working
+    # query". A check-2 complaint ABOUT A PLACE (it names the place's column or value) is
+    # false when every resolved entity is a place filtered verbatim — plain column =
+    # 'VALUE', no fold — and every programme literal is an exact programme name (a
+    # misspelt programme is a real check-2 problem and still raises).
+    if schemes == ["CM Elevate"] and _VERIFIER_CHECK2_RE.search(issue or "") and resolved:
+        _given = {k: v for k, v in resolved.items() if v}
+        _cols = {"district": "lgd_district", "block": "lgd_block", "village_code": "village_code"}
+        _m = _CME_SCHEME_IN_RE.search(sql or "")
+        _lits = [x.replace("''", "'") for x in _SQL_LITERAL.findall(_m.group(1))] if _m else []
+        _lits += [x.replace("''", "'") for x in re.findall(r"\bscheme_name\s*=\s*'((?:[^']|'')*)'", sql or "",
+                                                           re.IGNORECASE)]
+        if _given and set(_given) <= set(_cols) and all(x in _CME_PROGRAMME_WORDS for x in _lits) and any(
+                re.search(rf"\b{_cols[k]}\b", issue, re.IGNORECASE) or str(v).upper() in issue.upper()
+                for k, v in _given.items()) and all(
+                re.search(rf"(?<![\w(])(?:\w+\.)?{_cols[k]}\s*=\s*'?{re.escape(str(v))}'?(?![\w])", sql or "")
+                and not re.search(rf"(?:LOWER|UPPER)\s*\(\s*(?:\w+\.)?{_cols[k]}\b", sql or "", re.IGNORECASE)
+                for k, v in _given.items()):
+            return True
     if schemes == ["CM Elevate"] and "scheme_specific" in (issue or "").lower() \
             and _VERIFIER_CHECK2_RE.search(issue or "") and _cme_resolved_places_in_sql(resolved, sql):
         keys = re.findall(r"scheme_specific\s*->>?\s*'(\w+)'", sql or "", re.IGNORECASE)
@@ -11739,6 +12106,7 @@ async def execute_with_repair(question: str, schemes: list[str], entity_result: 
         sql = _focus_legacy_geo_columns(schemes, sql)
         sql = _focus_legacy_village_code_only(schemes, entity_result.get("resolved") or {}, sql)
         sql = _focus_legacy_date_trunc_as_date(schemes, sql)
+        sql = _cm_elevate_case_safe_literals(schemes, sql)
         sql = _uppercase_geo_literals(sql)
         sql = _focusplus_drop_unrequested_verification_status(question, schemes, sql)
         sql = _cm_legacy_keep_unresolved_off_village(question, schemes, sql)
@@ -11751,7 +12119,9 @@ async def execute_with_repair(question: str, schemes: list[str], entity_result: 
         sql = _cm_elevate_unasked_programme_filter(question, schemes, sql)
         sql = _cm_elevate_sector_zero_groups(schemes, sql)
         sql = _cm_elevate_level_pending(question, schemes, sql)
+        sql = _cm_elevate_unique_applications(question, schemes, sql)
         sql = _cm_elevate_pending_without_level(question, schemes, sql)
+        sql = _cm_elevate_plain_pending_file_status(question, schemes, sql)
         sql = _cm_elevate_unasked_level_filter(question, schemes, sql)
         sql = _cm_elevate_status_is_file_status(question, schemes, sql)
         sql = _cm_elevate_decision_status_column(schemes, sql)
@@ -12770,14 +13140,213 @@ def _cme_pick_count_col(question: str, rows: list[dict]) -> "str | None":
     return None
 
 
+_CME_ZERO_STATED = re.compile(r"(?<![\d,.])0(?![\d,.])|\bzero\b|\bnone\b|"
+                              r"\bno\s+(?:\w+\s+)?(?:applicants?|applications?|records?)\b(?!\s+count)", re.IGNORECASE)
+
+
+def _cme_requested_zero_programmes(sql: str, rows: list[dict]) -> list[str]:
+    """KI-182 (OFF-009 all-pairs runs 2026-10-01 / 10-05, 1,131 of 2,520 failed):
+    "applicants in Cinema Theatre and Warehouse in <district>" — GROUP BY
+    scheme_name returns no row for a programme with no applications, so the
+    answer named only Warehouse ("Meghalaya Warehouse Scheme: 10 applicants.")
+    and the officer could not tell Cinema Theatre was checked. Returns the
+    programmes the SQL's scheme_name IN (…) asked for that have no row — each a
+    true 0 — but only when absence provably means 0: one plain SELECT whose
+    figures are COUNTs, no HAVING / OR, no LIMIT small enough to drop a group,
+    and every literal an exact programme name (a misspelt literal returns no
+    row too, and that is not a 0)."""
+    m = _CME_SCHEME_IN_RE.search(sql or "")
+    if not m:
+        return []
+    canon = {p.lower(): p for p in _CME_PROGRAMME_WORDS}
+    asked = list(dict.fromkeys(x.replace("''", "'") for x in _SQL_LITERAL.findall(m.group(1))))
+    if len(asked) < 2 or any(a.lower() not in canon for a in asked):
+        return []
+    masked = _mask_sql_literals(sql)
+    sel = re.search(r"\bselect\b", masked, re.IGNORECASE)
+    frm = re.search(r"\bfrom\b", masked, re.IGNORECASE)
+    if (not _simple_select(masked) or not sel or not frm or m.start() < frm.start()
+            or re.search(r"\bhaving\b|\bor\b", masked, re.IGNORECASE)):
+        return []
+    select_list = masked[sel.end():frm.start()]
+    if not re.search(r"\bcount\s*\(", select_list, re.IGNORECASE) or re.search(
+            r"\b(?:sum|avg|min|max|round)\s*\(|/", select_list, re.IGNORECASE):
+        return []
+    lim = re.search(r"\blimit\s+(\d+)", masked, re.IGNORECASE)
+    if lim and int(lim.group(1)) < len(asked):
+        return []
+    have = {str(r.get("scheme_name") or "").lower() for r in rows}
+    return [canon[a.lower()] for a in asked if a.lower() not in have]
+
+
+# Place filters an empty CM Elevate programme count may carry: column -> how to name it.
+_CME_ZERO_PLACE_COLS = {"lgd_district": "{}", "lgd_block": "{} block", "lgd_village_name": "{} village",
+                        "village_code": "village code {}"}
+_CME_ZERO_PLACE_RE = re.compile(r"^\(?\s*(?:(LOWER|UPPER)\s*\(\s*)?(?:\w+\.)?(lgd_district|lgd_block|lgd_village_name|"
+                                r"village_code)\s*\)?\s*(=|ILIKE)\s*'((?:[^']|'')*)'\s*\)?$", re.IGNORECASE)
+_CME_ZERO_SCHEME_RE = re.compile(r"^\(?\s*(?:\w+\.)?scheme_name\s*(?:IN\s*\(\s*(?:'(?:[^']|'')*'\s*,?\s*)+\)|"
+                                 r"=\s*'(?:[^']|'')*')\s*\)?$", re.IGNORECASE)
+# The status filters the wording can name exactly (what the figure counts). Any
+# other filter (sector, gender, mode, file status, …) -> None: the wording would
+# silently drop it ("on hold in WGH under cinema and piggery", 2026-10-05).
+_CME_ZERO_QUALIFIERS = (
+    (re.compile(r"^\(?\s*(?:\w+\.)?data_verified\s*=\s*'On Hold'\s*\)?$", re.IGNORECASE), "on hold"),
+    (re.compile(r"^\(?\s*(?:\w+\.)?data_verified\s*=\s*'Valid'\s*\)?$", re.IGNORECASE), "verified as Valid"),
+    (re.compile(r"^\(?\s*(?:LOWER\s*\(\s*)?(?:\w+\.)?current_level\s*\)?\s*=\s*'level([012])'\s*\)?$", re.IGNORECASE),
+     "pending at level {}"),
+)
+
+
+def _cme_programme_count_filters(sql: str) -> "tuple[list[str], list[tuple[str, str, str, str]], tuple[str, str]] | None":
+    """(programmes, place filters, (plural, singular) noun) for a CM Elevate
+    programme count whose ONLY filters are named programmes, places and at most
+    one status the wording can name (_CME_ZERO_QUALIFIERS) — exact programme
+    names, a plain COUNT, GROUP BY scheme_name or none, no HAVING / OR. None for
+    anything else: an unnamed filter changes what the figure means, so wording
+    built from this must not be used then. The noun carries the status:
+    ("applications on hold", "application on hold")."""
+    masked = _mask_sql_literals(sql or "")
+    sel = re.search(r"\bselect\b", masked, re.IGNORECASE)
+    frm = re.search(r"\bfrom\s+(?:curated\.)?v_cm_elevate\b", masked, re.IGNORECASE)
+    if (not sql or not _simple_select(masked) or not sel or not frm
+            or re.search(r"\bhaving\b|\bor\b", masked, re.IGNORECASE)):
+        return None
+    select_list = masked[sel.end():frm.start()]
+    if not re.search(r"\bcount\s*\(", select_list, re.IGNORECASE) or re.search(
+            r"\b(?:sum|avg|min|max|round)\s*\(|/", select_list, re.IGNORECASE):
+        return None
+    gb = re.search(r"\bgroup\s+by\s+([\w.,\s]+?)\s*(?:\border\b|\blimit\b|;|$)", masked, re.IGNORECASE)
+    # "GROUP BY scheme_name, scheme_name" is generated too (live 2026-10-05)
+    if gb and {g.strip().split(".")[-1].lower() for g in gb.group(1).split(",")} != {"scheme_name"}:
+        return None
+    span = _top_level_where_span(sql)
+    if not span:
+        return None
+    canon = {p.lower(): p for p in _CME_PROGRAMME_WORDS}
+    progs: list[str] = []
+    places: list[tuple[str, str, str, str]] = []      # (func, column, op, value)
+    quals: list[str] = []
+    file_pending = False
+    body_m = masked[span[1]:span[2]]
+    pos = 0
+    for part in re.split(r"(\s+AND\s+)", body_m, flags=re.IGNORECASE):
+        conj, conj_m = sql[span[1] + pos:span[1] + pos + len(part)].strip(), part.strip()
+        pos += len(part)
+        if not conj_m or re.fullmatch(r"\s*AND\s*", part, re.IGNORECASE):
+            continue
+        if _CME_ZERO_SCHEME_RE.match(conj):
+            for lit in _SQL_LITERAL.findall(conj):
+                name = canon.get(lit.replace("''", "'").lower())
+                if not name:
+                    return None                       # not an exact programme name
+                if name not in progs:
+                    progs.append(name)
+            continue
+        if re.fullmatch(r"(?:\w+\.)?entity_type\s*<>\s*'Unresolved'", conj, re.IGNORECASE):
+            continue
+        if re.fullmatch(r"\(?\s*" + _CME_FILE_PENDING_RE.pattern + r"\s*\)?", conj, re.IGNORECASE):
+            file_pending = True       # part of "pending at level N" (KI-186)
+            continue
+        qm = next(((rx.match(conj), words) for rx, words in _CME_ZERO_QUALIFIERS if rx.match(conj)), None)
+        if qm:
+            quals.append(qm[1].format(*qm[0].groups()))
+            continue
+        pm = _CME_ZERO_PLACE_RE.match(conj)
+        if not pm:
+            return None                               # another filter: the wording could not name it
+        places.append(((pm.group(1) or "").upper(), pm.group(2).lower(), pm.group(3).upper(),
+                       pm.group(4).replace("''", "'")))
+    if file_pending and not any(q.startswith("pending at level") for q in quals):
+        quals.append("with file status Pending")
+    if not progs or len(quals) > 1:
+        return None
+    alias = re.search(r"\bcount\s*\([^)]*\)\s*(?:as\s+)?(\w+)", select_list, re.IGNORECASE)
+    noun = ("applications" if alias and "application" in alias.group(1).lower() else
+            "applicants" if (alias and "applicant" in alias.group(1).lower())
+            or re.search(r"count\s*\(\s*distinct\s+(?:\w+\.)?request_id", select_list, re.IGNORECASE)
+            else "applications")
+    q = f" {quals[0]}" if quals else ""
+    return progs, places, (noun + q, noun[:-1] + q)
+
+
+def _cme_place_words(places: "list[tuple[str, str, str, str]]") -> str:
+    return ", ".join(_CME_ZERO_PLACE_COLS[c].format(_fp_title(v.upper())) for _f, c, _o, v in places)
+
+
+def _cme_join_names(names: list[str]) -> str:
+    return names[0] if len(names) == 1 else ", the ".join(names[:-1]) + f" and the {names[-1]}"
+
+
+async def _cme_zero_programmes_answer(sql: str) -> "str | None":
+    """User report 2026-10-05 (screenshot, "applicants in SWKH under agro tourism
+    and green taxi scheme"): both programmes have no applicants in the district,
+    the GROUP BY returned no row, and the officer got "I couldn't find any
+    matching records for South West Khasi Hills, …" — read as a failed search,
+    not as the answer 0. When the empty result provably means 0, say so: the
+    programmes are exact programme names, the figure is a plain COUNT, the only
+    other filters are places, and the app's own parameter-bound lookup confirms
+    those places exist in CM Elevate (a misspelt place also returns nothing, and
+    that is NOT a 0 — None then, and the plain no-records message stands)."""
+    parsed = _cme_programme_count_filters(sql)
+    if not parsed:
+        return None
+    progs, places, (noun, _one) = parsed
+    if places:
+        # identifiers come from the whitelist above; only the values are bound
+        cond = " AND ".join(f"{f + '(' if f else ''}{c}{')' if f else ''} {op} ${i}"
+                            for i, (f, c, op, _v) in enumerate(places, 1))
+        try:
+            hit = await fetch_rows(f"SELECT 1 AS hit FROM curated.v_cm_elevate WHERE {cond} LIMIT 1",
+                                   [v for *_x, v in places])
+        except Exception:  # noqa: BLE001 — cannot confirm the place: keep the plain message
+            logger.warning("CM Elevate zero answer: place check failed", exc_info=True)
+            return None
+        if not hit:
+            return None
+    where = (" in " + _cme_place_words(places)) if places else ""
+    logger.info("CM Elevate: empty programme count answered as 0 for %d programme(s)", len(progs))
+    if len(progs) == 1:
+        return f"There are no {noun} under the {progs[0]}{where} — the data records 0."
+    named = ", the ".join(progs[:-1]) + f" or the {progs[-1]}"
+    return (f"There are no {noun} under the {named}{where} — the data records 0 for each.\n\n"
+            + "; ".join(f"{_cme_short(p)}: 0" for p in progs) + ".")
+
+
+def _cme_zero_breakdown_answer(vals: "list[tuple[str, int | float]]", places: list, nouns: "tuple[str, str]") -> str:
+    """User report 2026-10-05 (screenshot, "applicants in WGH under cinema theatre
+    and green taxi scheme"): the KI-182 line was right but read as a stub —
+    "Chief Minister's Green Taxi Scheme: 2 applicants. / Cinema Theatre: 0 (none
+    recorded); Chief Minister's Green Taxi: 2." Rebuilt as one explanation: the
+    total, every programme with its figure, and where the applicants are."""
+    where = _cme_place_words(places)
+    in_where = f" in {where}" if where else ""
+    noun, one = nouns
+
+    def n(v: "int | float") -> str:
+        return f"{_fmt_num(v)} {one if v == 1 else noun}"
+    total = sum(v for _p, v in vals)
+    lines = [f"- {p}: {n(v)}" if v else f"- {p}: 0 — no {noun} recorded{in_where}" for p, v in vals]
+    nonzero = [p for p, v in vals if v]
+    zero = [p for p, v in vals if not v]
+    has = "has" if len(zero) == 1 else "have"
+    if len(nonzero) == 1:
+        lead = f"The only {one} is" if total == 1 else f"All {n(total)} are"
+        tail = f"{lead} under the {nonzero[0]}; the {_cme_join_names(zero)} {has} none{in_where}."
+    else:
+        tail = (f"The {_cme_join_names(zero)} {has} no {noun}{in_where}, so the total comes from the other "
+                f"{len(nonzero)} programmes.")
+    return (f"There {'is' if total == 1 else 'are'} {n(total)}{in_where} across the {len(vals)} programmes you "
+            "asked about:\n" + "\n".join(lines) + f"\n\n{tail}")
+
+
 def _cme_multi_scheme_total(question: str, sql: str, rows: list[dict], answer: str) -> str:
     """KI-069: a question naming 2+ programmes gets each programme's figure
     AND their combined total. Rows come split by scheme_name (the SQL guard
     ensures it); this adds any programme figure the text left out, then the
     combined total if it is not stated. Exact: request_id never repeats across
-    programmes."""
+    programmes. KI-182: a named programme with no row is stated as 0."""
     m = _CME_SCHEME_IN_RE.search(sql or "")
-    if not m or not 2 <= len(rows) <= 15 or not all("scheme_name" in r for r in rows):
+    if not m or not 1 <= len(rows) <= 15 or not all("scheme_name" in r for r in rows):
         return answer
     labels = [k for k in rows[0] if k not in _fp_numeric_cols(rows)]
     if labels != ["scheme_name"]:
@@ -12788,11 +13357,32 @@ def _cme_multi_scheme_total(question: str, sql: str, rows: list[dict], answer: s
     vals = [(r["scheme_name"], _as_number(r.get(col))) for r in rows]
     if any(v is None for _n, v in vals):
         return answer
+    zeros = _cme_requested_zero_programmes(sql, rows)
+    if len(vals) + len(zeros) < 2:
+        return answer
     sents = _cme_sentences(answer)
     missing = [(n, v) for n, v in vals if not _cme_row_stated(sents, [n], v)]
+    # a 0 programme counts as stated only beside its own name, as 0 / "no applicants"
+    missing += [(n, 0) for n in zeros if not any(
+        any(k in s for k in _cme_label_keys(n)) and _CME_ZERO_STATED.search(s) for s in sents)]
     out = answer.rstrip()
+    if zeros:
+        logger.info("CM Elevate: %d named programme(s) have no applications here — stated as 0 (KI-182)", len(zeros))
+        order = [x.replace("''", "'").lower() for x in _SQL_LITERAL.findall(m.group(1))]
+        vals = sorted(vals + [(n, 0) for n in zeros],
+                      key=lambda nv: order.index(nv[0].lower()) if nv[0].lower() in order else len(order))
+        # list them in the order the officer named them (the SQL's IN order can differ)
+        at = {n: re.search(_CME_PROGRAMME_WORDS.get(n, re.escape(n)), question or "", re.IGNORECASE) for n, _v in vals}
+        if all(at.values()):
+            vals = sorted(vals, key=lambda nv: at[nv[0]].start())
+        parsed = _cme_programme_count_filters(sql)
+        if parsed and any(v for _n, v in vals):
+            # only programmes + places are filtered: rebuild the whole answer clearly
+            # (with a status / level filter the wording would drop it, so not then)
+            return _cme_zero_breakdown_answer(vals, parsed[1], parsed[2])
     if missing:
-        out += "\n\n" + "; ".join(f"{_cme_short(n)}: {_fmt_num(v)}" for n, v in vals) + "."
+        out += "\n\n" + "; ".join(f"{_cme_short(n)}: {_fmt_num(v)}" + (" (none recorded)" if v == 0 and n in zeros else "")
+                                  for n, v in vals) + "."
     total = sum(v for _n, v in vals)
     if not any(abs(n - total) < 0.005 for n in _cme_nums(answer)):
         out += f"\n\nCombined across these {len(vals)} programmes: {_fmt_num(total)} {_metric_label(col)}."
@@ -12931,6 +13521,11 @@ async def compose_response(question: str, sql: str, rows: list[dict],
     # Legacy's answer shots). Empty for every other scheme, which leaves the
     # prompt exactly as it was.
     if not rows:
+        if schemes == ["CM Elevate"]:
+            # a named programme with no applications is the answer 0, not "no records" (2026-10-05)
+            _zero = await _cme_zero_programmes_answer(sql)
+            if _zero:
+                return _zero
         return _no_data_answer(schemes, entities)
     preview = rows[:40]
     truncated = len(rows) > len(preview)
@@ -13112,7 +13707,16 @@ Answer:"""
     # data / can't break it down" phrasing anyway (seen when the question names
     # two categories joined by "or" and the query returns their combined COUNT).
     # A usable number must be reported as the answer.
-    if _HEDGE_RE.search(answer):
+    # A sentence about a financial year the scheme genuinely lacks ("The scheme
+    # has no data for FY 2023-24, so the comparison uses …") is the year-gap note
+    # restated, not a hedge over the result: "Compare total remittances between
+    # financial years 2023-24 and 2024-25 for Focus Legacy" had its correct
+    # comparison replaced by a bare row list (2026-10-03, KI-183). Only those
+    # sentences are set aside; a hedge anywhere else still trips the guard.
+    _absent_fy = {m for n in (notes or []) for m in re.findall(r"\bFY\s*(\d{4}-\d{2})\s+holds no data", n or "")}
+    _hedge_text = answer if not _absent_fy else " ".join(
+        s for s in re.split(r"(?<=[.!?])\s+", answer or "") if not any(fy in s for fy in _absent_fy))
+    if _HEDGE_RE.search(_hedge_text):
         metrics_now = _row_metrics(preview[0]) if len(preview) == 1 else []
         if metrics_now and all(v not in (0, None) for _k, v in metrics_now):
             logger.warning("compose_response: hedged over a real value %r — deterministic answer",
@@ -13491,6 +14095,12 @@ async def _answer_data(question: str, scope: "auth.UserScope | None" = None,
     # everything downstream — SQL generation above all.
     if entity_result.get("question"):
         question = entity_result["question"]
+    # Focus Legacy "duplicate producer groups" = paid more than once (KI-187).
+    if schemes == ["Focus Legacy"]:
+        _dup = await _focus_legacy_duplicate_groups_answer(
+            question, entity_result.get("resolved") or {}, entity_result.get("display") or {})
+        if _dup is not None:
+            return _dup
 
     # "Garo Hills" / "Khasi Hills" name a hill RANGE, not a district. When one is
     # named and no specific district resolved, either offer its districts as one-tap

@@ -25,7 +25,8 @@ deterministic pre-routing and edge → follow-up rewrite → intent (DATA/KNOWLE
   3 repairs) → `compose_response` (numeric-faithfulness checks).
 - **KNOWLEDGE:** `rag.answer_from_kb`.
 
-The orchestration lives in [app/pipeline.py](app/pipeline.py), which is about 8,400 lines.
+The orchestration lives in [app/pipeline.py](app/pipeline.py), which is about 15,200 lines
+(VERIFIED 2026-10-05; it grew with the four newer schemes).
 Full map: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and [docs/AI_PIPELINE.md](docs/AI_PIPELINE.md).
 
 ## 3. Documentation map
@@ -36,9 +37,12 @@ Full map: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and [docs/AI_PIPELINE.md]
 | [docs/CURRENT_STATE.md](docs/CURRENT_STATE.md) | **Every session.** What works, what's broken, what's next |
 | [docs/HANDOFF.md](docs/HANDOFF.md) | **Every session.** Where the last session stopped |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Components, API, auth, deploy, infrastructure |
+| [docs/COMPLETE_ARCHITECTURE.md](docs/COMPLETE_ARCHITECTURE.md) | The whole system in one document: every layer, the full request path, the pipeline's internal stages, and why each design choice holds. Start here when onboarding or when you need the end-to-end map |
 | [docs/AI_PIPELINE.md](docs/AI_PIPELINE.md) | Any change to routing, prompts, SQL gen/repair, composer, RAG |
 | [docs/DATA_MODEL.md](docs/DATA_MODEL.md) | Any change touching SQL, tables, joins, units, years |
 | [docs/SCHEMES.md](docs/SCHEMES.md) | Any scheme-specific change, or adding a scheme |
+| [docs/SCHEME_ONBOARDING_HANDOFF.md](docs/SCHEME_ONBOARDING_HANDOFF.md) | How each of the six schemes was onboarded, plus every change since, by phase and by layer (no testing) |
+| [docs/SCHEME_ONBOARDING_RUNBOOK.md](docs/SCHEME_ONBOARDING_RUNBOOK.md) | **Onboarding a new scheme.** The 23-step procedure end to end, including testing, plus what the automation may and may not generate |
 | [docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md) | Before fixing a bug (it may already be tracked) |
 | [docs/DECISIONS.md](docs/DECISIONS.md) | **Before proposing any architectural replacement** |
 | [docs/TESTING.md](docs/TESTING.md) | Before and after changing code |
@@ -131,7 +135,7 @@ whose line numbers are stale), `docs/*_DB_Issues.md`, `docs/*Fix_Verification*.m
 - Run pytest on the **26 pytest-style files only**, then the **14 plain-script suites**
   (`python tests/test_X.py`). The exact commands are in [docs/TESTING.md](docs/TESTING.md).
   Do **not** run bare `pytest tests`: it crashes with INTERNALERROR (KNOWN_ISSUES KI-018).
-- Baseline (2026-09-29, after the Focus Legacy all-levels fixes KI-145 to KI-165 and the PMAY-G calendar-year change): 1,266 pytest passed (26 files), 14/14 scripts passed, and the live context suite 43/43 on the final code.
+- Baseline (2026-10-07, after KI-187 (Focus Legacy duplicate producer groups = paid more than once, D-032), the CM Elevate KI-182 fix, empty-result zero answer and clear one-zero wording and KI-186 (pending at level = file_status Pending) on top of KI-183, the Focus Legacy all-levels fixes and the later CM Elevate Legacy / PMAY-G work): 1,498 pytest passed (26 files), 14/14 scripts passed, and the live context suite 43/43 on the final code.
   The live multi-turn suite `tests/live_context_validation.py` (needs the VPN) passed 43/43 on
   2026-09-26 and again on 2026-09-27 after the Focus Plus and the CM Elevate fixes. Re-run it after any routing, rewrite or state change.
 - Every bug fix gets a regression test that calls the **real function**, never a

@@ -33,6 +33,7 @@ _RESOLVER_FILE = {
     "CM Elevate": _DATA_PART / "cm_elevate" / "cmelevate_entity_resolver.yaml",
     "Focus Legacy": _DATA_PART / "focus_legacy" / "focuslegacy_entity_resolver.yaml",
     "CM Elevate Legacy": _DATA_PART / "cm_elevate_legacy" / "cmelevatelegacy_entity_resolver.yaml",
+    "NRLM": _DATA_PART / "NRLM" / "nrlm_entity_resolver.yaml",
 }
 
 # The dimension key a resolver file uses when it differs from the one this
@@ -40,7 +41,17 @@ _RESOLVER_FILE = {
 # sub-scheme dimension `scheme`; it is the same closed set, same `canonical` +
 # `aliases` shape and same scheme_name column as CM Elevate's `cm_scheme`, so it
 # is read under that name and resolve_cm_scheme() works for both.
-_DIMENSION_ALIASES = {"cm_scheme": ("scheme",)}
+# nrlm_entity_resolver.yaml names its 55-value assembly-constituency dimension
+# `constituency` (and its formation-year dimension `formation_year`). Both carry
+# the same `canonical` + `aliases` shape this module reads, so they are loaded
+# under the names it already understands. Without the assembly_constituency
+# alias NRLM's 55 constituencies resolve to nothing, and a question naming one
+# silently falls through to the block of the same name — 26 NRLM block names are
+# ALSO constituency names, and a block and its same-name constituency cover
+# different areas (1,106 SHGs vs 1,092 for Mawkyrwat).
+_DIMENSION_ALIASES = {"cm_scheme": ("scheme",),
+                      "assembly_constituency": ("constituency",),
+                      "year": ("formation_year",)}
 
 
 def _dimension_values(dims: dict, dim_name: str) -> list:
@@ -1384,10 +1395,18 @@ _AC_CONTENTS_SQL = {
     "CM Elevate Legacy": ("SELECT DISTINCT v.lgd_district, v.lgd_block, g.village_code "
                           "FROM curated.v_cm_elevate_disbursement v JOIN curated.dim_geography g "
                           "ON g.geography_key = v.geography_key WHERE UPPER(g.ac_name) = UPPER($1)"),
+    # NRLM needs NO dim_geography join: v_nrlm carries the constituency on the row
+    # itself (constituency_name_raw, mixed case as the source typed it — compare
+    # case-folded). The 2,032 SHGs with no village also have no constituency, so
+    # they are excluded here anyway by the NULL; entity_type <> 'Unresolved' keeps
+    # the village_code list to real villages, as every NRLM village rule requires.
+    "NRLM": ("SELECT DISTINCT lgd_district, lgd_block, village_code FROM curated.v_nrlm "
+             "WHERE UPPER(constituency_name_raw) = UPPER($1) AND entity_type <> 'Unresolved'"),
 }
 # How the drill-down names each scheme's data ("190 villages in the <this>").
 AC_CONTENTS_SOURCE = {"MGNREGA": "MGNREGA employment data", "Focus Legacy": "Focus Legacy data",
-                      "CM Elevate Legacy": "CM Elevate Legacy data"}
+                      "CM Elevate Legacy": "CM Elevate Legacy data",
+                      "NRLM": "NRLM Self Help Group register"}
 
 
 async def constituency_contents(ac_name: str, scheme: "str | None" = None) -> dict:

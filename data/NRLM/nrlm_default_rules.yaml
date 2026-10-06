@@ -1,0 +1,556 @@
+# nrlm_default_rules.yaml
+#
+# Default rules for NRLM - node 5.5. Runs after the clarification gate.
+# Each rule fills a missing detail silently and hands the response composer an
+# assumption line, so the user can correct it without being interrupted first.
+# Editable by analysts - no code change needed.
+#
+# A condition must live in EITHER the clarification file OR this one. The gate runs
+# first, so any condition present in both will always ask and never default.
+# {placeholders} are filled from the resolved query at runtime.
+#
+# ===========================================================================
+# v1.0 - 2026-10-05 - FIRST VERSION, WRITTEN AGAINST THE CURATED STAR SCHEMA
+#
+# Target: curated.v_nrlm over curated.fact_nrlm_shg (megh_db).
+#
+# What makes NRLM's defaults different from PMAY's:
+#
+#   * there is NO mandatory exclusion predicate - every row is a real SHG
+#     (PMAY's NOT is_placeholder has no NRLM counterpart)
+#   * the one conditional exclusion is entity_type <> 'Unresolved', and it applies
+#     to village-level questions ONLY
+#   * there is no time default for money, because money has no time - a money
+#     question with no period is simply "as at the current extract"
+#   * the only year default is for FORMATION questions
+#   * "fund" with no qualifier shows BOTH funds rather than picking one
+#   * district and block are filtered by the UPPERCASE LGD name; their LGD codes
+#     exist on the row and are authoritative for identity
+#
+# EVERY NUMBER IN AN assumption_text BELOW IS A SOURCE-FILE FIGURE
+# (datasets/NRLM/NRLM.csv, 2026-10-05) AND HAS NOT BEEN RE-MEASURED AGAINST
+# megh_db. The live table comments quote the same figures, but re-verify before
+# these reach a user.
+# ===========================================================================
+#
+# Reserved for nrlm_classification_rules.yaml, not defaulted here: money in a year,
+# money trend or growth, "beneficiaries" (SHGs or members?), a village name shared by
+# several villages, an SHG name shared by several SHGs, "Pre-NRLM" (type or year?),
+# and anything the source cannot answer at all - federations, savings, bank linkage,
+# loans, member-level detail, formation dates, utilisation.
+
+default_rules:
+
+  # ---- population - fires before everything else -------------------------
+  - condition: "shg_status_unspecified"
+    default_value: "all_shgs_active_and_inactive"
+    assumption_text: "Counting all SHGs on the register, active and inactive (39,432 active, 1,197 inactive)."
+    note: >
+      The register is the population. Filtering to active silently would hide 2.9% of
+      groups. If the question says "functional", "working" or "active", filter is_active.
+
+  - condition: "unresolved_rows_in_state_district_or_block_total"
+    default_value: "include"
+    assumption_text: "SHGs with no village recorded are included - they still belong to a known block and district."
+    note: 2,032 SHGs. Excluding them under-reports every district and block total.
+
+  - condition: "unresolved_rows_in_village_question"
+    default_value: "exclude_and_state_count"
+    assumption_text: "{unresolved_count} SHGs with no village recorded are left out of village figures and counted only at block and district level."
+    sql_effect: "WHERE entity_type <> 'Unresolved'"
+    note: Applies to village counts, village lists and village rankings ONLY.
+
+  - condition: "possible_duplicate_rows_present"
+    default_value: "include"
+    assumption_text: "Counted as registered; 5 pairs of SHGs that look like double registrations are not removed."
+    note: NR-24. is_possible_duplicate. State it only when the result touches one of the 10 rows.
+
+  - condition: "out_of_norm_membership_present"
+    default_value: "include"
+    assumption_text: "SHGs with membership outside the NRLM norm are included."
+    note: 178 SHGs (5 zero, 74 at 1-4, 99 above 20). A finding, not noise.
+
+  # ---- time (formation only) ---------------------------------------------
+  - condition: "money_question_without_period"
+    default_value: "as_at_current_extract"
+    assumption_text: "Amounts are cumulative totals received by each SHG, as at the current data extract."
+    critical: true
+    note: >
+      This is NOT a time default - money has no time. Every money answer carries this
+      line so that no reader takes the figure as a one-year release.
+
+  - condition: "count_question_without_period"
+    default_value: "all_shgs_on_register"
+    assumption_text: "Covering all SHGs on the register, formed between 1984-85 and 2022-23."
+
+  - condition: "formation_question_without_period"
+    default_value: "all_formation_years"
+    assumption_text: "Covering all formation years, 1984-85 to 2022-23."
+
+  - condition: "relative_formation_year_latest"
+    default_value: "2022-23"
+    assumption_text: "Taking the latest formation year as 2022-23 - the last year in this data."
+
+  - condition: "relative_formation_year_previous"
+    default_value: "2021-22"
+    assumption_text: "Taking the previous formation year as 2021-22."
+
+  - condition: "relative_formation_year_earliest"
+    default_value: "1984-85"
+    assumption_text: "Taking the earliest formation year as 1984-85, which holds a single SHG."
+
+  - condition: "formation_trend_without_period"
+    default_value: "2014-15_onward_with_earlier_grouped"
+    assumption_text: "Formation shown from 2014-15 onward; the 931 SHGs formed earlier are grouped as 'before 2014-15'."
+    note: Years before 2014-15 hold between 1 and 105 SHGs each and flatten the chart.
+
+  - condition: "formation_comparison_without_second_year"
+    default_value: "preceding_formation_year"
+    assumption_text: "Compared against SHGs formed in the preceding year, {previous_year}."
+
+  - condition: "formation_year_range_partly_outside_data"
+    default_value: "clamp_to_available_range"
+    assumption_text: "Formation years run from 1984-85 to 2022-23, so the range has been trimmed to {applied_range}."
+
+  - condition: "no_shgs_in_requested_formation_year"
+    default_value: "state_data_span"
+    assumption_text: "No SHG formed in {value} is on the register; formation years run from 1984-85 to 2022-23."
+
+  - condition: "year_word_with_count_question"
+    default_value: "formation_year"
+    assumption_text: "Reading '{value}' as the year the SHG was formed - the only year recorded."
+    note: Applies to COUNT and MEMBER questions only. With a money question the gate refuses instead.
+
+  - condition: "latest_formation_year_partial"
+    default_value: "include_with_note"
+    assumption_text: "2022-23 shows only 1,680 SHGs; it may be incomplete in this extract rather than a real fall in formation."
+    note: Unconfirmed. Extraction date and coverage are open items in the readiness document.
+
+  # ---- geography --------------------------------------------------------
+  - condition: "missing_geography"
+    default_value: "all_districts"
+    assumption_text: "Covering all 12 districts of Meghalaya."
+
+  - condition: "whole_state_reference"
+    default_value: "no_district_filter"
+    assumption_text: "Figures are statewide."
+
+  - condition: "missing_breakdown_level"
+    default_value: "district"
+    assumption_text: "Broken down by district."
+
+  - condition: "region_group_named"
+    default_value: "expand_to_member_districts"
+    assumption_text: "{region} covers {districts}."
+    note: >
+      Khasi Hills = East Khasi Hills, West Khasi Hills, South West Khasi Hills,
+      Eastern West Khasi Hills (12,557 SHGs by code). Garo Hills = East, West, South,
+      North, South West Garo Hills (17,565). Jaintia Hills = East and West Jaintia Hills
+      (6,799). See nrlm_entity_resolver.yaml region_groups.
+
+  - condition: "ri_bhoi_as_region"
+    default_value: "single_district"
+    assumption_text: "Ri Bhoi is its own district and is not counted under Khasi Hills."
+
+  - condition: "west_khasi_without_qualifier"
+    default_value: "west_khasi_hills_279"
+    assumption_text: "Reading West Khasi Hills as district 279; Eastern West Khasi Hills (740) is a separate district."
+
+  - condition: "colliding_name_without_level"
+    default_value: "block"
+    assumption_text: "Reading {value} as a block, the level users usually mean; 25 block names are also village names."
+
+  - condition: "block_and_constituency_same_name"
+    default_value: "block"
+    assumption_text: "Reading {value} as the block. {value} is also an assembly constituency, which covers a different area."
+    note: 26 block names are also constituency names. The areas do not coincide.
+
+  - condition: "geography_filter_form_unspecified"
+    default_value: "lgd_name_uppercase"
+    assumption_text: "Filtered on the LGD district / block name."
+    sql_effect: "lgd_district = 'EAST KHASI HILLS'"
+    note: >
+      dim_geography stores district and block UPPERCASE. Emit the uppercase literal.
+      The LGD code (district_lgd_code / block_lgd_code) is equivalent and authoritative;
+      either may be used for the filter.
+
+  - condition: "district_grouping_basis"
+    default_value: "lgd_code_based"
+    assumption_text: "Districts follow the LGD code; 12 SHGs named 'Eastern West Khasi Hills' in the source file are counted under East Jaintia Hills, their LGD district."
+    note: State only when the answer is a district breakdown covering East Jaintia Hills or Eastern West Khasi Hills.
+
+  - condition: "constituency_breakdown"
+    default_value: "include_with_note"
+    assumption_text: "Constituency figures cover 38,597 SHGs; 2,032 have no constituency recorded."
+
+  - condition: "gp_name_breakdown"
+    default_value: "include_with_note"
+    assumption_text: "GP names are as typed in the source, without codes, and may repeat across blocks."
+
+  # ---- which measure ----------------------------------------------------
+  - condition: "missing_scheme"
+    default_value: "nrlm"
+    assumption_text: "Answering for NRLM Self Help Groups."
+
+  - condition: "scheme_alias_named"
+    default_value: "nrlm"
+    assumption_text: "{value} is read as NRLM (DAY-NRLM); the data held is the MSRLS SHG register."
+    note: Aliases - DAY-NRLM, Aajeevika, MSRLS, SRLM, Meghalaya State Rural Livelihoods Society.
+
+  - condition: "bare_group_term"
+    default_value: "count_shgs"
+    assumption_text: "Counted as SHGs - one row is one Self Help Group."
+
+  - condition: "members_term"
+    default_value: "sum_total_members"
+    assumption_text: "Members are added up across SHGs (male plus female)."
+    sql_effect: "SUM(total_members)"
+
+  - condition: "women_reference"
+    default_value: "sum_female_members"
+    assumption_text: "Women means women members - 409,249, or 99.6% of all members."
+    sql_effect: "SUM(female_members)"
+
+  - condition: "bare_fund_term"
+    default_value: "both_rf_and_cif_separately"
+    assumption_text: "Showing both funds separately - Revolving Fund and Community Investment Fund."
+    note: Only when the gate's fund_unspecified did not fire (e.g. a table or summary question).
+
+  - condition: "rf_term"
+    default_value: "revolving_fund_amount"
+    assumption_text: "Revolving Fund received, cumulative per SHG."
+
+  - condition: "cif_term"
+    default_value: "cif_amount"
+    assumption_text: "Community Investment Fund received, cumulative per SHG."
+
+  - condition: "total_funds_term"
+    default_value: "rf_plus_cif"
+    assumption_text: "Total funds are Revolving Fund plus CIF; no other fund is recorded."
+    sql_effect: "SUM(revolving_fund_amount + cif_amount)"
+
+  - condition: "fund_received_or_released_word"
+    default_value: "cumulative_received"
+    assumption_text: "'{value}' is read as the cumulative amount the SHG has received to date - no release date is recorded."
+
+  - condition: "shgs_with_fund_term"
+    default_value: "amount_greater_than_zero"
+    assumption_text: "An SHG has received {fund} when its recorded amount is above zero."
+    sql_effect: "WHERE {fund_column} > 0"
+
+  - condition: "average_fund_requested"
+    default_value: "both_populations"
+    assumption_text: "Average shown across all SHGs and across SHGs that received the fund; 73% of SHGs hold no CIF."
+    note: Only when the gate's average_fund_population_unclear did not fire.
+
+  - condition: "rf_norm_reference"
+    default_value: "include_with_note"
+    assumption_text: "The usual Revolving Fund is Rs 15,000 per SHG (33,241 SHGs); 246 SHGs hold Rs 30,000."
+
+  - condition: "high_cif_in_ranking"
+    default_value: "include_with_note"
+    assumption_text: "39 SHGs hold more than Rs 5 lakh CIF; these values are not yet confirmed by MSRLS."
+    note: NR-25. Fires when a CIF ranking or maximum returns one of them.
+
+  - condition: "inactive_shgs_in_fund_figures"
+    default_value: "include_with_note"
+    assumption_text: "Inactive SHGs all show zero funds in the source; they are included and pull averages down."
+    note: NR-15.
+
+  - condition: "active_term"
+    default_value: "is_active_true"
+    assumption_text: "Active is the active status recorded in the source, with no date attached."
+    sql_effect: "WHERE is_active"
+
+  - condition: "inactive_synonym_term"
+    default_value: "is_active_false"
+    assumption_text: "'{value}' is read as inactive - the only status recorded besides active."
+    sql_effect: "WHERE NOT is_active"
+    note: dormant, defunct, non-functional, closed, dissolved.
+
+  - condition: "shg_type_unspecified"
+    default_value: "all_types"
+    assumption_text: "Covering all three SHG types - New, Revived and Pre-NRLM."
+
+  - condition: "formation_cohort_term"
+    default_value: "formation_financial_year_short"
+    assumption_text: "Grouped by the financial year each SHG was formed."
+
+  - condition: "money_unit_status_note"
+    default_value: "rupees_assumed"
+    assumption_text: "Amounts are taken to be in rupees; the unit is awaiting confirmation from MSRLS."
+    note: NR-07. Carry on every money answer until confirmed.
+
+  # ---- which table ------------------------------------------------------
+  - condition: "any_nrlm_question"
+    default_value: "curated.v_nrlm"
+    assumption_text: "Answered from the NRLM SHG register."
+
+  - condition: "lineage_or_source_name_question"
+    default_value: "curated.fact_nrlm_shg"
+    assumption_text: "Answered from the source values kept for lineage."
+    note: Only for "what does the source file say" questions (district_name_raw, block_name_raw, village_name_raw).
+
+  - condition: "cross_scheme_coverage_question"
+    default_value: "aggregate_each_scheme_by_village_code"
+    assumption_text: "Each scheme is counted separately by LGD village code and the counts are then combined."
+    note: >
+      No cross-scheme view includes NRLM. Aggregate v_nrlm by village_code (excluding
+      Unresolved) and the other scheme by village_code independently, then FULL JOIN the
+      two aggregates. Never a fact-to-fact join.
+
+  - condition: "cross_scheme_district_question"
+    default_value: "aggregate_each_scheme_by_district"
+    assumption_text: "Each scheme is totalled by district separately and the totals are shown side by side."
+
+  # ---- units ------------------------------------------------------------
+  - condition: "money_unit_unspecified"
+    default_value: "crore"
+    assumption_text: "Amounts are in crore rupees."
+    note: v_nrlm stores rupees. Divide by 1e7. State the unit every time.
+
+  - condition: "single_shg_money_value"
+    default_value: "rupees"
+    assumption_text: "Amounts are in rupees."
+
+  - condition: "money_below_one_crore"
+    default_value: "lakh"
+    assumption_text: "Amounts are in lakh rupees, as the figures are below one crore."
+
+  - condition: "percentage_precision_unspecified"
+    default_value: 2
+    assumption_text: "Percentages are rounded to two decimal places."
+
+  # ---- shape of the answer ----------------------------------------------
+  - condition: "missing_aggregation_function"
+    default_value: "count_shgs"
+    assumption_text: "Figures are counts of SHGs."
+
+  - condition: "money_aggregation_unspecified"
+    default_value: "SUM"
+    assumption_text: "Amounts are added up across the selected SHGs."
+
+  - condition: "village_count_requested"
+    default_value: "count_distinct_village_code_excluding_unresolved"
+    assumption_text: "Villages are counted by LGD code, since 197 village names are shared by more than one village."
+    sql_effect: "COUNT(DISTINCT village_code) FILTER (WHERE entity_type <> 'Unresolved')"
+
+  - condition: "block_count_requested"
+    default_value: "count_distinct_block_lgd_code"
+    assumption_text: "Blocks are counted by LGD block code."
+
+  - condition: "average_members_per_shg"
+    default_value: "avg_total_members"
+    assumption_text: "Average members per SHG, across all SHGs."
+
+  - condition: "missing_top_n"
+    default_value: 5
+    assumption_text: "Showing the top 5."
+
+  - condition: "singular_superlative_without_n"
+    default_value: 1
+    assumption_text: "Showing the single highest."
+
+  - condition: "ranking_direction_unspecified"
+    default_value: "descending"
+    assumption_text: "Ranked highest first."
+
+  - condition: "missing_sort_column"
+    default_value: "requested_metric"
+    assumption_text: "Sorted by {metric}."
+
+  - condition: "missing_result_limit"
+    default_value: 10
+    assumption_text: "Showing the first 10 rows."
+
+  - condition: "shg_row_listing_limit"
+    default_value: 100
+    assumption_text: "Showing the first 100 matching SHGs."
+
+  - condition: "shg_listing_columns_unspecified"
+    default_value: "standard_shg_columns"
+    assumption_text: "Showing SHG code, name, type, status, village, block, members, RF and CIF."
+
+  - condition: "shg_type_ordering_unspecified"
+    default_value: "type_order"
+    assumption_text: "SHG types are listed as Pre-NRLM, Revived, New."
+
+  - condition: "chart_type_unspecified"
+    default_value: "auto_by_result_shape"
+    assumption_text: "Chart type chosen to suit the shape of the result."
+
+  # ---- nulls and zeros --------------------------------------------------
+  - condition: "zero_fund_values"
+    default_value: "include_as_zero"
+    assumption_text: "SHGs with no fund recorded count as zero; there are no blank amounts in this data."
+    note: Readiness clarification 7 answered by the data - no blanks exist.
+
+  - condition: "null_constituency"
+    default_value: "exclude_from_breakdown_only"
+    assumption_text: "SHGs with no constituency recorded are left out of the constituency breakdown, and their number is stated."
+
+  - condition: "null_village_name_in_listing"
+    default_value: "show_as_not_recorded"
+    assumption_text: "SHGs with no village recorded are shown with 'village not recorded'."
+
+# ===========================================================================
+# v1.1 - 2026-10-05 - WORKED EXAMPLES
+#
+# A question, the defaults that fire, the assumption line the user sees (with
+# placeholders filled), and the resulting answer. Every figure is from
+# datasets/NRLM/NRLM.csv grouped by LGD code.
+# ===========================================================================
+worked_examples:
+
+  - user: "How many SHGs are there?"
+    fires: [shg_status_unspecified, count_question_without_period, missing_geography, unresolved_rows_in_state_district_or_block_total]
+    assumptions_shown: "Counting all SHGs on the register, active and inactive (39,432 active, 1,197 inactive). Covering all 12 districts of Meghalaya."
+    sql: "SELECT COUNT(*) FROM curated.v_nrlm;"
+    result: 40629
+
+  - user: "SHGs in Umsning"
+    fires: [colliding_name_without_level, unresolved_rows_in_state_district_or_block_total, shg_status_unspecified]
+    assumptions_shown: "Reading Umsning as a block, the level users usually mean; 25 block names are also village names. SHGs with no village recorded are included - they still belong to a known block and district."
+    sql: "SELECT COUNT(*) FROM curated.v_nrlm WHERE block_lgd_code = 1987;"
+    result: 1035
+    note: Umsning is also a village (13 SHGs) and a constituency (650 SHGs). 316 of the block's 1,035 SHGs have no village and are correctly included.
+
+  - user: "How many villages in Umsning have SHGs?"
+    fires: [colliding_name_without_level, unresolved_rows_in_village_question, village_count_requested]
+    assumptions_shown: "316 SHGs with no village recorded are left out of village figures and counted only at block and district level. Villages are counted by LGD code, since 197 village names are shared by more than one village."
+    sql: "SELECT COUNT(DISTINCT village_code) FILTER (WHERE entity_type <> 'Unresolved') FROM curated.v_nrlm WHERE block_lgd_code = 1987;"
+    result: 83
+
+  - user: "Total RF in Ri Bhoi"
+    fires: [money_question_without_period, rf_term, money_unit_unspecified, money_unit_status_note, ri_bhoi_as_region]
+    assumptions_shown: "Amounts are cumulative totals received by each SHG, as at the current data extract. Amounts are in crore rupees; the unit is awaiting confirmation from MSRLS."
+    sql: "SELECT ROUND(SUM(revolving_fund_amount)/1e7, 2) FROM curated.v_nrlm WHERE district_lgd_code = 276;"
+    result: "Rs 5.25 crore"
+
+  - user: "Funds in Mawkyrwat block"
+    fires: [bare_fund_term, money_question_without_period, money_below_one_crore]
+    assumptions_shown: "Showing both funds separately - Revolving Fund and Community Investment Fund. Amounts are cumulative totals received by each SHG, as at the current data extract."
+    result: "RF Rs 144.84 lakh, CIF Rs 584.33 lakh"
+    note: RF falls below a crore, so lakh is used for both to keep them comparable.
+
+  - user: "How many women are in SHGs in East Jaintia Hills?"
+    fires: [women_reference]
+    assumptions_shown: "Women means women members."
+    sql: "SELECT SUM(female_members) FROM curated.v_nrlm WHERE district_lgd_code = 657;"
+    result: 26234
+    note: East Jaintia Hills has the lowest women's share in the State, 98.62% (367 men).
+
+  - user: "How many members per SHG in South West Khasi Hills?"
+    fires: [average_members_per_shg]
+    assumptions_shown: "Average members per SHG, across all SHGs."
+    result: 10.5
+    note: The highest of any district; the State average is 10.1.
+
+  - user: "SHGs formed in 2019-20 in North Garo Hills"
+    fires: [year_word_with_count_question, formation_cohort_term]
+    assumptions_shown: "Reading '2019-20' as the year the SHG was formed - the only year recorded."
+    sql: "SELECT COUNT(*) FROM curated.v_nrlm WHERE district_lgd_code = 656 AND formation_financial_year_short = '2019-20';"
+    result: 725
+
+  - user: "Latest year SHG formation by district"
+    fires: [relative_formation_year_latest, latest_formation_year_partial]
+    assumptions_shown: "Taking the latest formation year as 2022-23 - the last year in this data. 2022-23 shows only 1,680 SHGs; it may be incomplete in this extract rather than a real fall in formation."
+    result: "East Khasi Hills 450, West Jaintia Hills 250, West Garo Hills 230, ... East Garo Hills 31, Eastern West Khasi Hills 31"
+
+  - user: "Show SHG formation trend"
+    fires: [formation_trend_without_period, missing_geography]
+    assumptions_shown: "Formation shown from 2014-15 onward; the 931 SHGs formed earlier are grouped as 'before 2014-15'."
+    result: "before 2014-15: 931, 2014-15: 169, 2015-16: 582, 2016-17: 1,279, 2017-18: 3,634, 2018-19: 4,368, 2019-20: 10,604, 2020-21: 11,354, 2021-22: 6,028, 2022-23: 1,680"
+
+  - user: "Compare SHGs formed in 2021-22"
+    fires: [formation_comparison_without_second_year]
+    assumptions_shown: "Compared against SHGs formed in the preceding year, 2020-21."
+    result: "6,028 in 2021-22 against 11,354 in 2020-21 - a fall of 5,326."
+
+  - user: "SHGs formed in 1990"
+    fires: [no_shgs_in_requested_formation_year]
+    assumptions_shown: "No SHG formed in 1990-91 is on the register; formation years run from 1984-85 to 2022-23."
+    note: The register has gaps - no SHG for 1985-86 to 1992-93 or 1994-95.
+
+  - user: "SHGs in Khasi Hills"
+    fires: [region_group_named]
+    assumptions_shown: "Khasi Hills covers East Khasi Hills, West Khasi Hills, South West Khasi Hills and Eastern West Khasi Hills."
+    sql: "SELECT COUNT(*) FROM curated.v_nrlm WHERE district_lgd_code IN (274, 279, 658, 740);"
+    result: 12557
+
+  - user: "SHGs in West Khasi Hills"
+    fires: [west_khasi_without_qualifier]
+    assumptions_shown: "Reading West Khasi Hills as district 279; Eastern West Khasi Hills (740) is a separate district."
+    result: 2312
+
+  - user: "SHGs in Mawhati"
+    fires: [block_and_constituency_same_name]
+    assumptions_shown: "Reading Mawhati as the block. Mawhati is also an assembly constituency, which covers a different area."
+    result: 69
+    note: This default matters - Mawhati block has 69 SHGs but Mawhati constituency has 519. Reading it the wrong way is off by 7.5x.
+
+  - user: "SHGs by district - East Jaintia Hills and Eastern West Khasi Hills"
+    fires: [district_grouping_basis]
+    assumptions_shown: "Districts follow the LGD code; 12 SHGs named 'Eastern West Khasi Hills' in the source file are counted under East Jaintia Hills, their LGD district."
+    result: "East Jaintia Hills 2,744, Eastern West Khasi Hills 1,610"
+
+  - user: "SHGs by constituency"
+    fires: [constituency_breakdown, missing_top_n]
+    assumptions_shown: "Constituency figures cover 38,597 SHGs; 2,032 have no constituency recorded. Showing the top 5."
+    result: "Khliehriat 1,357; Sutnga-saipung 1,309; Rangsakona 1,114; Mawkyrwat 1,092; Mowkaiaw 1,066"
+
+  - user: "Revived SHGs in West Garo Hills"
+    fires: [shg_status_unspecified]
+    assumptions_shown: "Counting all SHGs on the register, active and inactive."
+    result: 622
+    note: West Garo Hills holds 36% of all 1,744 revived SHGs.
+
+  - user: "How many SHGs got CIF?"
+    fires: [shgs_with_fund_term, cif_term]
+    assumptions_shown: "An SHG has received Community Investment Fund when its recorded amount is above zero."
+    sql: "SELECT COUNT(*) FROM curated.v_nrlm WHERE cif_amount > 0;"
+    result: 10841
+
+  - user: "Average CIF in West Jaintia Hills"
+    fires: [average_fund_requested, money_question_without_period]
+    assumptions_shown: "Average shown across all SHGs and across SHGs that received the fund; 73% of SHGs hold no CIF statewide."
+    result: "Rs 46,589 across all 4,055 SHGs; Rs 92,471 across the 2,043 that received CIF"
+
+  - user: "Top 5 SHGs by CIF"
+    fires: [high_cif_in_ranking, single_shg_money_value]
+    assumptions_shown: "39 SHGs hold more than Rs 5 lakh CIF; these values are not yet confirmed by MSRLS. Amounts are in rupees."
+    result: "3329 Aibhahlang Shg Nongsohphan Rs 13,60,000; 9004 Laiohlang Shg Nrlm Rs 12,10,000; 12732 Kjatsngi Phyrnai Shg Rs 11,00,000; 5868 Kyntiew Shaphrang Shg Rs 8,80,000; 9005 Lateiskhem Shg Nrlm Rs 8,70,000"
+
+  - user: "Average RF per SHG in Dambo Rongjeng"
+    fires: [inactive_shgs_in_fund_figures, average_fund_requested]
+    assumptions_shown: "Inactive SHGs all show zero funds in the source; they are included and pull averages down."
+    note: Dambo Rongjeng has 97 inactive SHGs of 1,075 (91% active, among the lowest) - the caveat matters here.
+
+  - user: "How much RF is normal?"
+    fires: [rf_norm_reference]
+    assumptions_shown: "The usual Revolving Fund is Rs 15,000 per SHG (33,241 SHGs); 246 SHGs hold Rs 30,000."
+
+  - user: "Dormant SHGs in Shallang"
+    fires: [inactive_synonym_term]
+    assumptions_shown: "'dormant' is read as inactive - the only status recorded besides active."
+    result: 29
+    note: Shallang has 29 inactive of 223 (87% active) - the second-lowest active share of any block.
+
+  - user: "List SHGs in Rogu Alda"
+    fires: [shg_row_listing_limit, shg_listing_columns_unspecified]
+    assumptions_shown: "Showing SHG code, name, type, status, village, block, members, RF and CIF."
+    result_rows: 5
+
+  - user: "SHGs with no CIF in Sohiong"
+    fires: [zero_fund_values]
+    assumptions_shown: "SHGs with no fund recorded count as zero; there are no blank amounts in this data."
+    result: 726
+    note: Every SHG in Sohiong block - the block holds no CIF at all.
+
+  - user: "SHGs and PMAY houses by village"
+    fires: [cross_scheme_coverage_question]
+    assumptions_shown: "Each scheme is counted separately by LGD village code and the counts are then combined."
+
+  - user: "SHGs vs MGNREGA households by district"
+    fires: [cross_scheme_district_question]
+    assumptions_shown: "Each scheme is totalled by district separately and the totals are shown side by side."

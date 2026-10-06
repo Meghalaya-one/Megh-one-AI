@@ -29,7 +29,10 @@ _SUBJECT_TO_SCHEME = {"mgnrega": "MGNREGA", "pmay": "PMAY-G", "pmayg": "PMAY-G",
                       "cmelevatelegacy": "CM Elevate Legacy",
                       "cm elevate legacy": "CM Elevate Legacy",
                       "cm_elevate_disbursement": "CM Elevate Legacy",
-                      "cm elevate disbursement": "CM Elevate Legacy"}
+                      "cm elevate disbursement": "CM Elevate Legacy",
+                      "nrlm": "NRLM", "day-nrlm": "NRLM", "day_nrlm": "NRLM",
+                      "shg": "NRLM", "self_help_group": "NRLM",
+                      "livelihoods": "NRLM", "livelihood": "NRLM"}
 
 _cache: dict = {
     "loaded": False, "tables": [], "glossary": [], "metrics": [], "joins": [],
@@ -54,6 +57,8 @@ _TABLE_NAME_TO_SCHEME = {
     # hit, and every CM Elevate Legacy table name also contains "cm_elevate".
     "cm_elevate_disb": "CM Elevate Legacy",
     "cm_elevate": "CM Elevate",
+    "nrlm": "NRLM",
+    "shg": "NRLM",
     "focus_legacy": "Focus Legacy",
     "producer_group": "Focus Legacy",
     "pg_entity_type": "Focus Legacy",

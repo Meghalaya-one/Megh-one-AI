@@ -1,0 +1,509 @@
+# nrlm_classification_rules.yaml
+#
+# ===========================================================================
+# v1.0 - 2026-10-05 - FIRST VERSION, WRITTEN AGAINST THE CURATED STAR SCHEMA
+#
+# Target: curated.v_nrlm over curated.fact_nrlm_shg (megh_db). See
+# nrlm_schema_partitions.yaml for every column referenced here.
+#
+# Three facts about NRLM decide most of the rules in this file:
+#
+#   1. ONE ROW IS ONE SELF HELP GROUP. Not a person, not a payment. "How many
+#      beneficiaries" is ambiguous between SHGs and members and must be asked.
+#   2. THE ONLY YEAR IS THE FORMATION YEAR. There is no reporting year and no
+#      release date. Any question that puts money in a year, or asks for a trend
+#      or growth in money, is caught here before it reaches the generator.
+#   3. MONEY IS CUMULATIVE PER SHG AS AT ONE EXTRACT. Adds across SHGs, never
+#      across time. The table is a snapshot - there is no second point in time.
+#
+# Every count in a question below is a source-file figure (datasets/NRLM/NRLM.csv,
+# 2026-10-05) and has NOT been re-measured against megh_db.
+# ===========================================================================
+# Clarification rules for NRLM. First rule that fires wins; its question is asked
+# and the pipeline pauses. Editable by analysts - no code change needed.
+# {placeholders} are filled from the user's query at runtime.
+# Order matters: requests the source cannot answer are caught before missing detail
+# is asked for, so the bot never collects details for a question it cannot answer.
+# Conditions already filled silently by nrlm_default_rules.yaml are absent here.
+
+clarification_rules:
+
+  # ---- the source cannot answer this at all -----------------------------
+  - condition: "other_state_comparison_requested"
+    question: "Only Meghalaya is held here, so other states cannot be compared. Shall I compare districts within Meghalaya instead?"
+
+  - condition: "urban_livelihoods_requested"
+    question: "This data covers the rural Self Help Groups of NRLM only - urban livelihoods (DAY-NULM) are not held. Shall I answer for rural SHGs?"
+
+  - condition: "federation_requested"
+    question: "Village Organisations, Cluster Level Federations and other SHG federations are not held - the data has no federation identifier. Shall I answer at SHG level by village or block instead?"
+    note: Readiness clarification 8. No VO / CLF id exists in the source.
+
+  - condition: "savings_or_corpus_requested"
+    question: "SHG savings, corpus and internal lending are not held. The only money recorded is the Revolving Fund and Community Investment Fund each group has received. Shall I use those?"
+    note: Readiness clarification 10. RF and CIF are Mission grants, not savings - never substitute silently.
+
+  - condition: "bank_linkage_or_loan_requested"
+    question: "Bank linkage, bank loans, credit and loan outstanding are not held. Shall I report the Revolving Fund and CIF received instead?"
+    note: Readiness clarification 10.
+
+  - condition: "repayment_or_npa_requested"
+    question: "Repayment, overdue and NPA figures are not held - there is no loan data at all. Shall I report CIF received instead?"
+
+  - condition: "start_up_or_other_fund_requested"
+    question: "Only two funds are recorded - Revolving Fund and Community Investment Fund. Start-up funds, Vulnerability Reduction Fund and interest subvention are not held. Which of the two shall I use?"
+
+  - condition: "budget_or_target_requested"
+    question: "Targets, allocations and budgets are not held - only the SHGs on the register and the funds they hold. Shall I report actual SHGs and funds instead?"
+
+  - condition: "saturation_or_coverage_requested"
+    question: "Total rural households and eligible women are not held, so saturation or mobilisation coverage cannot be calculated. Would SHGs or members per block work instead?"
+
+  - condition: "per_capita_requested"
+    question: "Population figures are not held, so per-capita figures cannot be calculated. Would members per SHG, or SHGs per village, work instead?"
+
+  - condition: "member_level_detail_requested"
+    question: "Individual members are not held - no names, ages, social category, Aadhaar or contact details. Only the male and female member count of each SHG is recorded. Shall I use those counts?"
+
+  - condition: "social_category_requested"
+    question: "SC/ST/minority, PVTG, BPL and disability status are not held, for members or for SHGs. Shall I answer by SHG type or district instead?"
+
+  - condition: "livelihood_activity_requested"
+    question: "The livelihood activity of an SHG (farm, non-farm, livestock, enterprise) is not held. Shall I answer by SHG type, district or block?"
+
+  - condition: "training_or_capacity_building_requested"
+    question: "Training, capacity building and community resource persons are not held. Shall I answer on SHGs, members and funds?"
+
+  - condition: "grading_or_meeting_requested"
+    question: "SHG grading, meeting frequency, bookkeeping and Panchasutra compliance are not held. The only status recorded is active or inactive - shall I use that?"
+
+  - condition: "dissolution_or_history_requested"
+    question: "Dissolved, merged or renamed groups are not tracked - there is only a current active/inactive flag, with no date or reason. Shall I report inactive SHGs?"
+    note: Readiness clarification 9.
+
+  - condition: "formation_date_or_month_requested"
+    question: "Only the financial year of formation is recorded - the formation date field arrived empty. Shall I answer by formation year ({value} if given)?"
+    note: group_form was '00:00.0' on every source row and was dropped at ingest.
+
+  - condition: "other_scheme_requested"
+    question: "This source holds NRLM Self Help Groups only. Shall I answer for NRLM alone?"
+
+  - condition: "below_village_geography_requested"
+    question: "Geography runs down to village only - there is no habitation, ward or household location. Which village should I report on?"
+
+  # ---- time and money: the NRLM-specific refusals ------------------------
+  - condition: "money_in_a_year_requested"
+    question: "Fund amounts are cumulative totals each SHG has received, with no release date - so '{value}' cannot be applied to money. I can show the funds held by SHGs FORMED in {value}, which is a different figure. Shall I?"
+    critical: true
+    note: >
+      THE most important rule in this file. formation_financial_year is not a release
+      year. Filtering money by it answers a different question. Never do it silently.
+
+  - condition: "money_trend_or_growth_requested"
+    question: "The data is a single snapshot with no release dates, so growth or a trend in funds over time cannot be calculated. Shall I show current fund totals by district, or SHG formation by year instead?"
+    critical: true
+
+  - condition: "fund_utilisation_requested"
+    question: "Only funds received are recorded, not how they were spent or repaid, so utilisation cannot be calculated. Shall I report funds received?"
+
+  - condition: "extract_comparison_requested"
+    question: "Only the current extract is held - each new file replaces the last, so earlier positions cannot be compared. Shall I report the current position?"
+
+  - condition: "current_year_or_recent_formation_requested"
+    question: "The latest formation year in this data is 2022-23 - no SHG formed after that is held. Shall I report SHGs formed in 2022-23, or all SHGs?"
+
+  # ---- data quality ------------------------------------------------------
+  - condition: "inactive_shg_funds_requested"
+    question: "Every inactive SHG shows zero RF and zero CIF. That is how the source records them - the reason (never released, recovered, or zeroed on deactivation) is not known. Report the zero with that caveat?"
+    note: NR-15.
+
+  - condition: "duplicate_shgs_explicitly_requested"
+    question: "5 pairs of SHGs are identical in every field except their code - probable double registration, not yet confirmed. Shall I list them, or count them as separate groups as usual?"
+    note: NR-24. is_possible_duplicate.
+
+  - condition: "high_cif_values_questioned"
+    question: "39 SHGs hold more than Rs 5 lakh CIF (up to Rs 13.6 lakh). These are real rows but not yet confirmed by the client. Include them, or show results without them?"
+    note: NR-25.
+
+  - condition: "unresolved_village_shgs_in_village_question"
+    question: "2,032 SHGs have no village recorded - they are counted in their block and district but cannot be placed in a village. Shall I report village figures without them, and give their number separately?"
+
+  - condition: "constituency_total_mismatch"
+    question: "Constituency is blank for 2,032 SHGs, so constituency figures add up to 38,597, not the State total of 40,629. Continue with that noted?"
+
+  - condition: "source_name_vs_lgd_name_requested"
+    question: "The source file names 12 SHGs in village Tangnub as 'Eastern West Khasi Hills / Mairang', but their LGD codes are East Jaintia Hills / Saipung. The database uses the codes. Which do you want?"
+    note: has_name_code_conflict.
+
+  - condition: "gp_used_as_geography_level"
+    question: "'GP name' is free text typed in the source, with no code, and is not part of the LGD district-block-village hierarchy - it differs from the LGD village on about a quarter of SHGs. Use it anyway, or answer by village or block?"
+
+  - condition: "cross_scheme_money_comparison"
+    question: "NRLM funds are cumulative totals held by SHGs with no year, while other schemes record money in a year. They are not like for like. Compare them anyway, with that stated, or compare SHG counts instead?"
+
+  - condition: "cross_scheme_row_level_request"
+    question: "NRLM is recorded per SHG and other schemes per house, payment or village-year, so they cannot be listed side by side row by row. Shall I compare them by village or district totals?"
+
+  # ---- measures that exist but must not be reported as asked -------------
+  - condition: "beneficiaries_ambiguous"
+    question: "'Beneficiaries' could mean SHGs (40,629) or SHG members (410,847). Which one?"
+
+  - condition: "households_requested"
+    question: "Households are not recorded - only SHG members. One member is usually one household, but that is an assumption. Shall I report members?"
+
+  - condition: "fund_unspecified"
+    question: "Which fund - Revolving Fund, Community Investment Fund, or both?"
+
+  - condition: "rf_cif_added_together"
+    question: "RF and CIF are different instruments - RF is a small grant to most SHGs, CIF a larger fund to about a quarter of them. Show them separately, or one combined total?"
+
+  - condition: "average_fund_population_unclear"
+    question: "Average across all SHGs, or only those that received the fund? 73% of SHGs hold no CIF, so the two averages differ greatly."
+
+  - condition: "pre_nrlm_type_vs_year"
+    question: "'Pre-NRLM' could mean the 432 SHGs typed Pre-Nrlm, or the 645 SHGs formed before 2011-12. Which one?"
+
+  - condition: "women_scope_unclear"
+    question: "Women members (409,249), or women's SHGs? Nearly all SHGs are all-women - 39,924 have no male member."
+
+  - condition: "status_word_unclear"
+    question: "Only active or inactive is recorded. Does '{value}' mean inactive?"
+
+  - condition: "new_shg_word_unclear"
+    question: "'New' could mean the SHG type 'New' (38,453 SHGs) or SHGs formed recently. Which one?"
+
+  # ---- time -------------------------------------------------------------
+  - condition: "bare_year_formation_or_fy"
+    question: "'{value}' - do you mean SHGs formed in FY {fy_label}? (That is the only year in this data.)"
+
+  - condition: "ambiguous_year_shorthand"
+    question: "'{value}' could be FY {fy_label_a} or FY {fy_label_b}. Which formation year did you mean?"
+
+  - condition: "vague_recency"
+    question: "'{value}' is not a fixed period, and the only year held is the formation year. Which formation year - or all SHGs?"
+
+  - condition: "formation_growth_period_missing"
+    question: "Growth in SHG formation between which two financial years?"
+
+  - condition: "formation_series_full_range"
+    question: "Formation runs from 1984-85 to 2022-23 - 30 years, most before 2014-15 holding under 100 SHGs. Show all years, or 2014-15 onward with earlier years grouped?"
+
+  - condition: "reversed_year_range"
+    question: "'{value}' runs backwards. Did you mean {corrected_range}?"
+
+  # ---- which measure ----------------------------------------------------
+  - condition: "missing_metric_for_ranking"
+    question: "Top by what - number of SHGs, members, Revolving Fund, or CIF?"
+
+  - condition: "vague_qualifier"
+    question: "What should '{value}' be measured by - number of SHGs, members, share active, or funds received?"
+
+  - condition: "performance_term_unclear"
+    question: "Performance measured how - share of SHGs active, share with CIF, or funds per SHG? No outcome data is held."
+
+  - condition: "ambiguous_count_subject"
+    question: "A count of what - SHGs, members, villages, or blocks?"
+
+  - condition: "rate_vs_count_unclear"
+    question: "The number of SHGs, or the share as a percentage?"
+
+  # ---- geography --------------------------------------------------------
+  - condition: "missing_geography_level_for_breakdown"
+    question: "Broken down by which level - district, block, village, or constituency?"
+
+  - condition: "ambiguous_geography_level"
+    question: "'{value}' is both a {level_a} and a {level_b} name. Which did you mean?"
+
+  - condition: "ambiguous_village_needs_block"
+    question: "There is more than one village called {value} - in {blocks}. Which block?"
+    note: 197 village names map to more than one LGD village code.
+
+  - condition: "ambiguous_gp_name"
+    question: "'{value}' is a GP name used in {blocks}. Which block - or did you mean the village {value}?"
+
+  - condition: "eastern_west_vs_west_khasi"
+    question: "Eastern West Khasi Hills (Mairang, Mawthadraishan) and West Khasi Hills are separate districts. Which one did you mean?"
+
+  - condition: "blocked_fuzzy_pair"
+    question: "'{value}' is close to both {candidate_a} and {candidate_b}, which are different places. Which one?"
+
+  - condition: "constituency_spelling_variant"
+    question: "Did you mean {canonical} constituency (number {number})?"
+
+  - condition: "mixed_geography_levels_compared"
+    question: "{value_a} is a {level_a} and {value_b} is a {level_b}, so comparing them is not like-for-like. Compare at {level_b} level instead?"
+
+  - condition: "village_level_breakdown_size"
+    question: "A village-level breakdown returns up to 4,976 rows. Shall I show the top 10, or restrict it to one district or block?"
+
+  - condition: "unmatched_geography_name"
+    question: "I could not match '{value}' to any district, block, village or constituency in the NRLM data. Did you mean {suggestions}?"
+
+  # ---- identifiers and values -------------------------------------------
+  - condition: "shg_name_matches_many"
+    question: "{match_count} SHGs are called '{value}' - in {places}. Which one? You can also give me the SHG code."
+    note: shg_name is not unique - 27,692 names for 40,629 SHGs; 'Iatreilang Shg' alone is 295.
+
+  - condition: "unmatched_shg_code"
+    question: "No SHG carries code '{value}'. Codes run from 2 to 46,368. Shall I search by SHG name instead?"
+
+  - condition: "unmatched_shg_name"
+    question: "No SHG is called '{value}'. Did you mean {suggestions}?"
+
+  - condition: "unmatched_status_or_type"
+    question: "'{value}' is not a recorded {dimension}. Recorded values are {allowed_values}. Which did you mean?"
+
+  # ---- shape of the answer ----------------------------------------------
+  - condition: "missing_aggregation_level"
+    question: "At what level - statewide, by district, by block, by village, or by constituency?"
+
+  - condition: "ambiguous_average_denominator"
+    question: "Average per what - per SHG, per village, or per block?"
+
+  - condition: "ranking_direction_unclear"
+    question: "Highest or lowest?"
+
+  - condition: "missing_comparison_target"
+    question: "Compare {value} with which other district, block or SHG type?"
+
+  - condition: "share_denominator_missing"
+    question: "As a share of what - the district total, or the State total of 40,629 SHGs?"
+
+  - condition: "percentage_vs_count"
+    question: "As percentages, or as counts?"
+
+  - condition: "district_by_formation_year_grid"
+    question: "District by formation year gives up to 360 rows. Shall I show it as a chart, or restrict it to one district or recent years?"
+
+  - condition: "multi_measure_table"
+    question: "Which measures should the table carry - SHGs, active SHGs, members, RF, CIF?"
+
+  - condition: "columns_for_record_listing"
+    question: "Which fields do you need - SHG code, name, type, status, village, members, RF and CIF are the usual set?"
+
+  - condition: "list_vs_aggregate"
+    question: "Do you want the individual SHGs listed, or a summary count?"
+
+# ===========================================================================
+# v1.1 - 2026-10-05 - WORKED EXAMPLES
+#
+# Real user questions, the condition that fires, and the question the bot asks -
+# with the placeholders filled from the data. Every figure is from
+# datasets/NRLM/NRLM.csv, grouped by LGD code. Use these to test the gate and as
+# retrieval examples for the classifier.
+# ===========================================================================
+worked_examples:
+
+  # ---- money and time: the refusals that matter most ---------------------
+  - user: "How much RF was released in 2021-22?"
+    fires: money_in_a_year_requested
+    bot_asks: "Fund amounts are cumulative totals each SHG has received, with no release date - so '2021-22' cannot be applied to money. I can show the funds held by SHGs FORMED in 2021-22, which is a different figure. Shall I?"
+    if_yes: "SHGs formed in 2021-22 (6,028) hold Rs 6.69 crore RF and Rs 1.47 crore CIF to date."
+
+  - user: "CIF disbursed in West Jaintia Hills last year"
+    fires: money_in_a_year_requested
+    bot_asks: "Fund amounts have no release date, so 'last year' cannot be applied. West Jaintia Hills SHGs hold Rs 18.89 crore CIF to date - shall I show that, or the CIF held by its SHGs formed in 2022-23?"
+
+  - user: "Show the growth of CIF in East Khasi Hills over the years"
+    fires: money_trend_or_growth_requested
+    bot_asks: "The data is a single snapshot with no release dates, so growth in funds cannot be calculated. Shall I show current CIF by block in East Khasi Hills, or SHG formation by year?"
+
+  - user: "Has RF increased since last extract?"
+    fires: extract_comparison_requested
+    bot_asks: "Only the current extract is held - each new file replaces the last. Shall I report the current position (Rs 50.86 crore RF statewide)?"
+
+  - user: "What is the RF utilisation in Ri Bhoi?"
+    fires: fund_utilisation_requested
+    bot_asks: "Only funds received are recorded, not how they were spent or repaid. Ri Bhoi SHGs have received Rs 5.25 crore RF - shall I report that?"
+
+  - user: "How many SHGs were formed this year?"
+    fires: current_year_or_recent_formation_requested
+    bot_asks: "The latest formation year in this data is 2022-23 - no SHG formed after that is held. Shall I report SHGs formed in 2022-23 (1,680), or all SHGs?"
+
+  # ---- not held at all ----------------------------------------------------
+  - user: "Total savings of SHGs in Jirang block"
+    fires: savings_or_corpus_requested
+    bot_asks: "SHG savings and corpus are not held. Jirang SHGs have received Rs 84.00 lakh RF and Rs 1.38 crore CIF - shall I use those?"
+
+  - user: "Bank loans taken by SHGs in North Garo Hills"
+    fires: bank_linkage_or_loan_requested
+    bot_asks: "Bank linkage and loans are not held. Shall I report the RF (Rs 3.42 crore) and CIF (Rs 4.63 crore) received by North Garo Hills SHGs instead?"
+
+  - user: "Which VO in Mawkyrwat has the most SHGs?"
+    fires: federation_requested
+    bot_asks: "Village Organisations are not held - there is no federation identifier. Shall I show SHGs by village in Mawkyrwat block instead? (144 villages, 1,106 SHGs)"
+
+  - user: "List members of SHG 3329"
+    fires: member_level_detail_requested
+    bot_asks: "Individual members are not held - SHG 3329 records 12 members, all women. Shall I show the SHG's details instead?"
+
+  - user: "How many ST women are in SHGs in East Garo Hills?"
+    fires: social_category_requested
+    bot_asks: "Social category is not held. East Garo Hills SHGs have 27,019 women members in all - shall I report that?"
+
+  - user: "SHGs doing piggery in Ri Bhoi"
+    fires: livelihood_activity_requested
+    bot_asks: "The livelihood activity of an SHG is not held. Shall I show Ri Bhoi SHGs by block or type instead?"
+
+  - user: "Which SHGs follow Panchasutra in Umsning?"
+    fires: grading_or_meeting_requested
+    bot_asks: "Grading and Panchasutra compliance are not held; only active/inactive. In Umsning, 997 of 1,035 SHGs are active - shall I use that?"
+
+  - user: "When was SHG 9004 formed - exact date?"
+    fires: formation_date_or_month_requested
+    bot_asks: "Only the financial year of formation is recorded - SHG 9004 was formed in 2018-19. Shall I answer by formation year?"
+
+  - user: "Compare NRLM SHGs in Meghalaya and Assam"
+    fires: other_state_comparison_requested
+    bot_asks: "Only Meghalaya is held here. Shall I compare districts within Meghalaya instead?"
+
+  - user: "SHGs in Shillong city under NULM"
+    fires: urban_livelihoods_requested
+    bot_asks: "This data covers rural NRLM SHGs only. Shall I answer for rural SHGs - e.g. the 168 in Mawlai block?"
+
+  # ---- data quality ---------------------------------------------------------
+  - user: "How much RF did inactive SHGs get in West Garo Hills?"
+    fires: inactive_shg_funds_requested
+    bot_asks: "All 278 inactive SHGs in West Garo Hills show zero RF and CIF - the source records every inactive SHG that way, and the reason is not known. Report the zero with that caveat?"
+
+  - user: "Are there duplicate SHGs?"
+    fires: duplicate_shgs_explicitly_requested
+    bot_asks: "5 pairs look like double registrations (identical except the SHG code), e.g. 'Green Hills Shg Msrls' twice in Gumaijhora, Demdema block (codes 34950 and 36695). List all 5 pairs, or keep counting them as separate groups?"
+
+  - user: "Why does Aibhahlang Shg have 13.6 lakh CIF?"
+    fires: high_cif_values_questioned
+    bot_asks: "SHG 3329 (Aibhahlang Shg Nongsohphan, Pynursla) is the highest of 39 SHGs above Rs 5 lakh - 13 of them in Pynursla block. The values are unconfirmed by MSRLS. Show them, or results without them?"
+
+  - user: "Top 10 villages by SHGs in Umsning"
+    fires: unresolved_village_shgs_in_village_question
+    bot_asks: "316 of Umsning's 1,035 SHGs have no village recorded. Shall I rank villages without them and give the 316 separately?"
+
+  - user: "SHGs by constituency adding up to state total"
+    fires: constituency_total_mismatch
+    bot_asks: "Constituency is blank for 2,032 SHGs, so constituency figures add up to 38,597, not 40,629. Continue with that noted?"
+
+  - user: "What district does the file say Tangnub is in?"
+    fires: source_name_vs_lgd_name_requested
+    bot_asks: "The source file names 12 SHGs in Tangnub as 'Eastern West Khasi Hills / Mairang', but their LGD codes are East Jaintia Hills / Saipung (657 / 2000). Which do you want?"
+
+  - user: "SHGs per GP in Laskein"
+    fires: gp_used_as_geography_level
+    bot_asks: "GP names are free text with no code, and differ from the LGD village on about a quarter of SHGs. Use them anyway, or answer by village (76 villages in Laskein)?"
+
+  - user: "Compare NRLM CIF with MGNREGA expenditure by district"
+    fires: cross_scheme_money_comparison
+    bot_asks: "NRLM CIF is a cumulative amount held by SHGs with no year; MGNREGA expenditure is spent in a financial year, in lakh. They are not like for like. Compare anyway with that stated, or compare SHG counts with MGNREGA households?"
+
+  - user: "Show each PMAY house next to the SHGs in its village"
+    fires: cross_scheme_row_level_request
+    bot_asks: "NRLM is per SHG and PMAY per house, so they cannot be listed row by row. Shall I compare them by village totals?"
+
+  # ---- ambiguity in the measure ------------------------------------------------
+  - user: "How many beneficiaries does NRLM have in Ri Bhoi?"
+    fires: beneficiaries_ambiguous
+    bot_asks: "'Beneficiaries' could mean SHGs (3,708 in Ri Bhoi) or SHG members (38,276). Which one?"
+
+  - user: "How many households are covered in South Garo Hills?"
+    fires: households_requested
+    bot_asks: "Households are not recorded - only members (20,434 in South Garo Hills). Treating one member as one household is an assumption. Report members?"
+
+  - user: "Total fund in Mawkyrwat block"
+    fires: fund_unspecified
+    bot_asks: "Which fund - Revolving Fund (Rs 1.45 crore), Community Investment Fund (Rs 5.84 crore), or both?"
+
+  - user: "Add RF and CIF for Laskein"
+    fires: rf_cif_added_together
+    bot_asks: "RF and CIF are different instruments - in Laskein, 1,795 SHGs hold RF (Rs 2.70 crore) but 1,069 hold CIF (Rs 11.85 crore). Show them separately, or one combined total (Rs 14.55 crore)?"
+
+  - user: "Average CIF per SHG in East Khasi Hills"
+    fires: average_fund_population_unclear
+    bot_asks: "Across all 6,768 SHGs, or only the 795 that received CIF? 88% of East Khasi Hills SHGs hold none, so the two averages differ greatly."
+
+  - user: "How many pre-NRLM SHGs are there?"
+    fires: pre_nrlm_type_vs_year
+    bot_asks: "'Pre-NRLM' could mean the 432 SHGs typed Pre-Nrlm, or the 645 SHGs formed before 2011-12. Which one?"
+
+  - user: "How many women's SHGs in West Jaintia Hills?"
+    fires: women_scope_unclear
+    bot_asks: "Women members (40,591), or all-women SHGs? 186 of West Jaintia Hills' 4,055 SHGs include a man - the most male membership of any district."
+
+  - user: "How many dormant SHGs?"
+    fires: status_word_unclear
+    bot_asks: "Only active or inactive is recorded. Does 'dormant' mean inactive (1,197 SHGs)?"
+
+  - user: "New SHGs in East Khasi Hills"
+    fires: new_shg_word_unclear
+    bot_asks: "'New' could mean the SHG type 'New' (6,540 in East Khasi Hills) or SHGs formed recently (450 formed in 2022-23). Which one?"
+
+  # ---- time -----------------------------------------------------------------
+  - user: "SHGs formed in 2020"
+    fires: bare_year_formation_or_fy
+    bot_asks: "'2020' - do you mean SHGs formed in FY 2020-21 (11,354)? Or FY 2019-20 (10,604), which also includes part of 2020?"
+
+  - user: "SHGs formed in FY21"
+    fires: ambiguous_year_shorthand
+    bot_asks: "'FY21' could be FY 2020-21 (11,354 SHGs formed) or FY 2021-22 (6,028). Which formation year did you mean?"
+
+  - user: "SHG formation over all years"
+    fires: formation_series_full_range
+    bot_asks: "Formation runs from 1984-85 to 2022-23 - 30 years, most before 2014-15 holding under 110 SHGs each. Show all years, or 2014-15 onward with the earlier 931 grouped?"
+
+  # ---- geography ------------------------------------------------------------
+  - user: "SHGs in Umsaw"
+    fires: ambiguous_village_needs_block
+    bot_asks: "There are 7 villages called Umsaw - in Nongstoin (13 SHGs), Shella Bholaganj (11), Jirang (10), Sohiong (9), Mawkyrwat (7), Mawryngkneng (3) and Bhoirymbong (2). Which block?"
+
+  - user: "SHGs in Mawlong"
+    fires: ambiguous_village_needs_block
+    bot_asks: "Mawlong is 4 different villages - Umling (23 SHGs), Mawpat (18), Amlarem (11), Shella Bholaganj (9). Which block?"
+
+  - user: "SHGs in Mawlong GP"
+    fires: ambiguous_gp_name
+    bot_asks: "'Mawlong' is a GP name used in Umling, Mairang, Mawpat, Shella Bholaganj and Amlarem. Which block - or did you mean one of the 4 villages called Mawlong?"
+
+  - user: "SHGs in West Khasi"
+    fires: eastern_west_vs_west_khasi
+    bot_asks: "West Khasi Hills (2,312 SHGs) and Eastern West Khasi Hills (Mairang, Mawthadraishan - 1,610 SHGs) are separate districts. Which one did you mean?"
+
+  - user: "SHGs in Sohiong constituency"
+    fires: constituency_spelling_variant
+    bot_asks: "Did you mean Sohing constituency (number 23, stored as '23 SOHIONG')? It has 837 SHGs."
+
+  - user: "Compare Laskein with East Khasi Hills"
+    fires: mixed_geography_levels_compared
+    bot_asks: "Laskein is a block and East Khasi Hills is a district, so comparing them is not like-for-like. Compare Laskein with East Khasi Hills' blocks instead?"
+
+  - user: "SHGs by village"
+    fires: village_level_breakdown_size
+    bot_asks: "A village-level breakdown returns up to 4,976 rows. Shall I show the top 10 (led by Barato, 104 SHGs), or restrict it to one district or block?"
+
+  - user: "SHGs in Cherrapunji"
+    fires: unmatched_geography_name
+    bot_asks: "I could not match 'Cherrapunji' to a district, block or village in the NRLM data. Did you mean Sohra constituency (number 28, 624 SHGs) or Shella Bholaganj block?"
+    note: Cherrapunji is the old name of Sohra. Worth adding as a constituency alias if users keep typing it.
+
+  # ---- identifiers ------------------------------------------------------------
+  - user: "Show Iatreilang Shg"
+    fires: shg_name_matches_many
+    bot_asks: "295 SHGs are called 'Iatreilang Shg' - in East Khasi Hills (113), Ri Bhoi (42), Eastern West Khasi Hills (38), West Khasi Hills (38) and 3 more districts. Which one? You can also give the SHG code."
+
+  - user: "SHG code 50000"
+    fires: unmatched_shg_code
+    bot_asks: "No SHG carries code '50000'. Codes run from 2 to 46,368. Shall I search by SHG name instead?"
+
+  - user: "SHGs of type Federated"
+    fires: unmatched_status_or_type
+    bot_asks: "'Federated' is not a recorded SHG type. Recorded values are New, Revived, Pre-Nrlm. Which did you mean?"
+
+  # ---- shape of the answer ------------------------------------------------------
+  - user: "Top districts"
+    fires: missing_metric_for_ranking
+    bot_asks: "Top by what - number of SHGs (East Khasi Hills leads with 6,768), members, Revolving Fund, or CIF (West Jaintia Hills leads with Rs 18.89 crore)?"
+
+  - user: "Best performing block"
+    fires: performance_term_unclear
+    bot_asks: "Performance measured how - share of SHGs active, share with CIF, or funds per SHG? No outcome data is held."
+
+  - user: "SHGs by district and formation year"
+    fires: district_by_formation_year_grid
+    bot_asks: "District by formation year gives up to 360 rows. Shall I show it as a chart, or restrict it to one district or 2015-16 onward?"

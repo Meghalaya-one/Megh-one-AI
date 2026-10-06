@@ -1114,6 +1114,21 @@ sql_generation_examples:
     Do not read level2 as 'further along'. The data does not assert a progression, and
     level0 co-occurs with sent-back files.
 
+- question: How many CM Elevate unique applications are pending at level 1 for all of Meghalaya?
+  sql: |
+    SELECT COUNT(DISTINCT request_id) AS unique_applications
+    FROM curated.v_cm_elevate
+    WHERE LOWER(current_level) = 'level1'
+      AND scheme_specific ->> 'file_status' = 'Pending';
+  tables:
+  - curated.v_cm_elevate
+  note: >
+    Decided 2026-10-05: "pending at level N" = the file sits at that level AND its
+    decision state is still Pending (file_status) - the Rejected and Approved files at
+    level 1 are not pending. "unique" /
+    "distinct" applications = COUNT(DISTINCT request_id), never COUNT(*). A plain
+    "pending" with no level is data_verified = 'On Hold'.
+
 - question: How many applications were withdrawn?
   sql: |
     SELECT COUNT(*) FILTER (WHERE is_withdraw IS TRUE) AS withdrawn,

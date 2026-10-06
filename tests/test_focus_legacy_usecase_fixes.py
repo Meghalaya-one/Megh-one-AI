@@ -201,9 +201,13 @@ def test_group_size_examples_in_the_bank():
 
 
 # ── TC-12: duplicates wording ────────────────────────────────────────────────
-def test_duplicate_question_gets_the_repeat_payment_note():
+def test_duplicate_question_gets_the_paid_more_than_once_note():
+    # 2026-10-07 (KI-187): the product owner confirmed a duplicate producer group is
+    # one PAID MORE THAN ONCE (2,655) — replaces the 2026-09-25 "repeat payment" note
+    # and the withdrawn 2026-10-06 same-year-only count.
     notes = p._focus_legacy_answer_notes("Are there any duplicate Producer Groups there?")
-    assert notes and "REPEAT PAYMENT" in notes[0]
+    assert notes and "PAID MORE THAN ONCE" in notes[0] and "SAME FINANCIAL YEAR" not in notes[0]
+    assert "never call those groups duplicates" not in " ".join(p._focus_legacy_answer_notes("Are there duplicate payments?"))
     assert p._focus_legacy_answer_notes("How many producer groups are there?") == []
 
 
@@ -375,8 +379,12 @@ def test_ki148_constituency_alone_does_not_pin_mgnrega(q, expected):
 
 def test_ki148_scheme_question_offers_only_constituency_schemes():
     c = p._scheme_clarification("What is the total amount disbursed for Baghmara assembly constituency?")
-    assert [o["label"].split(" (")[0] for o in c.options] == ["MGNREGA", "Focus Legacy", "CM Elevate Legacy"]
-    assert len(p._scheme_clarification("total amount disbursed in 2024").options) == 7
+    # NRLM added 2026-10-06: it holds constituency data too, so an AC question
+    # must be able to reach it (KI-148 lists only AC-capable schemes).
+    assert [o["label"].split(" (")[0] for o in c.options] == ["MGNREGA", "Focus Legacy",
+                                                             "CM Elevate Legacy", "NRLM"]
+    # 6 schemes + "Compare across schemes" until NRLM landed (2026-10-06); 7 + 1 now.
+    assert len(p._scheme_clarification("total amount disbursed in 2024").options) == 8
 
 
 def test_ki146_drilldown_names_the_scheme_data():
@@ -690,7 +698,8 @@ def test_verifier_district_complaint_beside_village_code_is_discarded():
              "WHERE clause filters on village_code = '272807' and omits the required lgd_district filter.")
     sql = "SELECT DISTINCT pg_id, MAX(pg_name) AS pg_name FROM curated.v_focus_legacy WHERE village_code = '272807' GROUP BY pg_id"
     assert p._verifier_village_code_complaint_is_false(issue, FL, {"village_code": 272807, "district": "WEST GARO HILLS"}, sql)
-    assert not p._verifier_village_code_complaint_is_false(issue, ["CM Elevate Legacy"], {"village_code": 272807}, sql)
+    # CM Elevate Legacy joined this guard later (KI-173); a multi-scheme question is still outside it
+    assert not p._verifier_village_code_complaint_is_false(issue, ["Focus Plus", "PMAY-G"], {"village_code": 272807}, sql)
 
 
 @pytest.mark.parametrize("q,name", [
@@ -750,3 +759,84 @@ def test_id_only_group_list_gets_names(monkeypatch):
     # a result that already has names, or carries figures, is left alone
     assert asyncio.run(p._fl_add_group_names([{"pg_id": "X", "pg_name": "Y"}])) == [{"pg_id": "X", "pg_name": "Y"}]
     assert asyncio.run(p._fl_add_group_names([{"pg_id": "X", "amount": 5}])) == [{"pg_id": "X", "amount": 5}]
+
+
+# ── 2026-10-03: a year-gap sentence is not a hedge (KI-183) ──────────────────
+_GAP_SQL = ("SELECT financial_year_short, SUM(amount_disbursed) AS amount_disbursed FROM curated.v_focus_legacy "
+            "WHERE financial_year_short IN ('2022-23', '2024-25') GROUP BY financial_year_short")
+_GAP_ROWS = [{"financial_year_short": "2022-23", "amount_disbursed": Decimal("141790000")},
+             {"financial_year_short": "2024-25", "amount_disbursed": Decimal("114990000")}]
+_GAP_NOTE = ("FY 2023-24 holds no data for this scheme, so FY 2022-23 — the nearest financial year that "
+             "does — is compared instead. That is a gap in the records, not a zero.")
+
+
+def _compose_with(monkeypatch, text):
+    async def composer(prompt, *a, **k):
+        return text
+    monkeypatch.setattr(p.llm, "call_response_composer", composer)
+    return asyncio.run(p.compose_response(
+        "Compare total remittances between financial years 2022-23 and 2024-25 for Focus Legacy",
+        _GAP_SQL, _GAP_ROWS, notes=[_GAP_NOTE], schemes=FL))
+
+
+def test_gap_year_sentence_does_not_discard_a_correct_comparison(monkeypatch):
+    good = ("Focus Legacy disbursed 141,790,000 in FY 2022-23 and 114,990,000 in FY 2024-25. "
+            "The scheme has no data for FY 2023-24, so the comparison uses the nearest available years.")
+    out = _compose_with(monkeypatch, good)
+    assert out.startswith("Focus Legacy disbursed") and "Here are the 2 results" not in out
+
+
+def test_a_real_hedge_over_the_result_is_still_replaced(monkeypatch):
+    bad = "The data available doesn't cover remittances for FY 2022-23 or FY 2024-25."
+    out = _compose_with(monkeypatch, bad)
+    assert "doesn't cover" not in out
+
+
+# ── 2026-10-07: duplicate producer groups = paid more than once (KI-187) ─────
+def _dup_rows():
+    def r(pid, n, fys):
+        return {"pg_id": pid, "pg_name": f"G{pid}", "district": "WEST KHASI HILLS", "block": "NONGSTOIN",
+                "payments": n, "amount_disbursed": Decimal(5000 * n), "financial_years": fys}
+    # PG-A three times, PG-B and PG-C twice (PG-B in two different years — still a duplicate), PG-D once
+    return [r("PG-A", 3, "2022-23, 2025-26"), r("PG-B", 2, "2022-23, 2025-26"), r("PG-C", 2, "2025-26"),
+            r("PG-D", 1, "2024-25")]
+
+
+def test_duplicates_are_groups_paid_more_than_once(monkeypatch):
+    seen = {}
+
+    async def fake(sql, params):
+        seen["sql"], seen["params"] = sql, params
+        return _dup_rows()
+    monkeypatch.setattr(p, "fetch_rows", fake)
+    out = asyncio.run(p._focus_legacy_duplicate_groups_answer("Are there any duplicate Producer Groups there?", {}, {}))
+    a = out["answer"]
+    assert a.startswith("Yes — 3 of the 4 Focus Legacy producer groups are duplicates")
+    assert "2 paid twice, 1 paid 3 times" in a and "7 of the 8 payment records" in a
+    assert "0 duplicate" not in a and {r["pg_id"] for r in out["data"]} == {"PG-A", "PG-B", "PG-C"}
+    assert "GROUP BY pg_id ORDER BY" in seen["sql"] and seen["params"] == []
+
+
+def test_duplicates_for_one_year_and_place_and_the_no_answer(monkeypatch):
+    seen = {}
+
+    async def fake(sql, params):
+        seen["sql"], seen["params"] = sql, params
+        return [r for r in _dup_rows() if r["payments"] == 1]
+    monkeypatch.setattr(p, "fetch_rows", fake)
+    out = asyncio.run(p._focus_legacy_duplicate_groups_answer(
+        "Are there duplicate PGs in Nongstoin block in FY 2024-25?", {"block": "NONGSTOIN", "year_key": 2024},
+        {"block": "Nongstoin", "year": "FY 2024-25"}))
+    assert out["answer"].startswith(
+        "No — none of the 1 Focus Legacy producer groups in Nongstoin block in FY 2024-25 is a duplicate")
+    assert seen["params"] == ["NONGSTOIN", "2024-25"]
+    assert "UPPER(lgd_block) = $1" in seen["sql"] and "financial_year_short = $2" in seen["sql"]
+
+
+def test_duplicate_groups_answer_leaves_other_shapes_to_the_model(monkeypatch):
+    async def boom(*a, **k):
+        raise AssertionError("must not query")
+    monkeypatch.setattr(p, "fetch_rows", boom)
+    assert asyncio.run(p._focus_legacy_duplicate_groups_answer("Are there duplicate payments?", {}, {})) is None
+    assert asyncio.run(p._focus_legacy_duplicate_groups_answer(
+        "Are there duplicate producer groups in Songsak constituency?", {"assembly_constituency": "SONGSAK"}, {})) is None

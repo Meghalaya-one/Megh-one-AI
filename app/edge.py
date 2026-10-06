@@ -463,6 +463,14 @@ _DOMAIN_WORDS = [
     "cm elevate", "cmelevate", "cm-elevate", "piggery", "poultry", "warehouse scheme",
     # CM Elevate Legacy's own vocabulary (lender and desanction fields).
     "lifcom", "desanction", "loan entity", "lender",
+    # NRLM's vocabulary. Without these an SHG question with no other domain word
+    # ("how many shgs are there?") is bounced as off-topic by the edge layer.
+    # Word-boundary forms for the short ones: a bare "shg" is safe as a word but
+    # "rf" and "cif" are not substrings worth risking unanchored.
+    "nrlm", "day-nrlm", "aajeevika", "ajeevika", "msrls", "srlm",
+    "self help group", "self-help group", "selfhelp group",
+    r"\bshgs?\b", "revolving fund", r"\brf\b", "community investment fund",
+    r"\bcif\b", "pre-nrlm", "rural livelihood",
     "sericulture", "motorcaravan", "prime small enterprise", "prime tourism vehicle",
     "any business venture", "cinema theatre", "sports and wellness", "green taxi",
     "meghalayaone", "mbda", "meghalaya basin development", "farmer cash benefit",
@@ -646,6 +654,15 @@ _SCHEME_ALIASES = {
     "Focus Legacy": re.compile(
         r"\b(focus[\s-]?legacy|focuslegacy|legacy[\s-]?focus|producer[\s-]?groups?)\b",
         re.IGNORECASE),
+    # Scheme-NAME forms only, like every entry here: this map decides which
+    # single scheme the user NAMED, so the unit word "SHG" is left out (CM
+    # Elevate also takes SHG applicants). Self-help-group IS included because
+    # nothing else in the corpus is called that.
+    "NRLM": re.compile(
+        r"\b(nrlm|day[\s-]?nrlm|aajeevika|ajeevika|ajivika|msrls|srlm)\b|"
+        r"\bself[\s-]?help[\s-]?groups?\b|"
+        r"\bnational rural livelihoods? missions?\b",
+        re.IGNORECASE),
 }
 
 # What each scheme actually holds — the data side and the knowledge side — so
@@ -682,6 +699,15 @@ _SCHEME_CAPABILITY = {
         "sanctioned, subsidy and loans disbursed, the share of the sanction paid out, "
         "lender (Bank / LIFCOM) and desanctioned records — by scheme, district, block, "
         "village or financial year (FY 2024-25 and 2025-26)"
+    ),
+    "NRLM": (
+        "Self Help Groups on the MSRLS register — how many there are, their members "
+        "(total, women and men), active or inactive status, group type (New / Revived / "
+        "Pre-NRLM), the year each group was formed, and the Revolving Fund and Community "
+        "Investment Fund each has received to date — by district, block, village, "
+        "assembly constituency, group type or formation year. The figures are a snapshot "
+        "of the register, and the two funds are cumulative totals with no release date, "
+        "so they cannot be split by year"
     ),
 }
 
@@ -727,6 +753,16 @@ _SCHEME_STARTERS = {
         "CM Elevate Legacy records by scheme",
         "CM Elevate Legacy loans by lender",
         "CM Elevate Legacy records by financial year",
+    ],
+    # No money-by-year starter here, unlike every other scheme: NRLM's funds are
+    # cumulative with no release date, so such a chip would advertise the one
+    # question the scheme must refuse. The year chip is a FORMATION-count chip.
+    "NRLM": [
+        "How many NRLM Self Help Groups are there in Meghalaya?",
+        "NRLM SHGs and members by district",
+        "How many SHGs were formed in each financial year?",
+        "What Revolving Fund and CIF have SHGs received to date, by district?",
+        "Who can join an NRLM Self Help Group?",
     ],
 }
 

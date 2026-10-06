@@ -1,0 +1,706 @@
+# nrlm_foreign_key_augmentation.yaml
+#
+# Join edges and the materialised join graph for NRLM - node 5.9.
+#
+#   nodes       what each object is, its grain, and whether it may be aggregated
+#   edges       every join, with the exact ON clause the generator must emit
+#   join_graph  adjacency list, listed from the many side, traversed undirected
+#
+# declared: true      the edge is a real constraint in information_schema
+# declared: false     the edge exists only here
+# is_prohibited: true the generator must refuse this join and use `use_instead`
+#
+# ===========================================================================
+# v1.0 - 2026-10-05 - FIRST VERSION, WRITTEN AGAINST THE LIVE DATABASE
+#
+# Authority: SCHEMA_FOR_DEVELOPERS.md, regenerated 2026-10-05 11:24 UTC.
+#
+# fact_nrlm_shg carries FOUR REAL DECLARED FOREIGN KEYS - dim_scheme, dim_year
+# (as formation year), dim_geography and raw.source_rows - and all four are NOT
+# NULL except raw_id. curated.v_nrlm pre-joins dim_geography and dim_year, so the
+# generator emits no joins for ordinary questions.
+#
+# The prohibited edges are the point of this file. NRLM is recorded per SHG and
+# shares no identifier with any other scheme - the only common key is the LGD
+# village_code, and even that may only be used to join AGGREGATES, never rows.
+#
+# NOT VERIFIED: the semantic.join_graph rows for fact_nrlm_shg were not read
+# (no read credential on this machine). The live table comment on fact_nrlm_shg
+# says "Never row-join to another fact (CLAUDE.md rule 1)", which this file encodes.
+# ===========================================================================
+
+foreign_key_augmentation:
+
+  version: '1.0'
+  database: megh_db
+  schema: curated
+  read_role: megh_readonly
+  structure_verified: '2026-10-05'
+  primary_query_surface: curated.v_nrlm
+
+  # =======================================================================
+  nodes:
+
+    curated.v_nrlm:
+      role: fact_view
+      object_type: view
+      over: curated.fact_nrlm_shg
+      primary_key: nrlm_fact_id
+      natural_key: shg_code
+      grain: one row per Self Help Group, as at the extract date
+      column_count: 29
+      aggregate_before_reporting: false
+      unit: rupees (assumed, NR-07)
+      row_count: unverified_in_db
+      snapshot: true
+      note: >
+        THE DEFAULT FROM CLAUSE FOR EVERY NRLM QUESTION. Pre-joins dim_geography and
+        dim_year (exposed as formation_financial_year / formation_financial_year_short),
+        and computes total_members. COUNT(*) is an SHG count. shg_code is unique.
+        There is no mandatory predicate; village questions add entity_type <> 'Unresolved'.
+
+    curated.fact_nrlm_shg:
+      role: fact
+      object_type: table
+      primary_key: nrlm_fact_id
+      natural_key: shg_code
+      grain: one row per Self Help Group, as at the extract date
+      column_count: 30
+      aggregate_before_reporting: false
+      unit: rupees (assumed, NR-07)
+      row_count: unverified_in_db
+      load_mode: snapshot_replace
+      note: >
+        The underlying fact. Reach for it only when the question needs a column the view
+        does not expose - source_row_id, district_name_raw, block_name_raw,
+        village_name_raw, scheme_key, or the audit columns. Otherwise use v_nrlm.
+
+    curated.dim_scheme:
+      role: dimension
+      object_type: table
+      primary_key: scheme_key
+      grain: one row per scheme
+      shared_across_schemes: true
+      safe_to_aggregate: false
+      note: >
+        Authority on money_unit and time_semantics. Constant within the NRLM partition,
+        so never a grouping key for an NRLM-only question.
+
+    curated.dim_year:
+      role: dimension
+      object_type: table
+      primary_key: year_key
+      row_count: unverified_in_db
+      grain: one row per financial year
+      shared_across_schemes: true
+      safe_to_aggregate: false
+      nrlm_meaning: FORMATION year
+      note: >
+        Joined from fact_nrlm_shg.formation_year_key, which is NOT NULL. For NRLM the year
+        means the year the SHG was FORMED - never a reporting or funding year. The
+        schema doc estimates ~9 rows against 30 NRLM formation years; see the coverage
+        conflict in nrlm_entity_resolver.yaml.
+
+    curated.dim_geography:
+      role: dimension
+      object_type: table
+      primary_key: geography_key
+      natural_key: village_code
+      grain: one row per LGD village or ward, plus synthetic 'Unresolved' placeholders
+      shared_across_schemes: true
+      safe_to_aggregate: false
+      note: >
+        Conformed geography. fact_nrlm_shg.geography_key is NOT NULL, so an inner join
+        loses nothing - the 2,032 villageless SHGs point at their block's Unresolved
+        placeholder rather than at NULL. Pre-joined into v_nrlm.
+
+    curated.dim_geography_alias:
+      role: dimension
+      object_type: table
+      primary_key: alias_key
+      grain: one row per source spelling of a village
+      reachable: true
+      used_by_nrlm: false
+      note: >
+        REACHABLE BUT NOT PART OF THE NRLM GRAPH. fact_nrlm_shg has NO alias_key - NRLM
+        geography was resolved at ingest from the source LGD codes. Do not join it.
+
+    curated.v_pmay:
+      role: fact_view
+      object_type: view
+      grain: one row per sanctioned PMAY-G house
+      note: Other scheme. Declared here as the far end of a prohibited row-level edge, and as one side of the allowed aggregate-then-combine pattern.
+
+    curated.v_employment:
+      role: fact_view
+      object_type: view
+      grain: MGNREGA source row (village-year, may repeat)
+      aggregate_before_reporting: true
+      note: Other scheme. Same role as v_pmay.
+
+    curated.fact_mgnrega_employment:
+      role: fact
+      object_type: table
+      grain: one row per source row of the employment workbook
+      aggregate_before_reporting: true
+      note: MGNREGA partition. Far end of a prohibited edge only.
+
+    curated.fact_mgnrega_expenditure:
+      role: fact
+      object_type: table
+      grain: one row per source row of the expenditure workbook
+      aggregate_before_reporting: true
+      unit: lakh_rupees
+      note: MGNREGA partition, LAKH rupees. Far end of a prohibited edge only.
+
+    curated.fact_pmay_house:
+      role: fact
+      object_type: table
+      grain: one row per sanctioned PMAY-G house
+      note: PMAY partition. Far end of a prohibited edge only.
+
+    curated.fact_focus_plus_disbursement:
+      role: fact
+      object_type: table
+      grain: one row per beneficiary x tranche disbursement event
+      note: Focus+ partition. Far end of a prohibited edge only.
+
+    curated.fact_focus_legacy_disbursement:
+      role: fact
+      object_type: table
+      grain: one row per payment to one Producer Group
+      note: >
+        Focus Legacy partition. Producer Groups are NOT Self Help Groups - pg_id and
+        shg_code are different identifier systems. Far end of a prohibited edge only.
+
+    curated.dim_producer_group:
+      role: dimension
+      object_type: table
+      grain: one row per Producer Group (pg_id)
+      note: Focus Legacy partition. Looks like a natural partner for SHGs and is not.
+
+    curated.fact_cm_elevate_application:
+      role: fact
+      object_type: table
+      grain: one row per CM Elevate application
+      note: CM Elevate partition. Far end of a prohibited edge only.
+
+    curated.fact_cm_elevate_disbursement:
+      role: fact
+      object_type: table
+      grain: one applicant's sanction-and-disbursement record
+      note: CM Elevate Disbursement partition. Far end of a prohibited edge only.
+
+    curated.v_cross_scheme_money_district_year:
+      role: cross_scheme_view
+      object_type: view
+      includes_nrlm: false
+      note: >
+        Covers MGNREGA and PMAY only. NRLM is NOT in it, and NRLM money has no year, so it
+        could not be added without inventing one.
+
+    curated.v_cross_scheme_village_coverage:
+      role: cross_scheme_view
+      object_type: view
+      includes_nrlm: false
+      note: Covers PMAY and MGNREGA only. NRLM coverage is built by the aggregate-then-combine pattern below.
+
+    meta.v_reconciliation_nrlm:
+      role: reconciliation
+      object_type: view
+      readable_by_read_role: false
+      note: Operator check (raw = curated + quarantined). Not a chatbot surface.
+
+    raw.source_rows:
+      role: lineage
+      object_type: table
+      primary_key: raw_id
+      readable_by_read_role: false
+      note: >
+        fact_nrlm_shg.raw_id is a real declared FK to this table, but `raw` is outside
+        the megh_readonly boundary. The edge exists and the application cannot traverse it.
+
+  # =======================================================================
+  edges:
+
+    # ---- REAL DECLARED FOREIGN KEYS -------------------------------------
+    # All four are constraints in the live database as of 2026-10-05.
+    # dim_geography and dim_year are already resolved inside curated.v_nrlm,
+    # so emit them ONLY when querying fact_nrlm_shg directly.
+
+    - from_table: curated.fact_nrlm_shg
+      from_column: geography_key
+      to_table: curated.dim_geography
+      to_column: geography_key
+      cardinality: many_to_one
+      declared: true
+      nullable: false
+      on_clause: "curated.fact_nrlm_shg.geography_key = curated.dim_geography.geography_key"
+      prefer_instead: curated.v_nrlm
+      reason: >
+        The conformed geography join. NOT NULL, so an inner join loses nothing. v_nrlm
+        already carries village_code, lgd_village_name, lgd_block, lgd_district,
+        entity_type, on_roster and has_geo_conflict.
+
+    - from_table: curated.fact_nrlm_shg
+      from_column: formation_year_key
+      to_table: curated.dim_year
+      to_column: year_key
+      cardinality: many_to_one
+      declared: true
+      nullable: false
+      join_type: INNER
+      on_clause: "curated.fact_nrlm_shg.formation_year_key = curated.dim_year.year_key"
+      prefer_instead: curated.v_nrlm
+      reason: >
+        NOT NULL, so INNER is safe - unlike PMAY's nullable year_key. The column name says
+        FORMATION: the resulting financial_year is when the SHG was formed. Never use this
+        join to put money in a year.
+
+    - from_table: curated.fact_nrlm_shg
+      from_column: scheme_key
+      to_table: curated.dim_scheme
+      to_column: scheme_key
+      cardinality: many_to_one
+      declared: true
+      nullable: false
+      on_clause: "curated.fact_nrlm_shg.scheme_key = curated.dim_scheme.scheme_key"
+      prefer_instead: read dim_scheme on its own
+      reason: >
+        Constant within the NRLM partition. Read dim_scheme separately when the answer
+        needs money_unit or time_semantics.
+
+    - from_table: curated.fact_nrlm_shg
+      from_column: raw_id
+      to_table: raw.source_rows
+      to_column: raw_id
+      cardinality: many_to_one
+      declared: true
+      nullable: true
+      traversable_by_read_role: false
+      on_clause: "curated.fact_nrlm_shg.raw_id = raw.source_rows.raw_id"
+      reason: >
+        Real constraint, unreachable in practice. `raw` is outside the megh_readonly
+        boundary, so the generator must never emit this join.
+
+    - from_table: curated.v_nrlm
+      from_column: nrlm_fact_id
+      to_table: curated.fact_nrlm_shg
+      to_column: nrlm_fact_id
+      cardinality: one_to_one
+      declared: false
+      on_clause: "curated.v_nrlm.nrlm_fact_id = curated.fact_nrlm_shg.nrlm_fact_id"
+      reason: >
+        View to its own fact, one to one. Needed only when a single question wants a
+        view column AND a lineage column (e.g. lgd_district beside district_name_raw).
+        Prefer querying one object.
+
+    # ---- THE ONE SANCTIONED CROSS-SCHEME PATTERN -------------------------
+
+    - from_table: "aggregate of curated.v_nrlm GROUP BY village_code"
+      from_column: village_code
+      to_table: "aggregate of <other scheme view> GROUP BY village_code"
+      to_column: village_code
+      cardinality: one_to_one
+      declared: false
+      is_prohibited: false
+      pattern: aggregate_then_combine
+      join_type: FULL
+      on_clause: "n.village_code = o.village_code"
+      reason: >
+        The ONLY way NRLM meets another scheme. Aggregate each side to village_code (the
+        national LGD id) in its own CTE, applying each scheme's own mandatory predicates
+        (NRLM: entity_type <> 'Unresolved'; PMAY: NOT is_placeholder), THEN join the
+        aggregates. One row per village on each side - no fan-out. Never use
+        geography_key across schemes - it is unstable across reloads.
+      example: see nrlm_few_shot.yaml 'Villages with both SHGs and PMAY houses'
+
+    - from_table: "aggregate of curated.v_nrlm GROUP BY lgd_district"
+      from_column: lgd_district
+      to_table: "aggregate of <other scheme view> GROUP BY lgd_district"
+      to_column: lgd_district
+      cardinality: one_to_one
+      declared: false
+      is_prohibited: false
+      pattern: aggregate_then_combine
+      join_type: FULL
+      on_clause: "n.lgd_district = o.lgd_district"
+      reason: >
+        District-level version of the same pattern. Both sides come from dim_geography, so
+        the UPPERCASE names match. The answer must state that NRLM figures are a current
+        snapshot while the other scheme's are for a period.
+
+    # ---- THE JOINS THAT MUST NEVER BE MADE -------------------------------
+
+    - from_table: curated.v_nrlm
+      from_column: village_code
+      to_table: curated.v_pmay
+      to_column: village_code
+      cardinality: many_to_many
+      declared: false
+      is_prohibited: true
+      use_instead: aggregate_then_combine on village_code
+      on_clause: null
+      reason: >
+        CROSS-SCHEME ROW-LEVEL JOIN. SHG grain against HOUSE grain on a shared village:
+        a village with 104 SHGs and 300 houses returns 31,200 rows, and every SUM is
+        multiplied by the other side's count. Aggregate each side first.
+
+    - from_table: curated.v_nrlm
+      from_column: village_code
+      to_table: curated.fact_mgnrega_employment
+      to_column: geography_key
+      cardinality: many_to_many
+      declared: false
+      is_prohibited: true
+      use_instead: aggregate_then_combine on village_code (via curated.v_employment)
+      on_clause: null
+      reason: >
+        Grain mismatch (SHG vs village-year source row that may repeat), time mismatch
+        (snapshot vs financial year) and key mismatch (LGD code vs unstable surrogate).
+
+    - from_table: curated.v_nrlm
+      from_column: village_code
+      to_table: curated.fact_mgnrega_expenditure
+      to_column: geography_key
+      cardinality: many_to_many
+      declared: false
+      is_prohibited: true
+      use_instead: aggregate_then_combine on village_code (via curated.v_expenditure)
+      on_clause: null
+      reason: >
+        As the employment edge, plus a unit mismatch - MGNREGA expenditure is LAKH, NRLM
+        is rupees - and a meaning mismatch: MGNREGA is annual expenditure, NRLM is a
+        cumulative fund held. No combined money figure is meaningful.
+
+    - from_table: curated.v_nrlm
+      from_column: village_code
+      to_table: curated.fact_focus_plus_disbursement
+      to_column: village_code
+      cardinality: many_to_many
+      declared: false
+      is_prohibited: true
+      use_instead: aggregate_then_combine on village_code
+      on_clause: null
+      reason: >
+        Focus+ is one row per beneficiary x tranche. Joining it to SHG rows on village
+        multiplies both. Focus+ members may well be SHG members, but no member-level key
+        exists in NRLM, so that link cannot be made at all.
+
+    - from_table: curated.v_nrlm
+      from_column: shg_code
+      to_table: curated.dim_producer_group
+      to_column: pg_id
+      cardinality: many_to_many
+      declared: false
+      is_prohibited: true
+      use_instead: none
+      on_clause: null
+      reason: >
+        TEMPTING AND WRONG. Producer Groups (Focus Legacy) and Self Help Groups (NRLM)
+        are different entities with different identifier systems - pg_id is a prefixed
+        string, shg_code an integer. Matching names ("Iatreilang Shg" vs a PG name) is
+        worse still: 27,692 SHG names repeat across 40,629 groups. There is no link.
+
+    - from_table: curated.v_nrlm
+      from_column: village_code
+      to_table: curated.fact_focus_legacy_disbursement
+      to_column: village_code
+      cardinality: many_to_many
+      declared: false
+      is_prohibited: true
+      use_instead: aggregate_then_combine on village_code
+      on_clause: null
+      reason: Row-level cross-scheme join. Payment grain against SHG grain.
+
+    - from_table: curated.v_nrlm
+      from_column: village_code
+      to_table: curated.fact_cm_elevate_application
+      to_column: village_code
+      cardinality: many_to_many
+      declared: false
+      is_prohibited: true
+      use_instead: aggregate_then_combine on village_code
+      on_clause: null
+      reason: Row-level cross-scheme join. Application grain against SHG grain.
+
+    - from_table: curated.v_nrlm
+      from_column: village_code
+      to_table: curated.fact_cm_elevate_disbursement
+      to_column: village_code
+      cardinality: many_to_many
+      declared: false
+      is_prohibited: true
+      use_instead: aggregate_then_combine on village_code
+      on_clause: null
+      reason: Row-level cross-scheme join. Applicant grain against SHG grain.
+
+    - from_table: curated.v_nrlm
+      from_column: lgd_district
+      to_table: curated.v_cross_scheme_money_district_year
+      to_column: lgd_district
+      cardinality: many_to_many
+      declared: false
+      is_prohibited: true
+      use_instead: aggregate_then_combine on lgd_district
+      on_clause: null
+      reason: >
+        The cross-scheme money view does not include NRLM and is keyed by financial year.
+        Joining SHG rows to it repeats each district-year figure once per SHG. NRLM money
+        has no year to line up with it.
+
+    - from_table: curated.v_nrlm
+      from_column: village_code
+      to_table: curated.v_cross_scheme_village_coverage
+      to_column: village_code
+      cardinality: many_to_one
+      declared: false
+      is_prohibited: true
+      use_instead: aggregate_then_combine on village_code
+      on_clause: null
+      reason: >
+        Row-to-aggregate join: each village's PMAY and MGNREGA totals would repeat once per
+        SHG, inflating any SUM. Aggregate v_nrlm by village_code first, then join.
+
+    - from_table: curated.v_nrlm
+      from_column: village_code
+      to_table: curated.dim_geography_alias
+      to_column: geography_key
+      cardinality: many_to_many
+      declared: false
+      is_prohibited: true
+      use_instead: curated.v_nrlm
+      on_clause: null
+      reason: >
+        NRLM HAS NO alias_key. The alias table holds other schemes' source spellings and
+        fans out - several aliases per village - so the join multiplies SHG rows. NRLM
+        names on v_nrlm are already canonical.
+
+    - from_table: curated.v_nrlm
+      from_column: gp_name
+      to_table: curated.dim_geography
+      to_column: lgd_village_name
+      cardinality: many_to_many
+      declared: false
+      is_prohibited: true
+      use_instead: curated.v_nrlm (geography already resolved by code)
+      on_clause: null
+      reason: >
+        gp_name is free text with no code; village names are not unique (197 shared in
+        NRLM alone). A name join both fans out and mis-assigns. Geography was resolved by
+        LGD code at ingest - use it.
+
+    - from_table: curated.v_nrlm
+      from_column: shg_name
+      to_table: curated.v_nrlm
+      to_column: shg_name
+      cardinality: many_to_many
+      declared: false
+      is_prohibited: true
+      use_instead: curated.v_nrlm
+      on_clause: null
+      reason: >
+        Self-join on SHG name. 'Iatreilang Shg' alone is 295 SHGs - the join squares that
+        to 87,025 rows. Name repeats are found with GROUP BY shg_name HAVING COUNT(*) > 1.
+
+    - from_table: curated.v_nrlm
+      from_column: constituency_name_raw
+      to_table: curated.v_nrlm
+      to_column: lgd_block
+      cardinality: many_to_many
+      declared: false
+      is_prohibited: true
+      use_instead: filter on one column only
+      on_clause: null
+      reason: >
+        Constituency and block share 26 names but cover different areas (Mawkyrwat block
+        1,106 SHGs, Mawkyrwat constituency 1,092). Never equate them, in a join or a filter.
+
+    - from_table: curated.v_nrlm
+      from_column: formation_year_key
+      to_table: "any year-keyed money object"
+      to_column: year_key
+      cardinality: many_to_many
+      declared: false
+      is_prohibited: true
+      use_instead: none - refuse
+      on_clause: null
+      reason: >
+        Lining NRLM's formation year up against another scheme's money year treats the
+        year an SHG was FORMED as if it were the year its funds were released. It is not.
+        This is the single most dangerous misuse of the dim_year edge.
+
+    - from_table: curated.v_nrlm
+      from_column: any
+      to_table: raw.source_rows
+      to_column: raw_id
+      cardinality: many_to_one
+      declared: false
+      is_prohibited: true
+      use_instead: none
+      on_clause: null
+      reason: >
+        The view does not expose raw_id, and `raw` is outside the read boundary in any
+        case. A lineage request is answered by telling the user it is a DBA task.
+
+  # =======================================================================
+  join_graph:
+
+    # v_nrlm pre-joins every dimension. Ordinary questions emit WHERE and
+    # GROUP BY only.
+    curated.v_nrlm:
+    - {to: curated.fact_nrlm_shg, on: nrlm_fact_id, join_type: INNER, note: lineage columns only}
+
+    # the raw fact is the only NRLM node with real outbound edges
+    curated.fact_nrlm_shg:
+    - {to: curated.dim_geography, on: geography_key,                 join_type: INNER}
+    - {to: curated.dim_year,      on: "formation_year_key = year_key", join_type: INNER}
+    - {to: curated.dim_scheme,    on: scheme_key,                    join_type: INNER}
+
+    # dimensions are terminal
+    curated.dim_geography: []
+    curated.dim_year: []
+    curated.dim_scheme: []
+
+    # cross-scheme: aggregates only, via CTEs - never a direct edge
+    aggregate_then_combine:
+      keys: [village_code, lgd_district]
+      join_type: FULL
+      partners: [curated.v_pmay, curated.v_employment, curated.v_expenditure,
+                 curated.v_focus_plus, curated.v_focus_legacy, curated.v_cm_elevate,
+                 curated.v_cm_elevate_disbursement]
+
+    # reachable in megh_db but closed to this scheme - see the prohibited edges
+    curated.dim_geography_alias: []
+    curated.dim_producer_group: []
+    curated.v_cross_scheme_money_district_year: []
+    curated.v_cross_scheme_village_coverage: []
+    curated.fact_pmay_house: []
+    curated.fact_mgnrega_employment: []
+    curated.fact_mgnrega_expenditure: []
+    curated.fact_focus_plus_disbursement: []
+    curated.fact_focus_legacy_disbursement: []
+    curated.fact_cm_elevate_application: []
+    curated.fact_cm_elevate_disbursement: []
+    raw.source_rows: []
+
+# ===========================================================================
+# v1.1 - 2026-10-05 - WORKED EXAMPLES: which join (if any) a question needs
+#
+# For each question: the decision, the edge used or refused, and why. Figures
+# are from datasets/NRLM/NRLM.csv grouped by LGD code.
+# ===========================================================================
+worked_examples:
+
+- question: "How many SHGs are in Laskein block?"
+  decision: no_join
+  from: curated.v_nrlm
+  why: v_nrlm already carries lgd_block and block_lgd_code. Any join here is wasted work.
+  sql: "SELECT COUNT(*) FROM curated.v_nrlm WHERE block_lgd_code = 1997;"
+  expected: 1880
+
+- question: "SHGs formed in 2020-21 by district"
+  decision: no_join
+  from: curated.v_nrlm
+  why: The formation year from dim_year is pre-joined as formation_financial_year_short.
+  expected_top: {lgd_district: EAST KHASI HILLS, shgs: 2303}
+
+- question: "Show the source district name next to the LGD district for SHG 21609"
+  decision: view_to_fact_lineage_edge
+  edge: curated.v_nrlm.nrlm_fact_id = curated.fact_nrlm_shg.nrlm_fact_id
+  why: district_name_raw is only on the fact. The one-to-one lineage edge is allowed for this.
+  sql: |
+    SELECT v.shg_code, v.lgd_district, f.district_name_raw, f.block_name_raw
+    FROM curated.v_nrlm v
+    JOIN curated.fact_nrlm_shg f ON f.nrlm_fact_id = v.nrlm_fact_id
+    WHERE v.shg_code = 21609;
+  expected: {lgd_district: EAST JAINTIA HILLS, district_name_raw: Eastern West Khasi Hills, block_name_raw: Mairang}
+  note: SHG 21609 is one of the 12 Tangnub has_name_code_conflict rows. Querying fact_nrlm_shg alone would also work.
+
+- question: "Which villages in Ri Bhoi have both SHGs and PMAY houses?"
+  decision: aggregate_then_combine
+  key: village_code
+  why: >
+    SHG grain vs house grain. Aggregate v_nrlm by village_code (excluding the 345 Ri Bhoi
+    SHGs with no village) and v_pmay by village_code (NOT is_placeholder) separately,
+    then FULL JOIN the aggregates.
+  sql: |
+    WITH n AS (
+      SELECT village_code, COUNT(*) AS shgs
+      FROM curated.v_nrlm
+      WHERE district_lgd_code = 276 AND entity_type <> 'Unresolved'
+      GROUP BY village_code
+    ), p AS (
+      SELECT village_code, COUNT(*) AS houses
+      FROM curated.v_pmay
+      WHERE lgd_district = 'RI BHOI' AND NOT is_placeholder
+      GROUP BY village_code
+    )
+    SELECT COUNT(*) FILTER (WHERE n.village_code IS NOT NULL AND p.village_code IS NOT NULL) AS both_schemes
+    FROM n FULL JOIN p ON p.village_code = n.village_code;
+  nrlm_side_expected: {villages: 458}
+
+- question: "Give each SHG in Barato its village's PMAY house count"
+  decision: refuse_row_level_and_rewrite
+  refused_edge: curated.v_nrlm.village_code -> curated.v_pmay.village_code
+  why: >
+    Barato has 104 SHGs. A row join to its PMAY houses repeats every house 104 times and
+    every SHG once per house. Return Barato's two village totals side by side instead.
+  rewrite: aggregate_then_combine on village_code = 279198
+
+- question: "SHG members vs MGNREGA person-days in West Garo Hills"
+  decision: aggregate_then_combine
+  key: lgd_district
+  why: >
+    NRLM is a snapshot (64,514 members in West Garo Hills); MGNREGA person-days belong to
+    a financial year. Totals side by side are allowed; the answer must say they cover
+    different periods.
+
+- question: "Total NRLM CIF plus MGNREGA expenditure in East Khasi Hills"
+  decision: refuse
+  refused_edge: curated.v_nrlm -> curated.fact_mgnrega_expenditure
+  why: >
+    Different grain, different unit (rupees vs lakh) and different meaning (cumulative
+    fund held vs annual expenditure). Adding them produces a meaningless number. Offer
+    the two figures separately: NRLM CIF in East Khasi Hills is Rs 10.66 crore to date.
+
+- question: "Which SHGs are also Producer Groups in Focus Legacy?"
+  decision: refuse
+  refused_edge: curated.v_nrlm.shg_code -> curated.dim_producer_group.pg_id
+  why: >
+    No shared identifier exists. Name matching would be meaningless - 'Iatreilang Shg'
+    alone is 295 different SHGs. Offer a village-level count of both instead.
+
+- question: "Add NRLM to the cross-scheme money view by district and year"
+  decision: refuse
+  refused_edge: curated.v_nrlm -> curated.v_cross_scheme_money_district_year
+  why: >
+    The view is keyed by financial year. NRLM money has no year - only the formation year,
+    which would place West Jaintia Hills' Rs 18.89 crore CIF in the years its SHGs were
+    FORMED. That is not when the money was released.
+
+- question: "Find SHGs with the same name as SHG 3329 elsewhere"
+  decision: no_self_join
+  why: >
+    A self-join on shg_name squares each name group. Filter instead - 'Aibhahlang Shg
+    Nongsohphan' is matched with a WHERE on the name.
+  sql: "SELECT shg_code, lgd_block FROM curated.v_nrlm WHERE shg_name = (SELECT shg_name FROM curated.v_nrlm WHERE shg_code = 3329);"
+
+- question: "Look up SHG villages through the geography alias table"
+  decision: refuse
+  refused_edge: curated.v_nrlm -> curated.dim_geography_alias
+  why: NRLM has no alias_key and its geography is already canonical. The alias table fans out rows.
+
+- question: "SHGs in Mawkyrwat - join constituency to block"
+  decision: refuse
+  refused_edge: constituency_name_raw = lgd_block
+  why: >
+    Same name, different areas - 1,106 SHGs in the block, 1,092 in the constituency, and
+    they do not overlap exactly. Filter on one column, the one the user meant.
+
+- question: "Revolving Fund per formation year compared with PMAY releases per year"
+  decision: refuse
+  refused_edge: formation_year_key -> any year-keyed money object
+  why: >
+    The formation year is not a release year. The 2017-18 cohort holds Rs 4.44 crore RF
+    today; that is not what was released in 2017-18.

@@ -17,7 +17,7 @@ meghalaya/
 ├── app/                       the FastAPI service (package `app`)
 │   ├── main.py                app, lifespan startup, /health, /metrics, static UI routes
 │   ├── config.py              every setting (pydantic-settings, reads .env)
-│   ├── pipeline.py            ~8,400 lines — the whole routing + NL→SQL orchestration
+│   ├── pipeline.py            ~15,200 lines — the whole routing + NL→SQL orchestration
 │   ├── edge.py                regex edge layer (greetings, off-topic, harmful, identity)
 │   ├── prompt_builder.py      SQL / repair / verifier prompt assembly
 │   ├── schema_context.py      hand-written per-scheme TABLES / RULES / VOCAB prompt blocks

@@ -62,7 +62,11 @@ def test_schemes_with_no_ac_column_still_refuse(scheme):
 def test_the_capable_set_is_exactly_the_schemes_with_a_route():
     # CM Elevate Legacy joined 2026-09-25: geography_key -> dim_geography.ac_name,
     # which reproduces the source's mapped_constituency_name exactly.
-    assert set(_AC_CAPABLE_SCHEMES) == {"MGNREGA", "Focus Legacy", "CM Elevate Legacy"}
+    # NRLM joined 2026-10-06 and is the first member needing NO dim_geography
+    # join: v_nrlm carries constituency_name_raw / constituency_number_raw on the
+    # row (55 constituencies; NULL on the 2,032 SHGs with no village).
+    assert set(_AC_CAPABLE_SCHEMES) == {"MGNREGA", "Focus Legacy", "CM Elevate Legacy",
+                                        "NRLM"}
 
 
 def test_a_cross_scheme_question_does_not_offer_ac():

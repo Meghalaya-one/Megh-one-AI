@@ -42,6 +42,14 @@ SCHEME_CATALOG = {
                          "lender (Bank / LIFCOM) and a financial year (FY2024-25, "
                          "FY2025-26). NOT the 15-scheme CM Elevate applications dataset: "
                          "the two share a name and no key.",
+    "NRLM": "National Rural Livelihoods Mission, run in Meghalaya by MSRLS — the Self "
+            "Help Group (SHG) register as at ONE EXTRACT DATE. One row per SHG "
+            "(40,629), the only GROUP-grained membership fact in megh_db. COUNT(*) is "
+            "SHGs, never people: members are SUM(total_members). The only year is the "
+            "year the SHG was FORMED (1984-85..2022-23) — there is NO reporting year "
+            "and NO release date. Money (Revolving Fund, CIF) is CUMULATIVE PER SHG "
+            "with no date, in RUPEES: it adds across SHGs but can NEVER be split, "
+            "filtered or trended by year.",
 }
 
 # The metrics each scheme actually carries in the curated data — the plain-English
@@ -123,6 +131,30 @@ SCHEME_METRICS = {
         "distinct villages / blocks / districts reached",
         "NO applicant name, gender, caste, applicant type, application status, repayment, "
         "target, budget or monthly figure exists",
+    ],
+    "NRLM": [
+        "Self Help Groups on the register (COUNT(*), one row per SHG), active and inactive",
+        "members (SUM(total_members)), women members (SUM(female_members)) and men "
+        "(SUM(male_members)) — members are a COLUMN, never COUNT(*)",
+        "average members per SHG, and SHG size bands",
+        "SHG type (New / Revived / Pre-Nrlm) and active status (active / inactive)",
+        "SHGs FORMED in a financial year (1984-85..2022-23) — the only year in the data",
+        "Revolving Fund received, cumulative per SHG (in rupees; norm Rs 15,000)",
+        "Community Investment Fund received, cumulative per SHG (in rupees)",
+        "fund coverage — the share of SHGs with RF > 0 or CIF > 0, and averages over all "
+        "SHGs vs over recipients only (73% of SHGs hold no CIF)",
+        "distinct villages reached (COUNT(DISTINCT village_code)), blocks, districts and "
+        "assembly constituencies",
+        "Gram Panchayat / village council name (free text, advisory — not an LGD level)",
+        "data-quality flags: possible duplicate pairs, membership outside the NRLM norm, "
+        "SHGs with no village recorded, source-name vs LGD-code conflicts",
+        "NO savings, corpus, internal lending, bank linkage, loan, credit or repayment "
+        "exists — RF and CIF are Mission grants and must never be called savings or loans",
+        "NO federation (Village Organisation / Cluster Level Federation), member name or "
+        "any member-level detail, social category, livelihood activity, training or "
+        "grading exists",
+        "NO formation date or month, no household count, no population, no target or "
+        "budget, and NO fund release date — so no fund trend, growth or utilisation",
     ],
 }
 
@@ -788,7 +820,7 @@ CM ELEVATE BUSINESS VOCABULARY (source: cmelevate_schema_partitions.yaml + cmele
     "applications" / "records" / "requests" -> COUNT(*)   (an application is a REQUEST, not an award — say "applications")
     "applicants" / "beneficiaries" / "distinct applications" / "unique applications" -> COUNT(DISTINCT request_id)   (request_id is NOT unique — about 36 numbers repeat, all inside Piggery — so a bare COUNT(*) overcounts "applicants"/"beneficiaries" by those duplicates; only "applications"/"requests" itself means the raw row count)
     "on hold" / "pending" / "held" -> data_verified = 'On Hold'   (NEVER the onhold boolean)
-    ONLY when the question itself names a level ("pending at level 2", "pending in level1"): -> LOWER(current_level) = 'levelN' alone — the level IS the scope; do NOT also add data_verified = 'On Hold' (no level-2 application is on hold, so that AND returns a false 0). A plain "pending" with NO level named is still data_verified = 'On Hold' — never a current_level filter
+    ONLY when the question itself names a level ("pending at level 2", "pending in level1"): -> LOWER(current_level) = 'levelN' AND scheme_specific ->> 'file_status' = 'Pending' (decided 2026-10-05: the file sits at that level AND is still undecided — Rejected / Approved files at that level are NOT pending); do NOT also add data_verified = 'On Hold' (no level-2 application is on hold, so that AND returns a false 0). A plain "pending" with NO level named is still data_verified = 'On Hold' — never a current_level filter
     "pending in each sector" / "<status> by sector" / "<status> by <dimension>" -> keep the status test INSIDE COUNT(*) FILTER (WHERE data_verified = '...') and GROUP BY the dimension with NO status test in the WHERE, so a group with none still shows 0
     "approved" / "rejected" / "decision" -> scheme_specific ->> 'file_status' = 'Approved' / 'Rejected' (exact Title Case) — current_file_status NEVER holds approved/rejected/pending (only forward / sendback / resubmit), so filtering it for those returns a false 0   "sanctioned" / "cleared" / "funded" -> NOT AVAILABLE here (sanction lives in CM Elevate Legacy)   "status" / "status distribution" / "status-wise" / "application status" (default) -> current_file_status, send-back spellings merged (rule 13; decided 2026-09-28)   "verification status" -> data_verified
     "villages" -> COUNT(DISTINCT village_code) FILTER (WHERE entity_type <> 'Unresolved')   "districts" / "blocks" -> COUNT(DISTINCT lgd_district) / COUNT(DISTINCT lgd_block)
@@ -1574,6 +1606,180 @@ CM ELEVATE LEGACY IN A CROSS-SCHEME QUESTION — read first:
     combined total with another scheme's unit.
 """.strip()
 
+_NRLM_TABLES = """
+NRLM TABLES (source: data/NRLM/*.yaml)
+  curated.v_nrlm  -- THE query surface, and ZERO JOINS for any ordinary question. One row =
+      one Self Help Group (40,629 rows), as at ONE extract date. 29 columns:
+        nrlm_fact_id, shg_code, shg_name, shg_type, is_active, formation_year_key,
+        formation_financial_year, formation_financial_year_short, geography_key,
+        village_code, lgd_village_name, lgd_block, lgd_district, entity_type, on_roster,
+        has_geo_conflict, district_lgd_code, block_lgd_code, gp_name,
+        constituency_name_raw, constituency_number_raw, male_members, female_members,
+        total_members, revolving_fund_amount, cif_amount, is_possible_duplicate,
+        has_name_code_conflict, member_count_out_of_norm
+      dim_geography and dim_year (as the FORMATION year) are PRE-JOINED: district, block,
+      village, entity_type, constituency and the formation year are all on the row, and
+      total_members is computed in the view. An ordinary NRLM question needs no JOIN at all.
+  curated.fact_nrlm_shg  -- the same SHGs, for LINEAGE ONLY. Query it on its own, and only
+      when the question is about what the SOURCE FILE says: source_row_id,
+      district_name_raw, block_name_raw, village_name_raw (plus has_name_code_conflict and
+      shg_code). Those *_raw columns are NOT in the view.
+  NOTE: NRLM has NO monthly fact, NO payment/transaction table and NO second snapshot.
+      There is exactly one extract; a new file REPLACES the table. Nothing can be compared
+      "since last extract".
+""".strip()
+
+_NRLM_RULES = """
+NRLM RULES (breaking these produces a wrong number, not just an ugly query):
+  1. GRAIN. One row = one SHG. COUNT(*) AS shgs counts GROUPS and is NEVER a count of
+     members, people, women, households or beneficiaries. People are a COLUMN:
+     members = SUM(total_members), women = SUM(female_members), men = SUM(male_members).
+     "How many members" is SUM(total_members); getting this wrong understates members
+     roughly tenfold. Never COUNT(DISTINCT shg_name) as an SHG count (27,692 names for
+     40,629 SHGs -- it undercounts by ~32%); never SUM or AVG any code or key
+     (shg_code, village_code, *_lgd_code, *_key).
+  2. THE ONLY YEAR IS THE FORMATION YEAR. formation_financial_year_short is char(7)
+     'YYYY-YY', '1984-85'..'2022-23', and holds the year the SHG was FORMED. There is NO
+     reporting year, NO release date and NO extract-date column. Filter and group on the
+     short form; it compares correctly AS TEXT, so "before 2014-15" is
+     < '2014-15'. No SHG formed after 2022-23 exists, so "formed this year" returns 0 --
+     say the data stops at 2022-23. 'Pre-Nrlm' is a TYPE, not a year filter (432 typed
+     Pre-Nrlm vs 645 formed before 2011-12 -- the two sets do NOT coincide).
+  3. MONEY IS CUMULATIVE AND UNDATED -- THE HIGHEST-RISK RULE IN THIS SCHEME.
+     revolving_fund_amount (RF) and cif_amount (CIF) are what each SHG has received IN
+     TOTAL as at the extract, in RUPEES. They are additive ACROSS SHGs, so a sum by
+     district, block, type or status is sound. They can NEVER be placed in a year:
+     do NOT filter, group or trend money by formation year on your own initiative, and
+     NEVER compute a year-on-year difference or growth rate of money. "RF released in
+     2021-22", "CIF disbursed last year", "growth in CIF", "fund utilisation" and "has RF
+     increased since last extract" have NO answer in this data -- filtering money by the
+     formation year returns what SHGs formed that year HOLD TODAY, a different figure that
+     looks exactly like the one asked for. The ONE allowed form is the COHORT view, used
+     only when the official asked for it in those terms or a pipeline decision shows they
+     accepted it: alias the sums *_held_cr / *_held_lakh and include the SHG count, so the
+     result cannot be read as a release in that year.
+  4. MONEY UNITS. Convert IN THE QUERY and put the unit in the alias: / 1e7 for crore on
+     State and district totals (rf_cr, cif_cr); / 1e5 for lakh on block and village totals
+     (rf_lakh, cif_lakh); plain RUPEES for the rows of individual SHGs. Keep RF and CIF as
+     TWO columns unless the official asks for one combined total. NRLM rupees must never be
+     added to MGNREGA's lakh or any other scheme's money.
+  5. ZERO IS A RECORDED VALUE, NOT NULL. Both money columns are NOT NULL and the source had
+     no blanks, so "received" is > 0 and "not received" is = 0 -- never IS NULL. For an
+     average, return BOTH AVG over all SHGs and AVG(...) FILTER (WHERE amount > 0): 73.3%
+     of SHGs hold no CIF (29,788 rows) and the two averages differ greatly. Coverage is the
+     share with the amount > 0.
+  6. STATUS. is_active is a NOT NULL boolean, so WHERE is_active and WHERE NOT is_active are
+     exact complements -- never IS DISTINCT FROM. Dormant, defunct, non-functional and
+     closed all mean NOT is_active; there is no dissolved / merged / renamed history, no
+     as-of date and no reason code. With NO status word, count EVERY SHG, active and
+     inactive (39,432 active / 1,197 inactive). ALL 1,197 inactive SHGs show 0 RF and 0 CIF
+     (NR-15): a fund question filtered to inactive SHGs returns zero -- report the zero with
+     that caveat, never as a finding about funding.
+  7. THE 2,032 UNRESOLVED-VILLAGE SHGs. 2,032 SHGs (5.0%) had no village in the source and
+     point at a per-block placeholder row whose entity_type = 'Unresolved'. They carry a
+     CORRECT block and district, so they stay IN every State, district and block total --
+     excluding them under-reports SHGs by 5%. Add entity_type <> 'Unresolved' ONLY to
+     village questions: counting villages, listing them, ranking them, and both sides of a
+     per-village average. constituency_name_raw is NULL on the SAME 2,032 rows, so a
+     constituency breakdown adds constituency_name_raw IS NOT NULL and sums to 38,597, NOT
+     the State total of 40,629 -- say so.
+  8. VILLAGE IDENTITY IS village_code, NOT THE NAME. 197 village names belong to more than
+     one village. Filter with village_code, count with COUNT(DISTINCT village_code), and
+     GROUP BY village_code with lgd_village_name and lgd_block alongside for display. Never
+     filter a village by name alone: if a village is named but no code was resolved, ASK
+     which block it is in.
+  9. GEOGRAPHY CASE. lgd_district and lgd_block are stored UPPERCASE ('EAST KHASI HILLS',
+     'LASKEIN'); a mixed-case equality filter returns zero rows SILENTLY. lgd_village_name
+     is Title Case. constituency_name_raw is mixed case exactly as stored ('Sutnga-saipung').
+     shg_type is exactly 'New', 'Revived' or 'Pre-Nrlm'. Use the predicate from the resolved
+     entities verbatim; prefer district_lgd_code / block_lgd_code for identity.
+     EASTERN WEST KHASI HILLS (LGD 740) is a REAL district here, distinct from WEST KHASI
+     HILLS (279) -- never merge them. 12 source rows carry a district name that contradicts
+     the code; the CODE was trusted. Regions are not a column:
+     Garo Hills = 273, 656, 277, 663, 278; Khasi Hills = 274, 740, 658, 279;
+     Jaintia Hills = 657, 275; Ri Bhoi (276) is its own district and belongs to no range.
+ 10. CONSTITUENCY. constituency_number_raw holds '<number> <UPPERCASE NAME>' such as
+     '36 MAWKYRWAT' -- a MISLEADING NAME: it is not a bare number, so NEVER cast it to
+     integer. Match a number with LIKE '36 %' (the trailing space stops '3 %' matching
+     '36'). A block and a constituency of the SAME NAME cover DIFFERENT areas (Mawkyrwat
+     block 1,106 SHGs vs Mawkyrwat constituency 1,092) -- filter the one column the official
+     meant. Three names differ between the two columns (Sohing/SOHIONG, Ampathi/AMPATI,
+     Tikrikila/TIKRIKILLA) and four more are truncated in the numbered field, so use the
+     resolved value. Group a breakdown by constituency_name_raw AND constituency_number_raw.
+ 11. gp_name IS ADVISORY, NOT A GEOGRAPHY LEVEL. Free text from the source, no code, not
+     part of LGD District > Block > Village (Meghalaya is largely outside the Panchayati Raj
+     system), and it differs from the LGD village name on ~23-28% of mapped rows. Use it
+     ONLY because the official said GP, gram panchayat, panchayat, village council or
+     dorbar; match with ILIKE and GROUP BY lgd_block as well, because the same name recurs
+     in different blocks.
+ 12. SHG NAME IS DISPLAY ONLY, NOT AN IDENTITY. shg_code is unique and is THE lookup key.
+     shg_name is not unique -- 'Iatreilang Shg' alone is 295 different SHGs -- so a name
+     search uses ILIKE and returns a LIST with shg_code and the place, never an assumed
+     single group. To find repeats use GROUP BY shg_name HAVING COUNT(*) > 1, never a
+     self-join on the name.
+ 13. RANKING AND LIMITS. "Which district has the most" is singular -> LIMIT 1. "Top blocks"
+     or "which SHGs have the highest" with no N -> LIMIT 5. "Each", "every", "all", "-wise"
+     and "compare across" ask for EVERY group -- return all 12 districts or all 56 blocks
+     with NO LIMIT. A listing of individual SHGs carries shg_code, shg_name and the place,
+     LIMIT 100. Add shg_code or the name as a final ORDER BY key so the order is stable.
+     Revolving Fund takes only TEN distinct values and hundreds of SHGs share the top one,
+     so "which SHGs received the highest RF" is answered by the SHGs at
+     MAX(revolving_fund_amount) counted by block, not an arbitrary top 5.
+ 14. A YEAR SERIES OF SHG COUNTS groups the sparse early years by default:
+     CASE WHEN formation_financial_year_short < '2014-15' THEN 'before 2014-15'
+     ELSE formation_financial_year_short END, ordered by MIN(formation_financial_year_short)
+     -- ordering by the LABEL puts 'before 2014-15' LAST, because digits sort before letters.
+     Comparing two formation years is a comparison of COUNTS (one row, one FILTER per year);
+     the same comparison of MONEY is refused (rule 3).
+ 15. DATA-QUALITY FLAGS MARK REAL ROWS. is_possible_duplicate (10 rows / 5 pairs, NR-24),
+     member_count_out_of_norm (178 SHGs) and has_name_code_conflict (12 rows) stay IN every
+     count unless the question is about them. 39 SHGs hold CIF above Rs 5 lakh (max Rs 13.6
+     lakh, shg_code 3329) and are UNCONFIRMED (NR-25) -- a top-N by CIF surfaces these first,
+     so carry the caveat. The rupee unit itself is assumed, pending client confirmation
+     (NR-07).
+ 16. CROSS-SCHEME. NEVER join NRLM rows to another scheme's rows: SHG grain against house or
+     payment grain multiplies BOTH sides. Aggregate each scheme in its OWN CTE to
+     village_code (NRLM side with entity_type <> 'Unresolved') or lgd_district, then
+     FULL JOIN the aggregates. Never add NRLM money to another scheme's money, and never
+     line NRLM's FORMATION year up against another scheme's financial year.
+ 17. NOT HELD -- say it is not held and offer the nearest real figure; never improvise:
+     savings, corpus, internal lending, bank linkage, loans, credit, repayment, NPA;
+     federations (Village Organisation / CLF); member names or ANY member-level detail;
+     social category (SC/ST, PVTG, BPL), disability; livelihood activity; training; grading,
+     meetings, Panchasutra; formation DATE or month (the source column was empty on every
+     row); households, population, per-capita, saturation; targets, budgets, fund
+     utilisation; other states; urban livelihoods (DAY-NULM). Do NOT present RF or CIF as
+     savings or loans.
+""".strip()
+
+_NRLM_VOCAB = """
+NRLM BUSINESS VOCABULARY (source: nrlm_schema_partitions.yaml + nrlm_entity_resolver.yaml)
+  "SHGs" / "self help groups" / "groups"        -> COUNT(*) AS shgs            (one row = one SHG)
+  "members" / "membership" / "people"           -> SUM(total_members)          (NEVER COUNT(*))
+  "women" / "women members" / "mahila"          -> SUM(female_members)
+  "men" / "male members"                        -> SUM(male_members)
+  "all-women SHGs" / "women-only groups"        -> COUNT(*) WHERE male_members = 0 AND female_members > 0
+  "average members per SHG" / "SHG size"        -> ROUND(AVG(total_members), 1)
+  "active" / "functional" / "working"           -> WHERE is_active
+  "inactive" / "dormant" / "defunct"            -> WHERE NOT is_active
+  "revolving fund" / "RF"                       -> SUM(revolving_fund_amount)  (cumulative, rupees)
+  "CIF" / "community investment fund"           -> SUM(cif_amount)             (cumulative, rupees)
+  "fund" / "funds" / "money" with no qualifier  -> RF and CIF as TWO columns, side by side
+  "received" / "released" / "disbursed" / "got" -> the CUMULATIVE amount held (> 0); carries NO date
+  "has received X" / "not received X"           -> amount > 0 / amount = 0  (zero is recorded, not NULL)
+  "coverage" / "% with CIF"                     -> share of SHGs with the amount > 0
+  "formed in" / "year formed" / "formation FY"  -> formation_financial_year_short  (the ONLY year)
+  "type" / "New" / "Revived" / "Pre-NRLM"       -> shg_type ('New' / 'Revived' / 'Pre-Nrlm')
+  "villages"                                    -> COUNT(DISTINCT village_code) + entity_type <> 'Unresolved'
+  "constituency" / "AC" / "MLA" / "assembly"    -> constituency_name_raw (+ constituency_number_raw)
+  "GP" / "gram panchayat" / "panchayat" / "dorbar" -> gp_name (ILIKE, advisory, GROUP BY lgd_block too)
+  "SHG code" / "group code"                     -> shg_code  (unique; THE lookup key)
+  "SHG name" / "called" / "named"               -> shg_name ILIKE -> a LIST (not unique)
+  "beneficiaries" -> AMBIGUOUS: SHGs (40,629) or members (410,847). Ask, never guess.
+  "households covered" / "women mobilised" -> members ONLY with the assumption stated (no household column)
+  "savings" / "corpus" / "loans" / "bank linkage" / "VO" / "CLF" -> NOT HELD (rule 17)
+""".strip()
+
 _SCHEME_BLOCKS = {
     "MGNREGA": (_MGNREGA_TABLES, _MGNREGA_RULES, _MGNREGA_VOCAB),
     "PMAY-G": (_PMAY_TABLES, _PMAY_RULES, _PMAY_VOCAB),
@@ -1581,6 +1787,7 @@ _SCHEME_BLOCKS = {
     "CM Elevate": (_CMELEVATE_TABLES, _CMELEVATE_RULES, _CMELEVATE_VOCAB),
     "Focus Legacy": (_FOCUSLEGACY_TABLES, _FOCUSLEGACY_RULES, _FOCUSLEGACY_VOCAB),
     "CM Elevate Legacy": (_CMELEVATELEGACY_TABLES, _CMELEVATELEGACY_RULES, _CMELEVATELEGACY_VOCAB),
+    "NRLM": (_NRLM_TABLES, _NRLM_RULES, _NRLM_VOCAB),
 }
 
 

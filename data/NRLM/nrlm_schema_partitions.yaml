@@ -1,0 +1,1225 @@
+schema_version: '1.0'
+schema_name: nrlm_curated_semantic_schema
+display_name: NRLM Self Help Group Curated Star-Schema Semantic Schema (megh_db)
+
+# ===========================================================================
+# v1.0 - 2026-10-05 - FIRST VERSION, WRITTEN AGAINST THE LIVE DATABASE
+#
+# There is no flat-table predecessor for NRLM. This file describes the curated
+# star schema as loaded, from the beginning.
+#
+# Authority: SCHEMA_FOR_DEVELOPERS.md, regenerated 2026-10-05 11:24 UTC from the
+# live database (DATABASE_SCHEMA (3).md).
+#
+# WHAT NRLM IS
+#   National Rural Livelihoods Mission (DAY-NRLM), implemented in Meghalaya by
+#   MSRLS (Meghalaya State Rural Livelihoods Society) under the Community and
+#   Rural Development Department. The dataset is the Self Help Group (SHG)
+#   REGISTER: one row per SHG, with its membership and the two community funds
+#   it has received - Revolving Fund (RF) and Community Investment Fund (CIF).
+#
+# THE THREE FACTS THAT GOVERN EVERY RULE IN THIS FILE
+#   1. ONE ROW IS ONE SHG. shg_code is unique on every row. COUNT(*) is an SHG
+#      count - never a member count, never a beneficiary count.
+#   2. THE ONLY YEAR IS THE FORMATION YEAR. formation_year_key is the financial
+#      year the SHG was formed (1984-85 .. 2022-23). It is NOT a funding year,
+#      NOT a reporting year, NOT a release year. The data readiness document
+#      assumed "one SHG per financial year"; the data disproves it - no SHG
+#      appears twice.
+#   3. MONEY IS CUMULATIVE AND UNDATED. revolving_fund_amount and cif_amount are
+#      the totals each SHG has received as at the extract date. They add across
+#      SHGs. They NEVER split by year, NEVER trend, NEVER compare across extracts.
+#      Evidence: the share of SHGs holding any CIF falls from 60% (formed 2015-16)
+#      to 0% (formed 2022-23) - older groups have passed more funding rounds.
+#   A SNAPSHOT: a new extract REPLACES fact_nrlm_shg (loader --force). No history.
+#
+# WHAT IS NOT IN THE CURATED LAYER
+#   group_form             -> NOT LOADED. "00:00.0" on all 40,629 source rows -
+#                             an Excel time format with the date lost. Dead.
+#   id (source row id)     -> fact_nrlm_shg.source_row_id, lineage only.
+#   source district/block/
+#   village names          -> fact only (district_name_raw, block_name_raw,
+#                             village_name_raw). The view exposes the LGD names.
+#   Village Organisation / Cluster Level Federation ids -> NOT IN THE SOURCE.
+#   Savings, bank linkage, loans, credit             -> NOT IN THE SOURCE.
+#   Member names / member-level rows                 -> NOT IN THE SOURCE.
+#
+# PROVENANCE OF NUMBERS IN THIS FILE
+#   Column names, types, nullability, defaults, PKs, FKs, indexes, comments
+#                                                  -> live DB, 2026-10-05. Trust.
+#   Row counts, distinct counts, value distributions
+#                                                  -> source file datasets/NRLM/NRLM.csv,
+#                                                     40,629 rows, profiled 2026-10-05.
+#                                                     NOT re-measured against megh_db
+#                                                     (no read credential on this machine).
+#                                                     Marked `unverified_in_db: true`.
+#   The live table comments independently quote the same figures (40,629 rows,
+#   2,032 unmapped, 12 name/code conflicts, 5 duplicate pairs, 246 SHGs at RF
+#   30,000, 39 CIF > 5 lakh, 1,197 inactive at 0) - strong but indirect agreement.
+#
+# CLIENT ISSUE CODES CITED BY THE LIVE COMMENTS (full list not in this repo)
+#   NR-02 formation year meaning   NR-07 rupee unit   NR-15 inactive SHGs at 0
+#   NR-24 duplicate pairs          NR-25 CIF above 5 lakh
+# ===========================================================================
+
+architecture_alignment:
+  schema_linking: Enriched table and column documents are embedded for scheme-partitioned Qdrant retrieval.
+  entity_resolution: Dimension catalogue plus approved aliases, RapidFuzz, and BGE-small fallback.
+  join_discovery: information_schema FKs plus SME-reviewed implicit FK YAML; LLM never invents joins.
+  sql_generation: Retrieved schema, resolved entities, graph-generated joins, and curated question-to-SQL examples.
+  safety: SQLGlot read-only validation, enforced LIMIT, SELECT-only database role.
+  observability: Inputs, outputs, rule firings, SQL, results, chart spec, and response are traceable.
+
+database:
+  name: megh_db
+  schema: curated
+  read_role: megh_readonly
+  primary_query_surface: curated.v_nrlm
+  structure_verified: '2026-10-05'
+  volumes_verified: false
+
+datasets:
+
+  # =========================================================================
+  # PRIMARY QUERY SURFACE - query this, not the fact table
+  # =========================================================================
+  v_nrlm:
+    table_name: curated.v_nrlm
+    object_type: view
+    over: curated.fact_nrlm_shg
+    column_count: 29
+    grain: one row per Self Help Group (shg_code), as at the extract date
+    row_count: unverified_in_db
+    row_count_note: >
+      The source file holds 40,629 rows and meta.v_reconciliation_nrlm is commented
+      "Expected on the 2026-09 file: 40,629 = 40,629 + 0". The curated count has not
+      been measured from this machine. Quote 40,629 only with that caveat.
+    aggregate_before_reporting: false
+    grain_note: >
+      One row IS one SHG, so COUNT(*) is an SHG count with no prior aggregation.
+      Members are a column (total_members), not rows - a member count is
+      SUM(total_members), never COUNT(*).
+    snapshot: true
+    snapshot_note: >
+      The table is replaced on every new extract. There is no extract date column
+      and no history. Every figure is "as at the current extract".
+    money_unit: rupees
+    money_unit_status: assumed_pending_client_confirmation_NR-07
+    money_unit_authority: curated.dim_scheme.money_unit
+    columns:
+
+    # ---- keys -------------------------------------------------------------
+    - name: nrlm_fact_id
+      source_column: fact_nrlm_shg.nrlm_fact_id
+      meaning: Surrogate primary key of the NRLM SHG fact.
+      type: bigint
+      nullable: false
+      category: technical_identifier
+      nlp_sql_priority: low
+      sql_operations: [WHERE, COUNT, COUNT DISTINCT]
+      synonyms: [record id, row id, fact id]
+      business_rules:
+      - Identifier only; never SUM or AVG.
+      - Not stable across a reload - the table is replaced on every extract. Never export it.
+
+    - name: shg_code
+      source_column: fact_nrlm_shg.shg_code
+      meaning: Code of the Self Help Group. The natural key - unique across the State.
+      type: integer
+      nullable: false
+      unique: true
+      category: shg_identifier
+      nlp_sql_priority: critical
+      sql_operations: [WHERE, COUNT, COUNT DISTINCT]
+      synonyms: [SHG code, SHG id, group code, group id, self help group code]
+      sample_values: [7194, 7197, 20913, 20931, 20937, 20940]
+      business_rules:
+      - Identifier only; never SUM or AVG.
+      - UNIQUE (constraint fact_nrlm_shg_shg_code_key). COUNT(*) and COUNT(DISTINCT shg_code) are the same number.
+      - "THE lookup key. A single-SHG question resolves to shg_code, never to shg_name."
+      - Range 2 to 46,368 in the source; not dense. Issuing system (MSRLS MIS, LokOS or national MIS) unconfirmed.
+      - "NOT the source file's `id` column - that is source_row_id on the fact and differs on every row."
+
+    - name: shg_name
+      source_column: fact_nrlm_shg.shg_name
+      meaning: Name of the Self Help Group as registered.
+      type: varchar(200)
+      nullable: true
+      category: shg_name
+      nlp_sql_priority: high
+      sql_operations: [WHERE, GROUP BY]
+      synonyms: [SHG name, group name, self help group name, SHG]
+      sample_values: [Iatreilang Shg, Iatyllilang Shg, Synroplang Shg, Chibasal Shg, Iatreilang, Tyllilang Shg]
+      business_rules:
+      - "DISPLAY ONLY - NOT AN IDENTITY. 27,692 distinct names across 40,629 SHGs (unverified_in_db)."
+      - "'Iatreilang Shg' alone is 295 different SHGs. 2,684 names occur in more than one village; 174 SHGs repeat a name inside the same village."
+      - A name lookup returns a LIST with shg_code, village and block - never assume the first match.
+      - Never COUNT(DISTINCT shg_name) as an SHG count - it undercounts by ~32%.
+      - Suffixes vary ('Shg', 'Shg Msrls', 'Self Help Group Nrlm', none). Match with ILIKE / fuzzy, not equality.
+
+    # ---- SHG attributes ---------------------------------------------------
+    - name: shg_type
+      source_column: fact_nrlm_shg.shg_type
+      meaning: How the SHG entered NRLM - newly formed, revived from a defunct group, or pre-existing before NRLM.
+      type: varchar(20)
+      nullable: false
+      category: shg_type_dimension
+      nlp_sql_priority: critical
+      sql_operations: [WHERE, GROUP BY, COUNT]
+      synonyms: [SHG type, group type, type of SHG, SHG category]
+      sample_values: [New, Revived, Pre-Nrlm]
+      value_counts_source: {New: 38453, Revived: 1744, Pre-Nrlm: 432}
+      business_rules:
+      - "Exactly three stored values, case as shown: 'New', 'Revived', 'Pre-Nrlm'."
+      - "'Pre-Nrlm' is a TYPE, not a year filter. 645 SHGs carry a formation year before 2011-12 but only 432 are typed Pre-Nrlm - the two do not coincide."
+      - Code list and definitions unconfirmed by the client (readiness doc section 3).
+
+    - name: is_active
+      source_column: fact_nrlm_shg.is_active
+      meaning: Whether the SHG is currently active. Source column active_sta (truncated name).
+      type: boolean
+      nullable: false
+      category: shg_status_flag
+      nlp_sql_priority: critical
+      sql_operations: [WHERE, GROUP BY, COUNT, FILTER]
+      synonyms: [active, active status, functional, working, operational, live]
+      value_counts_source: {true: 39432, false: 1197}
+      business_rules:
+      - NOT NULL, so `WHERE is_active` and `WHERE NOT is_active` are true complements.
+      - "No as-of date and no reason code. 'Inactive' is the only status - there is no dissolved / merged / renamed history (readiness clarification 9)."
+      - "ALL 1,197 inactive SHGs show 0 RF and 0 CIF (NR-15). A fund question filtered to inactive SHGs returns 0 - say why, do not present it as a finding about funding."
+      - Default population for an SHG count is ALL SHGs (active + inactive). See nrlm_default_rules.yaml.
+
+    # ---- time (formation only) --------------------------------------------
+    - name: formation_year_key
+      source_column: fact_nrlm_shg.formation_year_key
+      meaning: dim_year key of the financial year the SHG was formed.
+      type: smallint
+      nullable: false
+      category: time_key
+      nlp_sql_priority: medium
+      sql_operations: [WHERE, GROUP BY]
+      synonyms: [formation year key]
+      business_rules:
+      - "FORMATION YEAR, NOT A FUNDING OR REPORTING YEAR (live comment, NR-02)."
+      - Filter and group on formation_financial_year_short, not on the key.
+      - NOT NULL - every SHG has a formation year.
+
+    - name: formation_financial_year
+      source_column: dim_year.financial_year
+      meaning: Financial year in which the SHG was formed, long form.
+      type: char(9)
+      nullable: false
+      category: time_dimension
+      nlp_sql_priority: high
+      sql_operations: [WHERE, GROUP BY, ORDER BY]
+      synonyms: [formation year, year formed, year of formation, formed in]
+      sample_values: ['2019-2020', '2020-2021', '2021-2022', '2018-2019', '2017-2018', '2022-2023']
+      business_rules:
+      - "ONLY answers 'formed in' / 'formed before' / 'formed after' questions."
+      - "A 'funds in 2021-22' / 'released this year' / 'year-on-year growth' question must NOT be answered by filtering this column. Refuse - see nrlm_classification_rules.yaml."
+
+    - name: formation_financial_year_short
+      source_column: dim_year.financial_year_short
+      meaning: Financial year in which the SHG was formed, short form.
+      type: char(7)
+      nullable: false
+      category: time_dimension
+      nlp_sql_priority: critical
+      sql_operations: [WHERE, GROUP BY, ORDER BY]
+      synonyms: [formation FY, FY formed, formation year short]
+      sample_values: ['2019-20', '2020-21', '2021-22', '2018-19', '2017-18', '2022-23']
+      value_range_source: 1984-85 to 2022-23 (30 distinct)
+      business_rules:
+      - Prefer this for filters and display. Same format as the source file's financial_year.
+      - "Peak formation 2020-21 (11,354) and 2019-20 (10,604). 645 SHGs formed before 2011-12 (NRLM launch)."
+      - "No SHG formed after 2022-23 is in this extract. 'SHGs formed this year' returns 0 - say the data stops at 2022-23."
+      - "char(7) comparison is lexical and safe: '2015-16' < '2020-21'. Use it for before/after filters."
+
+    # ---- geography --------------------------------------------------------
+    - name: geography_key
+      source_column: fact_nrlm_shg.geography_key
+      meaning: Surrogate key into the conformed geography dimension.
+      type: integer
+      nullable: false
+      category: geographic_identifier
+      nlp_sql_priority: low
+      sql_operations: [WHERE, GROUP BY, COUNT DISTINCT]
+      synonyms: [geography key]
+      business_rules:
+      - Identifier only; never SUM or AVG.
+      - NOT stable across a reload. Use village_code for anything leaving the database.
+
+    - name: village_code
+      source_column: fact_nrlm_shg.village_code
+      meaning: LGD village code of the SHG, or its block's synthetic Unresolved placeholder code.
+      type: integer
+      nullable: false
+      category: geographic_identifier
+      nlp_sql_priority: high
+      sql_operations: [WHERE, GROUP BY, COUNT DISTINCT]
+      synonyms: [village code, LGD village code, mapped village code]
+      sample_values: [279198, 279247, 279424, 278380, 279159, 279253]
+      business_rules:
+      - Identifier only; never SUM or AVG.
+      - "VILLAGE IDENTITY. 197 village names map to two or more codes in this data - count villages with COUNT(DISTINCT village_code), never by name."
+      - "CRITICAL: 2,032 SHGs (5.0%) had no village in the source. Their village_code is a synthetic placeholder (entity_type = 'Unresolved'). Exclude with entity_type <> 'Unresolved' from village counts and village lists ONLY."
+      - 4,976 real village codes in the source (unverified_in_db).
+
+    - name: lgd_village_name
+      source_column: dim_geography.lgd_village_name
+      meaning: LGD-standardised village name.
+      type: varchar(200)
+      nullable: true
+      category: geographic_dimension
+      nlp_sql_priority: critical
+      sql_operations: [WHERE, GROUP BY]
+      synonyms: [village, LGD village, mapped village, village name]
+      sample_values: [Barato, Kyndongtuber, Nongbah, Rymbai, Mawryngkneng, Thadmuthlong A]
+      business_rules:
+      - Display and filter name. NOT an identity - see village_code.
+      - 197 names are shared by more than one village code. Resolve the block before filtering on name alone.
+      - "For an Unresolved placeholder row this is a placeholder label, not a village. Never list it as a village."
+      - "NOT the same as gp_name - see gp_name."
+
+    - name: lgd_block
+      source_column: dim_geography.lgd_block
+      meaning: LGD-standardised block name, stored UPPERCASE in the dimension.
+      type: varchar(150)
+      nullable: true
+      category: geographic_dimension
+      nlp_sql_priority: critical
+      sql_operations: [WHERE, GROUP BY]
+      synonyms: [block, C&RD block, community development block, development block, block name]
+      sample_values: [LASKEIN, WAPUNG, THADLASKEIN, RONGRAM, DEMDEMA, MAIRANG]
+      business_rules:
+      - "UPPERCASE. A mixed-case equality filter returns zero rows SILENTLY. Compare case-folded and emit the stored form."
+      - 56 blocks in the source. Complete on every row, including Unresolved rows.
+      - For block identity prefer block_lgd_code - the name is display.
+
+    - name: lgd_district
+      source_column: dim_geography.lgd_district
+      meaning: LGD-standardised district name, stored UPPERCASE in the dimension.
+      type: varchar(100)
+      nullable: true
+      category: geographic_dimension
+      nlp_sql_priority: critical
+      sql_operations: [WHERE, GROUP BY]
+      synonyms: [district, LGD district, district name]
+      sample_values: [EAST KHASI HILLS, WEST GARO HILLS, WEST JAINTIA HILLS, RI BHOI, SOUTH WEST GARO HILLS, EASTERN WEST KHASI HILLS]
+      business_rules:
+      - "UPPERCASE. A mixed-case equality filter returns zero rows SILENTLY."
+      - 12 districts. Complete on every row, including Unresolved rows.
+      - "EASTERN WEST KHASI HILLS (LGD 740) is a real district here, distinct from WEST KHASI HILLS (279). Never merge them."
+      - For district identity prefer district_lgd_code - the name is display.
+
+    - name: entity_type
+      source_column: dim_geography.entity_type
+      meaning: "'Village', 'Ward' or 'Unresolved' - whether the geography row is a real place."
+      type: varchar(10)
+      nullable: true
+      category: geographic_quality
+      nlp_sql_priority: critical
+      sql_operations: [WHERE, GROUP BY]
+      synonyms: [entity type, geography type, unresolved, unmapped]
+      sample_values: [Village, Unresolved]
+      business_rules:
+      - "'Unresolved' = the SHG had no village in the source (2,032 SHGs). It carries a real district and block."
+      - "INCLUDE Unresolved rows in state, district and block totals - excluding them under-reports SHGs by 5%."
+      - "EXCLUDE Unresolved rows (entity_type <> 'Unresolved') from village counts, village lists and village rankings."
+      - on_roster is FALSE on every Unresolved row.
+
+    - name: on_roster
+      source_column: dim_geography.on_roster
+      meaning: Whether the village is in the official LGD roster.
+      type: boolean
+      nullable: true
+      category: geographic_quality
+      nlp_sql_priority: low
+      sql_operations: [WHERE, GROUP BY]
+      synonyms: [on roster, official village, in roster]
+      business_rules:
+      - FALSE on every Unresolved placeholder. Prefer entity_type for the village-count exclusion.
+      - Do not filter real off-roster villages out unless the question is about roster coverage.
+
+    - name: has_geo_conflict
+      source_column: dim_geography.has_geo_conflict
+      meaning: Sources disagree on this village's block or district; the roster value is stored.
+      type: boolean
+      nullable: true
+      category: geographic_quality
+      nlp_sql_priority: low
+      sql_operations: [WHERE, COUNT]
+      synonyms: [geo conflict, geography conflict]
+      business_rules:
+      - "A dim_geography flag shared by all schemes. NOT the same as has_name_code_conflict, which is NRLM-only and about the source file's own names."
+
+    - name: district_lgd_code
+      source_column: fact_nrlm_shg.district_lgd_code
+      meaning: LGD district code from the source (mapped_district_lgd_code).
+      type: integer
+      nullable: false
+      category: geographic_identifier
+      nlp_sql_priority: high
+      sql_operations: [WHERE, GROUP BY]
+      synonyms: [district code, district LGD code, LGD district code]
+      sample_values: [274, 278, 275, 276, 663, 740]
+      business_rules:
+      - Identifier only; never SUM or AVG.
+      - "AUTHORITATIVE over any district name (live comment). 12 source rows carry a contradicting name - the code was trusted."
+      - "UNLIKE PMAY, NRLM DOES carry a district LGD code. 'What is the LGD code of East Khasi Hills' is answerable here (274)."
+      - "Codes: 273 East Garo Hills, 274 East Khasi Hills, 275 West Jaintia Hills, 276 Ri Bhoi, 277 South Garo Hills, 278 West Garo Hills, 279 West Khasi Hills, 656 North Garo Hills, 657 East Jaintia Hills, 658 South West Khasi Hills, 663 South West Garo Hills, 740 Eastern West Khasi Hills."
+
+    - name: block_lgd_code
+      source_column: fact_nrlm_shg.block_lgd_code
+      meaning: LGD block code from the source (mapped_block_lgd_code, 1960-series).
+      type: integer
+      nullable: false
+      category: geographic_identifier
+      nlp_sql_priority: medium
+      sql_operations: [WHERE, GROUP BY]
+      synonyms: [block code, block LGD code, LGD block code]
+      sample_values: [1997, 1999, 1996, 1965, 6546, 2000]
+      business_rules:
+      - Identifier only; never SUM or AVG.
+      - AUTHORITATIVE over the block name. 56 codes, one name each except code 2000 (see has_name_code_conflict).
+      - "Same LGD numbering as the roster - unlike CM Elevate's block code, this one is compatible."
+
+    - name: gp_name
+      source_column: fact_nrlm_shg.gp_name
+      meaning: Free-text Gram Panchayat / village council name from the source.
+      type: varchar(200)
+      nullable: true
+      category: advisory_locality
+      nlp_sql_priority: medium
+      sql_operations: [WHERE, GROUP BY]
+      synonyms: [GP, gram panchayat, panchayat, village council, GP name, dorbar]
+      sample_values: [Madanmaroid, Barato, Kyndong Tuber, Mawlong, Rymbai, Mawryng Kneng]
+      business_rules:
+      - "ADVISORY, NOT A GEOGRAPHY LEVEL. No code. Not part of LGD District > Block > Village. Meghalaya is largely outside the Panchayati Raj system."
+      - 3,990 distinct values. Names repeat across blocks - a GP name alone is ambiguous.
+      - "Differs from the LGD village name on ~23-28% of mapped rows (23% per the live comment, 28.0% by exact case-insensitive comparison)."
+      - "'SHGs per GP' is answered only with this caveat; offer village or block instead."
+
+    - name: constituency_name_raw
+      source_column: fact_nrlm_shg.constituency_name_raw
+      meaning: Assembly constituency name as given in the source (mapped_constituency_name).
+      type: varchar(100)
+      nullable: true
+      category: constituency_dimension
+      nlp_sql_priority: high
+      sql_operations: [WHERE, GROUP BY]
+      synonyms: [constituency, assembly constituency, AC, MLA constituency, vidhan sabha constituency]
+      sample_values: [Khliehriat, Sutnga-saipung, Rangsakona, Mawkyrwat, Mowkaiaw, Rongjeng]
+      business_rules:
+      - Mixed case as stored. 55 values in the source.
+      - "NULL on the same 2,032 rows that have no village. A constituency breakdown does NOT sum to the State total - say so."
+      - "Three spellings differ from the numbered field: Ampathi/AMPATI, Sohing/SOHIONG, Tikrikila/TIKRIKILLA. Four more are truncated there: Sutnga-saipung/SUTNGA, Rambrai jyrngam/RAMBRAI, William Nagar/WILLIAM, Rongara-siju/RONGARA. The resolver carries every form."
+      - "Numbers 16-19 and 51 are absent - no rural SHG falls in those seats."
+
+    - name: constituency_number_raw
+      source_column: fact_nrlm_shg.constituency_number_raw
+      meaning: "Constituency NUMBER AND NAME string as given in the source (mapped_constituency_name_and_number), e.g. '36 MAWKYRWAT'."
+      type: varchar(120)
+      nullable: true
+      category: constituency_dimension
+      nlp_sql_priority: medium
+      sql_operations: [WHERE, GROUP BY]
+      synonyms: [constituency number, AC number, constituency no]
+      sample_values: [6 KHLIEHRIAT, 5 SUTNGA, 52 RANGSAKONA, 36 MAWKYRWAT, 4 MOWKAIAW, 42 RONGJENG]
+      business_rules:
+      - "MISLEADING NAME: holds '<number> <UPPERCASE NAME>', not a bare number. Never cast to integer."
+      - "For 'constituency number 36' filter constituency_number_raw LIKE '36 %' (trailing space matters - '3 %' must not match '36')."
+      - 1:1 with constituency_name_raw on every row in the source.
+
+    # ---- members ----------------------------------------------------------
+    - name: male_members
+      source_column: fact_nrlm_shg.male_members
+      meaning: Count of male members in the SHG.
+      type: smallint
+      nullable: false
+      category: member_measure
+      nlp_sql_priority: high
+      sql_operations: [SUM, AVG, MIN, MAX, WHERE]
+      synonyms: [male members, men, male]
+      business_rules:
+      - Additive across SHGs. Total 1,598 in the source (unverified_in_db).
+      - 0 on 39,924 SHGs (98.3%). NRLM SHGs are women's groups; male membership is an exception.
+      - Whether the count is current or as at formation is unconfirmed (readiness clarification 5).
+
+    - name: female_members
+      source_column: fact_nrlm_shg.female_members
+      meaning: Count of female members in the SHG.
+      type: smallint
+      nullable: false
+      category: member_measure
+      nlp_sql_priority: critical
+      sql_operations: [SUM, AVG, MIN, MAX, WHERE]
+      synonyms: [female members, women, women members, female]
+      business_rules:
+      - Additive across SHGs. Total 409,249 in the source - 99.6% of all members (unverified_in_db).
+      - No third gender category exists in the data.
+
+    - name: total_members
+      source_column: v_nrlm (male_members + female_members)
+      meaning: Total members of the SHG, computed in the view.
+      type: smallint
+      nullable: false
+      category: member_measure
+      nlp_sql_priority: critical
+      sql_operations: [SUM, AVG, MIN, MAX, WHERE]
+      synonyms: [members, membership, total members, member count, SHG members, households covered, women mobilised]
+      business_rules:
+      - "THE default member measure. 'How many members' is SUM(total_members), never COUNT(*)."
+      - Total 410,847 in the source (unverified_in_db). Average ~10.1 per SHG.
+      - "'Households covered' and 'women mobilised' are treated as members ONLY with a stated assumption - there is no household column."
+      - Out-of-norm groups are flagged by member_count_out_of_norm; they still count.
+
+    # ---- money ------------------------------------------------------------
+    - name: revolving_fund_amount
+      source_column: fact_nrlm_shg.revolving_fund_amount
+      meaning: Cumulative Revolving Fund received by the SHG as at the extract. Source rf_amount.
+      type: numeric(12,2)
+      nullable: false
+      unit: rupees
+      unit_status: assumed (NR-07)
+      category: financial_measure
+      nlp_sql_priority: critical
+      sql_operations: [SUM, AVG, MIN, MAX, WHERE]
+      synonyms: [revolving fund, RF, RF amount, revolving fund amount, RF released, RF received]
+      sample_values: [15000, 0, 30000, 13500, 12000, 10500]
+      business_rules:
+      - "UNIT IS RUPEES (assumed, client to confirm - NR-07). Divide by 1e7 for crore."
+      - "CUMULATIVE AND UNDATED. Additive across SHGs; NEVER split, filtered or trended by year. formation_financial_year is not a release year."
+      - "Norm is Rs 15,000 per SHG (33,241 SHGs). 246 SHGs show 30,000 - likely two rounds. 6,929 show 0. Total Rs 50.86 crore in the source."
+      - "0 means no RF recorded. There are no NULLs - the column is NOT NULL and the source had no blanks."
+      - "All 1,197 inactive SHGs show 0 (NR-15)."
+      - CHECK constraint ck_nrlm_amounts - never negative.
+
+    - name: cif_amount
+      source_column: fact_nrlm_shg.cif_amount
+      meaning: Cumulative Community Investment Fund received by the SHG as at the extract.
+      type: numeric(12,2)
+      nullable: false
+      unit: rupees
+      unit_status: assumed (NR-07)
+      category: financial_measure
+      nlp_sql_priority: critical
+      sql_operations: [SUM, AVG, MIN, MAX, WHERE]
+      synonyms: [CIF, community investment fund, CIF amount, CIF released, CIF received, investment fund]
+      sample_values: [0, 50000, 110000, 200000, 100000, 40000]
+      business_rules:
+      - "UNIT IS RUPEES (assumed, client to confirm - NR-07). Divide by 1e7 for crore."
+      - "CUMULATIVE AND UNDATED. Additive across SHGs; NEVER split, filtered or trended by year."
+      - "0 on 29,788 SHGs (73.3%). An AVG over all SHGs is pulled down by the zeros - state whether the average is over all SHGs or over CIF-receiving SHGs only."
+      - "39 SHGs exceed Rs 5 lakh, max Rs 13.6 lakh (shg_code 3329) - unconfirmed (NR-25). A top-N by CIF surfaces these first; carry the caveat."
+      - "Total Rs 98.48 crore in the source - larger than RF in total, but held by far fewer SHGs."
+      - "All 1,197 inactive SHGs show 0 (NR-15)."
+
+    # ---- data-quality flags ------------------------------------------------
+    - name: is_possible_duplicate
+      source_column: fact_nrlm_shg.is_possible_duplicate
+      meaning: The SHG is identical to another row in every field except id and shg_code.
+      type: boolean
+      nullable: false
+      default: false
+      category: data_quality_flag
+      nlp_sql_priority: medium
+      sql_operations: [WHERE, COUNT, FILTER]
+      synonyms: [duplicate, possible duplicate, double registration]
+      business_rules:
+      - "10 rows (5 pairs) - probable double registration, client to confirm (NR-24). Both rows kept."
+      - "Do NOT exclude by default. Counts include them. Mention the flag only when a question lands on one or asks about duplicates."
+
+    - name: has_name_code_conflict
+      source_column: fact_nrlm_shg.has_name_code_conflict
+      meaning: The source district or block NAME disagreed with the name most rows use for that code.
+      type: boolean
+      nullable: false
+      default: false
+      category: data_quality_flag
+      nlp_sql_priority: low
+      sql_operations: [WHERE, COUNT, FILTER]
+      synonyms: [name code conflict, district name mismatch]
+      business_rules:
+      - "12 rows, all village Tangnub: source names 'Eastern West Khasi Hills / Mairang' on codes 657 / 2000 (East Jaintia Hills / Saipung). The CODES were trusted."
+      - "Consequence: grouping by the SOURCE name puts these 12 under Eastern West Khasi Hills; grouping by lgd_district or district_lgd_code puts them under East Jaintia Hills. The view's figures are the code-based ones."
+
+    - name: member_count_out_of_norm
+      source_column: fact_nrlm_shg.member_count_out_of_norm
+      meaning: male + female is 0, 1-4, or above 20 - outside the NRLM norm of 10-20 (5 minimum in special cases).
+      type: boolean
+      nullable: false
+      default: false
+      category: data_quality_flag
+      nlp_sql_priority: medium
+      sql_operations: [WHERE, COUNT, FILTER]
+      synonyms: [out of norm, abnormal membership, too few members, too many members]
+      business_rules:
+      - "178 SHGs: 5 with 0 members, 74 with 1-4, 99 above 20 (max 38)."
+      - "Note the flag treats 5-9 as within norm (10,899 SHGs) - the 5-minimum special case."
+      - A finding, not noise. Do not exclude by default.
+
+  # =========================================================================
+  # UNDERLYING FACT - documented for lineage; query v_nrlm instead
+  # =========================================================================
+  fact_nrlm_shg:
+    table_name: curated.fact_nrlm_shg
+    object_type: table
+    column_count: 30
+    grain: one row per SHG (shg_code) as at the extract date
+    primary_key: nrlm_fact_id
+    unique_keys: [shg_code]
+    row_count: unverified_in_db
+    row_count_source: 40629
+    load_mode: snapshot_replace
+    query_preference: >
+      Use curated.v_nrlm. It pre-joins dim_geography and dim_year (as formation year)
+      and computes total_members, so the generator never has to emit those joins.
+    foreign_keys:
+    - {column: scheme_key,         references: curated.dim_scheme.scheme_key,         declared: true, nullable: false}
+    - {column: formation_year_key, references: curated.dim_year.year_key,             declared: true, nullable: false}
+    - {column: geography_key,      references: curated.dim_geography.geography_key,   declared: true, nullable: false}
+    - {column: raw_id,             references: raw.source_rows.raw_id,                declared: true, nullable: true}
+    check_constraints:
+    - ck_nrlm_amounts - revolving_fund_amount >= 0 AND cif_amount >= 0
+    - ck_nrlm_members - male_members >= 0 AND female_members >= 0
+    columns_not_in_v_nrlm:
+    - name: scheme_key
+      meaning: FK to dim_scheme. Constant for this partition.
+      business_rules: [Never a grouping key within NRLM - it has one value.]
+    - name: source_row_id
+      type: integer
+      meaning: The source file's own `id` column (1 to 40,629). Lineage only.
+      business_rules:
+      - Export sequence. Stability across extracts unconfirmed. Never a user-facing identifier.
+    - name: district_name_raw
+      type: varchar(100)
+      meaning: Source mapped_district_lgd_name, verbatim.
+      business_rules:
+      - Use only for "what does the source say" questions. 12 rows contradict the code.
+    - name: block_name_raw
+      type: varchar(150)
+      meaning: Source mapped_block_lgd_name, verbatim.
+    - name: village_name_raw
+      type: varchar(200)
+      meaning: Source mapped_village_lgd_name, verbatim. NULL on the 2,032 unmapped SHGs.
+    - name: raw_id
+      meaning: FK to raw.source_rows for full lineage back to the source row.
+      business_rules: [Not readable by megh_readonly - raw is outside the read boundary.]
+    - name: source_row_num
+      meaning: Audit.
+    - name: batch_id
+      type: uuid
+      meaning: Audit - the load batch.
+    - name: source_system
+      type: varchar(50)
+      default: "'nrlm'"
+      meaning: Audit - constant 'nrlm' for this partition.
+    - name: ingested_at
+      type: timestamptz
+      meaning: Audit. The closest thing to an extract date; not exposed in the view.
+    dropped_at_ingest:
+    - column: group_form
+      reason: >
+        "00:00.0" on every one of 40,629 source rows - a date/time cell whose date part
+        was lost in an Excel export. The readiness document calls it the largest open
+        item. No information survives. Formation DATE or MONTH questions cannot be answered.
+
+  # =========================================================================
+  # DIMENSIONS
+  # =========================================================================
+  dim_scheme:
+    table_name: curated.dim_scheme
+    object_type: table
+    column_count: 8
+    grain: one row per scheme
+    primary_key: scheme_key
+    shared_across_schemes: true
+    row_count: 6
+    business_rules:
+    - "AUTHORITY ON MONEY UNIT. Read money_unit rather than hardcoding 'rupees'."
+    - "NRLM's scheme_code value has not been read from the live table (assumed 'NRLM' from source_system = 'nrlm'). Verify before any cross-scheme query filters on it."
+    - time_semantics for NRLM should state formation year; carry it into any comparative answer.
+
+  dim_year:
+    table_name: curated.dim_year
+    object_type: table
+    column_count: 9
+    grain: one row per financial year
+    primary_key: year_key
+    shared_across_schemes: true
+    row_count: unverified_in_db
+    business_rules:
+    - Pre-joined into v_nrlm as formation_financial_year and formation_financial_year_short.
+    - "OPEN QUESTION: the 2026-10-05 schema doc estimates ~9 rows, but NRLM needs 30 formation years (1984-85 .. 2022-23) under a NOT NULL FK and the reconciliation expects 0 quarantined. Either the estimate is stale or years were added for NRLM. Verify before quoting dim_year coverage."
+    - "For NRLM the year means FORMATION. For MGNREGA it is the reporting year, for PMAY the sanction year. Same dimension, three meanings."
+    - data_quality_note on a year must be surfaced with any answer covering that year.
+
+  dim_geography:
+    table_name: curated.dim_geography
+    object_type: table
+    column_count: 13
+    grain: one row per LGD village or ward, plus synthetic 'Unresolved' placeholders
+    primary_key: geography_key
+    natural_key: village_code
+    shared_across_schemes: true
+    business_rules:
+    - "CONFORMED ACROSS SCHEMES. village_code is the national LGD id and the only cross-scheme key."
+    - Pre-joined into v_nrlm. Do not join it yourself.
+    - "Names are stored UPPERCASE for block and district."
+    - "NRLM's 2,032 villageless SHGs point at their BLOCK's Unresolved placeholder - so even Unresolved rows carry a correct block and district."
+    - NRLM does NOT use dim_geography_alias. It has no alias_key.
+
+  # =========================================================================
+  # RECONCILIATION - read, never join
+  # =========================================================================
+  v_reconciliation_nrlm:
+    table_name: meta.v_reconciliation_nrlm
+    object_type: view
+    schema: meta
+    column_count: 4
+    grain: one row (dataset = 'nrlm')
+    readable_by_megh_readonly: false
+    columns:
+    - {name: dataset,      type: text,   meaning: "Constant 'nrlm'."}
+    - {name: raw_rows,     type: bigint, meaning: Rows landed in raw.source_rows.}
+    - {name: curated_rows, type: bigint, meaning: Rows in fact_nrlm_shg.}
+    - {name: quarantined,  type: bigint, meaning: Rows held in staging.quarantine.}
+    business_rules:
+    - "raw_rows must equal curated_rows + quarantined, exactly. Expected 40,629 = 40,629 + 0."
+    - "meta is outside the megh_readonly boundary. Not a chatbot query surface - an operator check."
+
+# ===========================================================================
+semantic_rules:
+
+  geography_hierarchy:
+  - lgd_district
+  - lgd_block
+  - lgd_village_name
+
+  geography_codes:
+  - district_lgd_code
+  - block_lgd_code
+  - village_code
+  geography_codes_note: >
+    Unlike PMAY, NRLM carries all three LGD codes. District and block codes are
+    authoritative over their names (12 source rows contradict). Village identity is
+    village_code; 197 village names are shared.
+
+  advisory_localities: [gp_name, constituency_name_raw, constituency_number_raw]
+  advisory_localities_note: >
+    gp_name is free text outside the LGD hierarchy. Constituency is a parallel
+    electoral hierarchy, NULL on 2,032 SHGs, so its totals do not reach the State total.
+
+  unresolved_rule:
+    critical: true
+    text: >
+      entity_type = 'Unresolved' marks the 2,032 SHGs with no village. INCLUDE them in
+      State, district and block counts and sums. EXCLUDE them (entity_type <> 'Unresolved')
+      from village counts, village lists and village rankings. Never the other way round.
+
+  time_dimension: formation_financial_year_short
+  time_dimensions_available: [formation_year_key, formation_financial_year, formation_financial_year_short]
+  time_meaning: FORMATION
+  time_runtime_rule: >
+    The only year in NRLM is the year the SHG was formed. 'Formed in', 'formed before',
+    'formed after', 'new SHGs by year' use formation_financial_year_short. There is NO
+    reporting year, NO release date, NO extract-date column. A question that puts money
+    in a year ('RF released in 2021-22', 'CIF growth', 'funds this year') cannot be
+    answered and must be refused with the reason.
+  time_null_rule: formation_year_key is NOT NULL; a GROUP BY on formation year drops nothing.
+  no_date_columns: >
+    group_form was dropped at ingest (dead column). No formation date or month exists.
+
+  shg_term:
+    status: DEFINED_AS_SHG_COUNT
+    runtime_behavior: >
+      'How many SHGs / groups / self help groups' is COUNT(*). shg_code is unique, so
+      COUNT(DISTINCT shg_code) gives the same number.
+    not_beneficiaries: >
+      NRLM has no beneficiary row. 'Beneficiaries' is ambiguous between SHGs and members -
+      the gate asks, or the default treats it as members with a stated assumption.
+    name_lookup: >
+      shg_name is not unique. A name lookup returns a list with shg_code, village and
+      block, or asks which one. Never assume the first match.
+
+  member_term:
+    measure: total_members
+    runtime_behavior: >
+      'How many members / women / men' is SUM(total_members) / SUM(female_members) /
+      SUM(male_members). Never COUNT(*).
+    no_individuals: >
+      No member names, ages, social category or member-level rows exist. Questions
+      about individual members cannot be answered.
+
+  financial_measures:
+    revolving_fund_amount: SUM(revolving_fund_amount) - rupees, cumulative per SHG.
+    cif_amount: SUM(cif_amount) - rupees, cumulative per SHG.
+    total_community_funds: SUM(revolving_fund_amount + cif_amount) - only when the user asks for both combined.
+    unit_rule: >
+      Rupees (assumed, NR-07). Divide by 1e7 for crore and state the unit in every answer.
+      MGNREGA expenditure is LAKH; never put an NRLM rupee figure beside it unconverted.
+    cumulative_rule:
+      critical: true
+      text: >
+        Both amounts are cumulative per SHG as at the extract, with no date. Add across
+        SHGs only. Never across years, never across extracts, never 'per year'.
+    zero_rule: >
+      0 means no fund recorded; there are no NULLs. AVG over all SHGs includes the zeros -
+      state the population ('average across all SHGs' vs 'average among SHGs that received CIF').
+    inactive_rule: >
+      All inactive SHGs show 0 for both funds (NR-15). Never present 'inactive SHGs received
+      nothing' as a finding - the reason is unknown.
+
+  status_dimension: is_active
+  status_rule: >
+    is_active is NOT NULL, so NOT is_active is the true complement. Default SHG counts
+    include both active and inactive SHGs and say so.
+
+  type_dimension: shg_type
+
+  data_quality_flags: [is_possible_duplicate, has_name_code_conflict, member_count_out_of_norm]
+  data_quality_rule: >
+    None of the three flags is excluded by default - all three mark real rows. Surface a
+    flag when the question lands on it.
+
+  null_behavior: NULL is missing; never silently coerce NULL to zero. (Money and member columns are NOT NULL.)
+
+  identifier_behavior:
+  - nrlm_fact_id is a technical identifier, unstable across reloads.
+  - shg_code is the SHG identifier and IS unique.
+  - shg_name is display text and is NOT unique.
+  - village_code, geography_key, district_lgd_code and block_lgd_code are geographic identifiers.
+  - formation_year_key is a dimension key.
+  - Identifiers and keys must never be SUMed or AVGed.
+  - geography_key and nrlm_fact_id are unstable across a reload - never export them.
+
+# ===========================================================================
+nlp_sql_rules:
+  read_only: true
+  allowed_operations: [SELECT]
+  default_from: curated.v_nrlm
+
+  aggregation_defaults:
+    shgs: COUNT(*)
+    groups: COUNT(*)
+    active_shgs: COUNT(*) FILTER (WHERE is_active)
+    inactive_shgs: COUNT(*) FILTER (WHERE NOT is_active)
+    members: SUM(total_members)
+    women_members: SUM(female_members)
+    men_members: SUM(male_members)
+    average_members_per_shg: AVG(total_members)
+    revolving_fund: SUM(revolving_fund_amount)
+    cif: SUM(cif_amount)
+    shgs_with_rf: COUNT(*) FILTER (WHERE revolving_fund_amount > 0)
+    shgs_with_cif: COUNT(*) FILTER (WHERE cif_amount > 0)
+    average_cif_among_recipients: AVG(cif_amount) FILTER (WHERE cif_amount > 0)
+    distinct_villages: COUNT(DISTINCT village_code) FILTER (WHERE entity_type <> 'Unresolved')
+
+  mandatory_predicate:
+    clause: none
+    note: >
+      Unlike PMAY's NOT is_placeholder, NRLM has no row to exclude from counts. The only
+      conditional exclusion is entity_type <> 'Unresolved', and only for village-level
+      questions.
+
+  date_behavior: >
+    Only formation year exists. 'Formed in FY X' filters formation_financial_year_short = 'X'.
+    'Formed before / after' uses < / > on the same char(7) column. Any money-by-year,
+    release-date, trend or growth question is refused. No calendar-year or month question
+    is answerable.
+
+  comparison: >
+    Comparisons are across geography, type, status and formation cohort - never across
+    time for money. 'Compare SHGs formed in 2019-20 and 2020-21' is a cohort comparison
+    of counts and is allowed; the money of those cohorts may be shown only as cumulative
+    holdings, never as 'released in' that year.
+
+  ranking: >
+    ORDER BY the requested aggregate and default top 5 when N is omitted for plural
+    'top' requests; singular 'highest/lowest' uses LIMIT 1. Village rankings exclude
+    Unresolved rows.
+
+  entity_behavior: >
+    Resolve district, block, village, constituency, SHG type and status values using
+    canonical stored values and approved aliases before SQL generation. District and block
+    are stored UPPERCASE; constituency_name_raw is mixed case; shg_type is 'New' /
+    'Revived' / 'Pre-Nrlm'.
+
+  unknown_entity: Do not guess; return not-found/did-you-mean.
+
+  join_behavior: >
+    v_nrlm pre-joins every dimension, so the generator emits no joins for ordinary
+    questions. Never join fact_nrlm_shg or v_nrlm row-to-row to any other scheme's fact
+    or view - see nrlm_foreign_key_augmentation.yaml.
+
+  cross_scheme_behavior: >
+    No cross-scheme view includes NRLM. A cross-scheme question (e.g. 'villages with SHGs
+    and PMAY houses') aggregates each scheme SEPARATELY to village_code or district, then
+    combines the aggregates. Never a fact-to-fact join, and never a money comparison
+    without stating that NRLM money is cumulative and undated.
+
+  money_behavior: >
+    v_nrlm is rupees (assumed). Convert explicitly and state the unit and that the figure
+    is cumulative as at the extract.
+
+# ===========================================================================
+few_shot_examples:
+
+- question: How many SHGs are there?
+  explanation: One row is one SHG. Unresolved rows are real SHGs and stay in the count.
+  sql: |
+    SELECT COUNT(*) AS shgs
+    FROM curated.v_nrlm;
+
+- question: How many active SHGs are there?
+  explanation: is_active is NOT NULL, so a plain boolean test is the full answer.
+  sql: |
+    SELECT COUNT(*) AS active_shgs
+    FROM curated.v_nrlm
+    WHERE is_active;
+
+- question: How many SHGs are there in East Khasi Hills?
+  explanation: District is stored uppercase in the view.
+  sql: |
+    SELECT COUNT(*) AS shgs
+    FROM curated.v_nrlm
+    WHERE lgd_district = 'EAST KHASI HILLS';
+
+- question: How many SHG members are there?
+  explanation: Members are a column, not rows. SUM(total_members), never COUNT(*).
+  sql: |
+    SELECT SUM(total_members)  AS members,
+           SUM(female_members) AS women,
+           SUM(male_members)   AS men
+    FROM curated.v_nrlm;
+
+- question: What is the total Revolving Fund?
+  explanation: Rupees, cumulative per SHG with no date. Convert to crore and say it is cumulative.
+  sql: |
+    SELECT ROUND(SUM(revolving_fund_amount) / 1e7, 2) AS rf_cr
+    FROM curated.v_nrlm;
+
+- question: Total CIF by district
+  explanation: Additive across SHGs, so a district grouping is valid. Never a year grouping.
+  sql: |
+    SELECT lgd_district, ROUND(SUM(cif_amount) / 1e7, 2) AS cif_cr
+    FROM curated.v_nrlm
+    GROUP BY lgd_district
+    ORDER BY cif_cr DESC;
+
+- question: How many SHGs were formed in 2020-21?
+  explanation: The only year is the formation year - this is exactly what it answers.
+  sql: |
+    SELECT COUNT(*) AS shgs_formed
+    FROM curated.v_nrlm
+    WHERE formation_financial_year_short = '2020-21';
+
+- question: Show SHG formation by year
+  explanation: A formation cohort series. Counts only - money is never put on this axis.
+  sql: |
+    SELECT formation_financial_year_short, COUNT(*) AS shgs_formed
+    FROM curated.v_nrlm
+    GROUP BY formation_financial_year_short
+    ORDER BY formation_financial_year_short;
+
+- question: How many revived SHGs are there?
+  explanation: shg_type has three exact stored values.
+  sql: |
+    SELECT COUNT(*) AS revived_shgs
+    FROM curated.v_nrlm
+    WHERE shg_type = 'Revived';
+
+- question: How many villages have an SHG?
+  explanation: Village identity is the code. Unresolved placeholders are not villages and are excluded here only.
+  sql: |
+    SELECT COUNT(DISTINCT village_code) AS villages
+    FROM curated.v_nrlm
+    WHERE entity_type <> 'Unresolved';
+
+- question: Which district has the most SHGs?
+  explanation: Singular superlative - LIMIT 1. Unresolved rows count, because they carry a real district.
+  sql: |
+    SELECT lgd_district, COUNT(*) AS shgs
+    FROM curated.v_nrlm
+    GROUP BY lgd_district
+    ORDER BY shgs DESC
+    LIMIT 1;
+
+- question: Top blocks by number of SHGs
+  explanation: No N supplied, so the ranking rule defaults to top 5.
+  sql: |
+    SELECT lgd_block, lgd_district, COUNT(*) AS shgs
+    FROM curated.v_nrlm
+    GROUP BY lgd_block, lgd_district
+    ORDER BY shgs DESC
+    LIMIT 5;
+
+- question: How many SHGs have not received CIF?
+  explanation: 0 means no CIF recorded; there are no NULLs. Inactive SHGs are all in this group - say so.
+  sql: |
+    SELECT COUNT(*) AS shgs_without_cif,
+           COUNT(*) FILTER (WHERE NOT is_active) AS of_which_inactive
+    FROM curated.v_nrlm
+    WHERE cif_amount = 0;
+
+- question: What is the average CIF per SHG?
+  explanation: 73% of SHGs hold 0 CIF. Show both populations so the average is not misread.
+  sql: |
+    SELECT ROUND(AVG(cif_amount), 0)                              AS avg_cif_all_shgs,
+           ROUND(AVG(cif_amount) FILTER (WHERE cif_amount > 0), 0) AS avg_cif_among_recipients
+    FROM curated.v_nrlm;
+
+- question: How many SHGs are in Mawkyrwat constituency?
+  explanation: Constituency is mixed case as stored and NULL on 2,032 SHGs.
+  sql: |
+    SELECT COUNT(*) AS shgs
+    FROM curated.v_nrlm
+    WHERE constituency_name_raw = 'Mawkyrwat';
+
+- question: What is the LGD code of East Khasi Hills?
+  explanation: Unlike PMAY, NRLM carries the district code on the row.
+  sql: |
+    SELECT DISTINCT lgd_district, district_lgd_code
+    FROM curated.v_nrlm
+    WHERE lgd_district = 'EAST KHASI HILLS';
+
+- question: Find SHG code 3329
+  explanation: shg_code is unique, so exactly one row.
+  sql: |
+    SELECT shg_code, shg_name, shg_type, is_active, formation_financial_year_short,
+           lgd_district, lgd_block, lgd_village_name, total_members,
+           revolving_fund_amount, cif_amount
+    FROM curated.v_nrlm
+    WHERE shg_code = 3329;
+
+- question: Show the SHG called Iatreilang Shg
+  explanation: The name is shared by 295 SHGs. Return a list with codes and places so the user can choose.
+  sql: |
+    SELECT shg_code, shg_name, lgd_district, lgd_block, lgd_village_name, is_active
+    FROM curated.v_nrlm
+    WHERE shg_name ILIKE 'Iatreilang Shg'
+    ORDER BY lgd_district, lgd_block, lgd_village_name
+    LIMIT 100;
+
+- question: How many SHGs have membership outside the NRLM norm?
+  explanation: The flag is precomputed. Break it down so the zero-member SHGs are visible.
+  sql: |
+    SELECT CASE WHEN total_members = 0  THEN '0 members'
+                WHEN total_members < 5  THEN '1-4 members'
+                ELSE 'above 20 members' END AS band,
+           COUNT(*) AS shgs
+    FROM curated.v_nrlm
+    WHERE member_count_out_of_norm
+    GROUP BY 1
+    ORDER BY 1;
+
+# ---- v1.1 additions - answers checked against NRLM.csv (grouped by LGD code) ----
+- question: How many SHGs are in Ri Bhoi, and how many are active?
+  explanation: District by code avoids the uppercase-name trap. is_active is NOT NULL, so FILTER is exact.
+  sql: |
+    SELECT COUNT(*) AS shgs, COUNT(*) FILTER (WHERE is_active) AS active
+    FROM curated.v_nrlm
+    WHERE district_lgd_code = 276;
+  expected: {shgs: 3708, active: 3618}
+
+- question: How many members do SHGs in West Jaintia Hills have?
+  explanation: Members are summed from the column; COUNT(*) would give 4,055 groups.
+  sql: |
+    SELECT SUM(total_members) AS members, SUM(female_members) AS women, SUM(male_members) AS men
+    FROM curated.v_nrlm
+    WHERE lgd_district = 'WEST JAINTIA HILLS';
+  expected: {members: 41049, women: 40591, men: 458}
+
+- question: Total RF and CIF in Laskein block
+  explanation: Block totals fall under a crore for RF, so lakh is the natural unit. Both funds are cumulative.
+  sql: |
+    SELECT ROUND(SUM(revolving_fund_amount) / 1e5, 2) AS rf_lakh,
+           ROUND(SUM(cif_amount) / 1e5, 2)            AS cif_lakh
+    FROM curated.v_nrlm
+    WHERE block_lgd_code = 1997;
+  expected: {rf_lakh: 269.70, cif_lakh: 1184.83}
+
+- question: Which district has the lowest CIF coverage?
+  explanation: Coverage is the share of SHGs with cif_amount > 0. 0 is a recorded value, never NULL.
+  sql: |
+    SELECT lgd_district,
+           ROUND(100.0 * COUNT(*) FILTER (WHERE cif_amount > 0) / COUNT(*), 2) AS cif_coverage_pct
+    FROM curated.v_nrlm
+    GROUP BY lgd_district
+    ORDER BY cif_coverage_pct ASC
+    LIMIT 1;
+  expected: {lgd_district: EAST KHASI HILLS, cif_coverage_pct: 11.75}
+
+- question: How many SHGs were formed in South West Garo Hills in 2019-20?
+  explanation: The only year is the formation year; this is exactly the question it answers.
+  sql: |
+    SELECT COUNT(*) AS shgs_formed
+    FROM curated.v_nrlm
+    WHERE district_lgd_code = 663
+      AND formation_financial_year_short = '2019-20';
+  expected: 1123
+
+- question: How many villages in East Khasi Hills have an SHG?
+  explanation: Count codes, exclude Unresolved placeholders (355 SHGs in this district have no village).
+  sql: |
+    SELECT COUNT(DISTINCT village_code) AS villages
+    FROM curated.v_nrlm
+    WHERE lgd_district = 'EAST KHASI HILLS'
+      AND entity_type <> 'Unresolved';
+  expected: 788
+
+- question: How many SHGs are in Khliehriat constituency?
+  explanation: Constituency name is stored mixed case as typed.
+  sql: |
+    SELECT COUNT(*) AS shgs
+    FROM curated.v_nrlm
+    WHERE constituency_name_raw = 'Khliehriat';
+  expected: 1357
+
+- question: What is the LGD code of Eastern West Khasi Hills, and which blocks are in it?
+  explanation: NRLM carries district and block codes on the row, so this is answerable (it is not for PMAY).
+  sql: |
+    SELECT DISTINCT district_lgd_code, lgd_block, block_lgd_code
+    FROM curated.v_nrlm
+    WHERE district_lgd_code = 740
+    ORDER BY block_lgd_code;
+  expected: [{district_lgd_code: 740, lgd_block: MAWTHADRAISHAN, block_lgd_code: 1981}, {district_lgd_code: 740, lgd_block: MAIRANG, block_lgd_code: 1982}]
+
+- question: How many SHGs hold the standard Rs 15,000 Revolving Fund?
+  explanation: RF has only 10 distinct values; 15,000 is the norm.
+  sql: |
+    SELECT COUNT(*) AS shgs_at_15000
+    FROM curated.v_nrlm
+    WHERE revolving_fund_amount = 15000;
+  expected: 33241
+
+- question: How many active SHGs have not yet received Revolving Fund?
+  explanation: Restrict to active - every inactive SHG shows 0 and would swamp the result.
+  sql: |
+    SELECT COUNT(*) AS active_without_rf
+    FROM curated.v_nrlm
+    WHERE is_active
+      AND revolving_fund_amount = 0;
+  expected: 5732
+
+- question: Which SHGs in Pynursla block hold more than Rs 5 lakh CIF?
+  explanation: These values are unconfirmed (NR-25); list them with the caveat rather than summing silently.
+  sql: |
+    SELECT shg_code, shg_name, formation_financial_year_short, cif_amount
+    FROM curated.v_nrlm
+    WHERE block_lgd_code = 1995
+      AND cif_amount > 500000
+    ORDER BY cif_amount DESC;
+  expected_rows: 13
+  expected_first: {shg_code: 3329, shg_name: Aibhahlang Shg Nongsohphan, formation_financial_year_short: '2017-18', cif_amount: 1360000}
+
+- question: What is the source file's district name for the 12 Tangnub SHGs?
+  explanation: Lineage question - source names live on the fact only.
+  sql: |
+    SELECT district_name_raw, block_name_raw, district_lgd_code, block_lgd_code, COUNT(*) AS shgs
+    FROM curated.fact_nrlm_shg
+    WHERE has_name_code_conflict
+    GROUP BY 1, 2, 3, 4;
+  expected: {district_name_raw: Eastern West Khasi Hills, block_name_raw: Mairang, district_lgd_code: 657, block_lgd_code: 2000, shgs: 12}
+
+# ---- questions that must be refused -----------------------------------
+- question: How much Revolving Fund was released in 2021-22?
+  explanation: >
+    The money columns are cumulative per SHG with no release date. The only year is the
+    formation year. Filtering money by it would report 'funds held by SHGs formed in
+    2021-22', which is a different question. Refuse and offer that cohort figure instead,
+    clearly labelled.
+  sql: null
+
+- question: What is the year-on-year growth in CIF?
+  explanation: >
+    The table is a single snapshot that is replaced on every extract. There is no second
+    point in time and no release date. Growth cannot be computed.
+  sql: null
+
+- question: On what date was SHG 7194 formed?
+  explanation: >
+    group_form, the only candidate, was '00:00.0' on every source row and was dropped at
+    ingest. Only the formation financial year exists. Offer that instead.
+  sql: null
+
+- question: How many SHGs are in each Village Organisation?
+  explanation: >
+    The source carries no Village Organisation or Cluster Level Federation identifier
+    (readiness clarification 8). Federation questions cannot be answered.
+  sql: null
+
+- question: What are the total savings of SHGs in Ri Bhoi?
+  explanation: >
+    No savings, bank-linkage, loan or credit column exists (readiness clarification 10).
+    Do not substitute RF or CIF - they are grants from the Mission, not savings.
+  sql: null
+
+- question: List the members of SHG 7194
+  explanation: >
+    No member names or member-level rows exist. Only male and female counts per SHG.
+  sql: null
+
+- question: Show me PMAY houses for the SHGs in this result
+  explanation: >
+    A row-level join from fact_nrlm_shg to any other scheme's fact is prohibited - SHG
+    grain against house grain multiplies both sides. Aggregate each scheme separately by
+    village_code and combine the aggregates.
+  sql: null
+
+- question: Update the CIF amount for an SHG
+  explanation: The read role permits SELECT only. Refuse rather than translating into write SQL.
+  sql: null
+
+# ---- v1.1 refusals - each grounded in what the data actually holds -------
+- question: How much CIF did West Jaintia Hills get in 2020-21?
+  explanation: >
+    CIF is cumulative per SHG with no release date. Filtering by formation year would
+    report "CIF held today by West Jaintia Hills SHGs formed in 2020-21" - a different
+    question. Refuse and offer the district's cumulative CIF (Rs 18.89 crore to date), or
+    the cohort figure clearly labelled as such.
+  sql: null
+
+- question: Did Revolving Fund releases go up after COVID?
+  explanation: >
+    There is no release date and only one snapshot, so no before/after comparison exists.
+    Offer SHG FORMATION by year instead, which does show the 2019-20 / 2020-21 peak
+    (10,604 and 11,354 SHGs formed).
+  sql: null
+
+- question: Which SHGs were formed in March 2021?
+  explanation: >
+    Only the financial year of formation survives; group_form, the only date candidate,
+    was '00:00.0' on all 40,629 rows. Offer "SHGs formed in 2020-21" (11,354).
+  sql: null
+
+- question: How many households in Umling block are covered by SHGs?
+  explanation: >
+    There is no household column and no household total, so coverage cannot be computed.
+    Offer members (11,854 in Umling) with the assumption stated, or SHG count (1,167).
+  sql: null
+
+- question: Which Cluster Level Federation has the most SHGs in Mairang?
+  explanation: >
+    No Village Organisation or CLF identifier is in the source (readiness clarification 8).
+    Offer SHGs by village within Mairang block instead.
+  sql: null
+
+- question: What is the loan outstanding of SHGs in Ri Bhoi?
+  explanation: >
+    No bank linkage, loan or repayment field exists. Do not substitute CIF (Rs 8.85 crore in
+    Ri Bhoi) - it is a Mission fund, not a bank loan.
+  sql: null
+
+- question: List the SHGs in Dadenggiri that received CIF
+  explanation: >
+    Not a refusal of the question - the answer is genuinely empty: no SHG in Dadenggiri
+    block holds any CIF. Return the empty result and say so plainly, rather than "no data".
+  sql: |
+    SELECT shg_code, shg_name, cif_amount
+    FROM curated.v_nrlm
+    WHERE block_lgd_code = 1963
+      AND cif_amount > 0;
+  expected_rows: 0

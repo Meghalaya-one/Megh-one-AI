@@ -129,12 +129,358 @@ def test_combined_total_added_when_missing():
     assert "Combined across these 2 programmes: 448" in out
 
 
+# ── KI-182: a named programme with no applications is stated as 0 ───────────
+# The SQL and answers below are the bot's own, from the OFF-009 all-pairs re-test
+# (2026-10-05): one row back, the 0 programme silently missing from the answer.
+CIN, WAR, TAXI = ("Meghalaya Cinema Theatre Scheme", "Meghalaya Warehouse Scheme", "Chief Minister's Green Taxi Scheme")
+
+
+def _pair_sql(a, b, tail="GROUP BY scheme_name\nLIMIT 1000"):
+    lit = lambda s: s.replace("'", "''")  # noqa: E731
+    return ("SELECT scheme_name, COUNT(DISTINCT request_id) AS applicants\nFROM curated.v_cm_elevate\n"
+            f"WHERE lgd_district = 'SOUTH GARO HILLS'\n  AND scheme_name IN ('{lit(a)}', '{lit(b)}')\n{tail}")
+
+
+def test_zero_programme_named_only_one_is_stated_as_zero():
+    rows = [{"scheme_name": WAR, "applicants": 10}]
+    out = p._cme_multi_scheme_total("How many applicants are there in South Garo Hills under Meghalaya Cinema "
+                                    "Theatre Scheme and Meghalaya Warehouse Scheme?", _pair_sql(CIN, WAR), rows,
+                                    "Meghalaya Warehouse Scheme: 10 applicants.")
+    # user screenshot 2026-10-05: one clear explanation, in the question's order
+    assert out == ("There are 10 applicants in South Garo Hills across the 2 programmes you asked about:\n"
+                   "- Meghalaya Cinema Theatre Scheme: 0 — no applicants recorded in South Garo Hills\n"
+                   "- Meghalaya Warehouse Scheme: 10 applicants\n\n"
+                   "All 10 applicants are under the Meghalaya Warehouse Scheme; the Meghalaya Cinema Theatre Scheme "
+                   "has none in South Garo Hills.")
+
+
+def test_zero_programme_merged_into_one_figure_is_split_out():
+    # "There are 12 applicants … under A and B" read as if 12 covered both
+    rows = [{"scheme_name": "PRIME Agriculture Response Vehicle Scheme", "applicants": 12}]
+    ans = ("There are 12 applicants in East Jaintia Hills under the PRIME Agriculture Response Vehicle Scheme "
+           "and Chief Minister's Green Taxi Scheme.")
+    out = p._cme_multi_scheme_total("q", _pair_sql("PRIME Agriculture Response Vehicle Scheme", TAXI), rows, ans)
+    assert "- PRIME Agriculture Response Vehicle Scheme: 12 applicants" in out
+    assert "- Chief Minister's Green Taxi Scheme: 0 — no applicants recorded" in out
+    assert ans not in out                      # the misleading merged sentence is gone
+
+
+def test_one_applicant_is_singular():
+    rows = [{"scheme_name": "Meghalaya Goat Farming Scheme", "applicants": 1}]
+    ans = ("There is 1 applicant under the Meghalaya Goat Farming Scheme in East Jaintia Hills. No applicants "
+           "are recorded for the Meghalaya Sports & Wellness Centre Scheme in this area.")
+    sql = _pair_sql("Meghalaya Sports & Wellness Centre Scheme", "Meghalaya Goat Farming Scheme")
+    out = p._cme_multi_scheme_total("q", sql, rows, ans)
+    assert out.startswith("There is 1 applicant in South Garo Hills across the 2 programmes")
+    assert "The only applicant is under the Meghalaya Goat Farming Scheme" in out
+
+
+def test_no_separate_count_is_not_a_stated_zero():
+    rows = [{"scheme_name": "Meghalaya Dairy Development Scheme", "applicants": 1}]
+    ans = ("West Jaintia Hills has 1 applicant under the Meghalaya Dairy Development Scheme and Meghalaya "
+           "Motorcaravan Scheme. The result shows 1 applicant for the Meghalaya Dairy Development Scheme, with no "
+           "separate count provided for the Meghalaya Motorcaravan Scheme.")
+    out = p._cme_multi_scheme_total("q", _pair_sql("Meghalaya Dairy Development Scheme",
+                                                   "Meghalaya Motorcaravan Scheme"), rows, ans)
+    assert "- Meghalaya Motorcaravan Scheme: 0 — no applicants recorded" in out
+    assert "no separate count" not in out
+
+
+def test_three_programmes_one_zero_gets_zero_and_total():
+    sql = (f"SELECT scheme_name, COUNT(DISTINCT request_id) AS applicants FROM curated.v_cm_elevate "
+           f"WHERE lgd_district = 'RI BHOI' AND scheme_name IN ('{PIG}', '{POU}', '{CIN}') GROUP BY scheme_name")
+    rows = [{"scheme_name": PIG, "applicants": 400}, {"scheme_name": POU, "applicants": 48}]
+    out = p._cme_multi_scheme_total("q", sql, rows, "Piggery has 400 and Poultry has 48 applicants.")
+    assert out.startswith("There are 448 applicants in Ri Bhoi across the 3 programmes you asked about:")
+    assert "- Meghalaya Cinema Theatre Scheme: 0 — no applicants recorded in Ri Bhoi" in out
+    assert out.endswith("The Meghalaya Cinema Theatre Scheme has no applicants in Ri Bhoi, so the total comes from "
+                        "the other 2 programmes.")
+
+
+def test_programmes_listed_in_the_order_the_question_names_them():
+    # live 2026-10-05: the SQL's IN list put Any Business Venture first; the officer asked Motorcaravan first
+    rows = [{"scheme_name": "Meghalaya Any Business Venture Scheme", "applicants": 28}]
+    out = p._cme_multi_scheme_total(
+        "How many applicants are there in South Garo Hills under Meghalaya Motorcaravan Scheme and Meghalaya Any "
+        "Business Venture Scheme?", _pair_sql("Meghalaya Any Business Venture Scheme", "Meghalaya Motorcaravan Scheme"),
+        rows, "x")
+    assert out.index("Motorcaravan Scheme: 0") < out.index("Any Business Venture Scheme: 28")
+
+
+def test_duplicated_group_by_still_gets_the_clear_answer():
+    # live 2026-10-05: "GROUP BY scheme_name, scheme_name ORDER BY scheme_name LIMIT 100"
+    sql = _pair_sql(TAXI, SEED, "GROUP BY scheme_name, scheme_name ORDER BY scheme_name LIMIT 100")
+    out = p._cme_multi_scheme_total("q", sql, [{"scheme_name": SEED, "applicants": 124}],
+                                    f"{SEED}: 124 applicants.")
+    assert out.startswith("There are 124 applicants in South Garo Hills across the 2 programmes you asked about:")
+
+
+def test_zero_with_on_hold_names_the_status_in_every_line():
+    # live 2026-10-05: "on hold in WGH under cinema theatre and piggery" -> "…Piggery…: 20 applications." (no "on hold")
+    sql = (f"SELECT scheme_name, COUNT(*) AS applications FROM curated.v_cm_elevate WHERE lgd_district = "
+           f"'WEST GARO HILLS' AND scheme_name IN ('{CIN}', '{PIG}') AND data_verified = 'On Hold' GROUP BY scheme_name")
+    out = p._cme_multi_scheme_total("q", sql, [{"scheme_name": PIG, "applications": 20}],
+                                    "Meghalaya Piggery Development Scheme: 20 applications.")
+    assert out.startswith("There are 20 applications on hold in West Garo Hills across the 2 programmes")
+    assert "- Meghalaya Cinema Theatre Scheme: 0 — no applications on hold recorded in West Garo Hills" in out
+    assert "- Meghalaya Piggery Development Scheme: 20 applications on hold" in out
+
+
+def test_pending_at_level_one_is_named_and_singular():
+    sql = (f"SELECT scheme_name, COUNT(*) AS applications FROM curated.v_cm_elevate WHERE lgd_district = "
+           f"'RI BHOI' AND LOWER(current_level) = 'level1' AND scheme_name IN ('{CIN}', '{WAR}') GROUP BY scheme_name")
+    out = p._cme_multi_scheme_total("q", sql, [{"scheme_name": WAR, "applications": 1}], "x")
+    assert out.startswith("There is 1 application pending at level 1 in Ri Bhoi")
+    assert "The only application pending at level 1 is under the Meghalaya Warehouse Scheme" in out
+
+
+def test_zero_with_a_filter_the_wording_cannot_name_keeps_the_old_line():
+    # a sector filter: the rebuilt wording would drop it, so the KI-182 line is appended instead
+    sql = _pair_sql(CIN, WAR).replace("GROUP BY", "AND scheme_specific ->> 'sector_id' = 'Piggery'\nGROUP BY")
+    ans = "Meghalaya Warehouse Scheme: 3 applicants in the Piggery sector."
+    out = p._cme_multi_scheme_total("q", sql, [{"scheme_name": WAR, "applicants": 3}], ans)
+    assert out.startswith(ans) and "Cinema Theatre: 0 (none recorded); Warehouse: 3." in out
+
+
+@pytest.mark.parametrize("sql", [
+    # a misspelt literal also returns no row — that is not a 0
+    _pair_sql("Meghalaya Cinema Theater Scheme", WAR),
+    # a LIMIT that can drop a group, a HAVING, an OR: absence is not a 0
+    _pair_sql(CIN, WAR, "GROUP BY scheme_name ORDER BY applicants DESC LIMIT 1"),
+    _pair_sql(CIN, WAR, "GROUP BY scheme_name HAVING COUNT(*) > 5"),
+    _pair_sql(CIN, WAR).replace("AND scheme_name", "OR scheme_name"),
+    # an average of nothing is not 0
+    _pair_sql(CIN, WAR).replace("COUNT(DISTINCT request_id) AS applicants", "AVG(loan_amount) AS applicants"),
+])
+def test_absence_that_is_not_a_zero_is_not_filled(sql):
+    rows = [{"scheme_name": WAR, "applicants": 10}]
+    ans = "Meghalaya Warehouse Scheme: 10 applicants."
+    assert p._cme_multi_scheme_total("q", sql, rows, ans) == ans
+
+
+# ── both named programmes 0: an empty result is answered as 0, not "no records" ──
+# User screenshot 2026-10-05: "How many applicants are there in SWKH under agro tourism
+# and green taxi scheme?" -> "I couldn't find any matching records for South West Khasi Hills, …"
+AGRO = "Agro Tourism Villa Scheme"
+SWKH_SQL = ("SELECT scheme_name, COUNT(DISTINCT request_id) AS applicants\nFROM curated.v_cm_elevate\n"
+            "WHERE lgd_district = 'SOUTH WEST KHASI HILLS'\n"
+            f"  AND scheme_name IN ('Chief Minister''s Green Taxi Scheme', '{AGRO}')\nGROUP BY scheme_name\nLIMIT 1000")
+
+
+def _place_lookup(monkeypatch, found=True):
+    seen = []
+
+    async def fake(sql, params=None):
+        seen.append((sql, params))
+        return [{"hit": 1}] if found else []
+    monkeypatch.setattr(p, "fetch_rows", fake)
+    return seen
+
+
+def test_empty_two_programme_count_in_a_real_district_says_zero(monkeypatch):
+    seen = _place_lookup(monkeypatch)
+    out = run(p.compose_response("How many applicants are there in SWKH under agro tourism and green taxi scheme?",
+                                 SWKH_SQL, [], entities={"district": "South West Khasi Hills"}, schemes=CME))
+    assert out == ("There are no applicants under the Chief Minister's Green Taxi Scheme or the Agro Tourism Villa "
+                   "Scheme in South West Khasi Hills — the data records 0 for each.\n\n"
+                   "Chief Minister's Green Taxi: 0; Agro Tourism Villa: 0.")
+    # the place is checked with the app's own bound query, never the model's SQL
+    assert seen == [("SELECT 1 AS hit FROM curated.v_cm_elevate WHERE lgd_district = $1 LIMIT 1",
+                     ["SOUTH WEST KHASI HILLS"])]
+
+
+def test_empty_one_programme_count_with_a_block_says_zero(monkeypatch):
+    _place_lookup(monkeypatch)
+    sql = ("SELECT scheme_name, COUNT(*) AS applications FROM curated.v_cm_elevate WHERE "
+           f"LOWER(lgd_block) = 'mawphlang' AND scheme_name = '{CIN}' GROUP BY scheme_name")
+    out = run(p._cme_zero_programmes_answer(sql))
+    assert out == "There are no applications under the Meghalaya Cinema Theatre Scheme in Mawphlang block — the data records 0."
+
+
+def test_empty_on_hold_count_says_zero_on_hold(monkeypatch):
+    _place_lookup(monkeypatch)
+    sql = SWKH_SQL.replace("GROUP BY", "AND data_verified = 'On Hold'\nGROUP BY")
+    out = run(p._cme_zero_programmes_answer(sql))
+    assert out.startswith("There are no applicants on hold under the Chief Minister's Green Taxi Scheme or the "
+                          "Agro Tourism Villa Scheme in South West Khasi Hills — the data records 0 for each.")
+
+
+def test_place_not_in_the_data_keeps_the_no_records_message(monkeypatch):
+    _place_lookup(monkeypatch, found=False)      # e.g. a misspelt district: not a 0
+    out = run(p.compose_response("q", SWKH_SQL, [], entities={"district": "South West Khasi Hills"}, schemes=CME))
+    assert out.startswith("I couldn't find any matching records")
+
+
+@pytest.mark.parametrize("sql", [
+    SWKH_SQL.replace(AGRO, "Agro Tourism Villas Scheme"),                         # not an exact programme name
+    SWKH_SQL.replace("GROUP BY", "AND gender_id = '2'\nGROUP BY"),                 # a filter the wording cannot name
+    SWKH_SQL.replace("GROUP BY", "AND current_level = 'level7'\nGROUP BY"),        # not a level in the data
+    SWKH_SQL.replace("GROUP BY scheme_name", "GROUP BY scheme_name HAVING COUNT(*) > 5"),
+    SWKH_SQL.replace("AND scheme_name", "OR scheme_name"),
+    SWKH_SQL.replace("COUNT(DISTINCT request_id)", "AVG(loan_amount)"),
+    SWKH_SQL.replace("GROUP BY scheme_name", "GROUP BY lgd_block"),
+])
+def test_empty_results_that_are_not_a_zero_are_not_answered_as_zero(monkeypatch, sql):
+    _place_lookup(monkeypatch)
+    assert run(p._cme_zero_programmes_answer(sql)) is None
+
+
+def test_other_schemes_keep_the_no_records_message(monkeypatch):
+    _place_lookup(monkeypatch)
+    out = run(p.compose_response("q", SWKH_SQL, [], entities={"district": "South West Khasi Hills"},
+                                 schemes=["Focus Plus"]))
+    assert out.startswith("I couldn't find any matching records")
+
+
+def test_both_programmes_present_is_unchanged():
+    rows = [{"scheme_name": SEED, "applicants": 544}, {"scheme_name": WAR, "applicants": 2}]
+    ans = ("There are 544 applicants under PRIME Small Enterprise Empowerment and Development (SEED) and 2 "
+           "applicants under Meghalaya Warehouse Scheme in East Garo Hills.  Combined across these 2 programmes: "
+           "546 applicants.")
+    assert p._cme_multi_scheme_total("q", _pair_sql(SEED, WAR), rows, ans) == ans
+
+
 # ── KI-070: "pending at level N" ─────────────────────────────────────────────
 def test_pending_at_level_drops_the_on_hold_filter():
     sql = ("SELECT COUNT(*) AS applications\nFROM curated.v_cm_elevate\n"
            "WHERE LOWER(current_level) = 'level2'\n  AND data_verified = 'On Hold'\nLIMIT 1")
     out = p._cm_elevate_level_pending("How many CM ELEVATE applications are pending at level 2?", CME, sql)
     assert "On Hold" not in out and "current_level) = 'level2'" in out
+    assert "(LOWER(current_level) = 'level2' AND scheme_specific ->> 'file_status' = 'Pending')" in out  # KI-186
+
+
+# ── KI-186: pending at level N = level AND file_status 'Pending'; "unique" = distinct ──
+# User screenshot 2026-10-05: "how many cm elevate unique applications are pending at level 1
+# for all of Meghalaya" -> SELECT COUNT(*) … WHERE LOWER(current_level) = 'level1' -> 8,372.
+SHOT_Q = "how many cm elevate unique applications are pending at level 1 for all of Meghalaya"
+SHOT_SQL = ("SELECT COUNT(*) AS applications\nFROM curated.v_cm_elevate\n"
+            "WHERE LOWER(current_level) = 'level1'\nLIMIT 1")
+
+
+def test_screenshot_question_gets_pending_state_and_distinct_count():
+    out = p._cm_elevate_unique_applications(SHOT_Q, CME, p._cm_elevate_level_pending(SHOT_Q, CME, SHOT_SQL))
+    assert out == ("SELECT COUNT(DISTINCT request_id) AS applications\nFROM curated.v_cm_elevate\n"
+                   "WHERE (LOWER(current_level) = 'level1' AND scheme_specific ->> 'file_status' = 'Pending')\nLIMIT 1")
+
+
+def test_pending_state_added_inside_a_count_filter_too():
+    sql = ("SELECT lgd_district, COUNT(*) FILTER (WHERE LOWER(current_level) = 'level2') AS pending "
+           "FROM curated.v_cm_elevate GROUP BY lgd_district")
+    out = p._cm_elevate_level_pending("applications pending at level 2 by district", CME, sql)
+    assert "FILTER (WHERE (LOWER(current_level) = 'level2' AND scheme_specific ->> 'file_status' = 'Pending'))" in out
+
+
+@pytest.mark.parametrize("q,sql", [
+    # plain "pending" (no level) stays On Hold — KI-074, unchanged
+    ("How many applications are pending in Ri Bhoi?",
+     "SELECT COUNT(*) FROM curated.v_cm_elevate WHERE data_verified = 'On Hold' AND lgd_district = 'RI BHOI'"),
+    # a level without "pending" is just the level
+    ("How many applications are at level 2?",
+     "SELECT COUNT(*) FROM curated.v_cm_elevate WHERE LOWER(current_level) = 'level2'"),
+    # already carries the Pending state
+    ("pending at level 1", "SELECT COUNT(*) FROM curated.v_cm_elevate WHERE LOWER(current_level) = 'level1' "
+                           "AND scheme_specific ->> 'file_status' = 'Pending'"),
+    # "on hold at level 1" is asked explicitly
+    ("How many applications are on hold pending at level 1?",
+     "SELECT COUNT(*) FROM curated.v_cm_elevate WHERE LOWER(current_level) = 'level1' AND data_verified = 'On Hold'"),
+])
+def test_other_pending_and_level_questions_are_unchanged(q, sql):
+    assert p._cm_elevate_level_pending(q, CME, sql) == sql
+
+
+@pytest.mark.parametrize("q", ["How many applications are there in Ri Bhoi?",
+                               "How many applicants are there in Ri Bhoi?"])
+def test_count_star_kept_without_unique(q):
+    sql = "SELECT COUNT(*) AS applications FROM curated.v_cm_elevate WHERE lgd_district = 'RI BHOI'"
+    assert p._cm_elevate_unique_applications(q, CME, sql) == sql
+
+
+def test_unique_guard_is_cm_elevate_only():
+    sql = "SELECT COUNT(*) FROM curated.v_cm_elevate_disbursement"
+    assert p._cm_elevate_unique_applications("unique applications", ["CM Elevate Legacy"], sql) == sql
+
+
+@pytest.mark.parametrize("bad,good", [
+    # live 2026-10-05: verifier rejected all 4 attempts -> "couldn't build a working query"
+    ("WHERE LOWER(lgd_district) = 'NORTH GARO HILLS'", "WHERE lgd_district = 'NORTH GARO HILLS'"),
+    ("WHERE LOWER(lgd_district) = 'north garo hills'", "WHERE lgd_district = 'NORTH GARO HILLS'"),
+    ("WHERE UPPER(v.lgd_block) IN ('Tura')", "WHERE v.lgd_block IN ('TURA')"),
+    # live 2026-10-05: current_level = 'level 1' -> a false 0 against 1,624
+    ("WHERE current_level = 'level 1'", "WHERE LOWER(current_level) = 'level1'"),
+    ("WHERE LOWER(current_level) = 'Level-2'", "WHERE LOWER(current_level) = 'level2'"),
+    ("WHERE current_level = 'LEVEL0'", "WHERE LOWER(current_level) = 'level0'"),
+])
+def test_case_folded_literals_are_made_matchable(bad, good):
+    sql = f"SELECT COUNT(*) FROM curated.v_cm_elevate {bad}"
+    assert p._uppercase_geo_literals(p._cm_elevate_case_safe_literals(CME, sql)) == \
+        f"SELECT COUNT(*) FROM curated.v_cm_elevate {good}"
+
+
+def test_case_safe_literals_leave_other_schemes_and_canonical_sql_alone():
+    sql = "SELECT COUNT(*) FROM curated.v_cm_elevate WHERE LOWER(current_level) = 'level1' AND lgd_district = 'RI BHOI'"
+    assert p._cm_elevate_case_safe_literals(CME, sql) == sql
+    other = "SELECT 1 FROM curated.v_x WHERE LOWER(lgd_district) = 'RI BHOI'"
+    assert p._cm_elevate_case_safe_literals(["Focus Plus"], other) == other
+
+
+NGH_SQL = ("SELECT COUNT(*) AS applications FROM curated.v_cm_elevate WHERE LOWER(current_level) = 'level1' "
+           "AND scheme_specific ->> 'file_status' = 'Pending' AND lgd_district = 'NORTH GARO HILLS' LIMIT 1")
+NGH_ISSUE = ("Check 2: The RESOLVED ENTITIES block specifies lgd_district = 'NORTH GARO HILLS', but the SQL uses "
+             "LOWER(lgd_district) = 'NORTH GARO HILLS'. The check requires the exact value from the RESOLVED ENTITIES "
+             "block to be present verbatim in the WHERE clause.")
+
+
+def test_verifier_check2_on_a_verbatim_place_is_discarded():
+    # live 2026-10-05: rejected 4 times -> "couldn't build a working query"
+    assert p._verifier_scheme_specific_complaint_is_false(NGH_ISSUE, CME, NGH_SQL, {"district": "NORTH GARO HILLS"})
+
+
+@pytest.mark.parametrize("sql,resolved", [
+    (NGH_SQL.replace("lgd_district = ", "LOWER(lgd_district) = "), {"district": "NORTH GARO HILLS"}),  # really folded
+    (NGH_SQL.replace("NORTH GARO HILLS", "WEST GARO HILLS"), {"district": "NORTH GARO HILLS"}),        # wrong place
+    (NGH_SQL, {"district": "NORTH GARO HILLS", "cm_scheme": "Meghalaya Piggery Development Scheme"}),  # not only places
+])
+def test_verifier_check2_with_a_real_place_problem_is_kept(sql, resolved):
+    assert not p._verifier_scheme_specific_complaint_is_false(NGH_ISSUE, CME, sql, resolved)
+
+
+TOP_Q = "Which CM ELEVATE programs have the highest number of pending applications?"
+
+
+@pytest.mark.parametrize("where,expected", [
+    # live 2026-10-05, 4 of 6 runs: "Tourism Vehicle 89" against the true On Hold leader
+    ("WHERE LOWER(current_file_status) LIKE 'sendback%' OR current_file_status IS NULL GROUP BY scheme_name",
+     "WHERE data_verified = 'On Hold' GROUP BY scheme_name"),
+    ("WHERE lgd_district = 'RI BHOI' AND LOWER(current_file_status) = 'forward' GROUP BY scheme_name",
+     "WHERE lgd_district = 'RI BHOI' AND data_verified = 'On Hold' GROUP BY scheme_name"),
+])
+def test_plain_pending_on_file_status_is_restored_to_on_hold(where, expected):
+    sql = f"SELECT scheme_name, COUNT(*) AS pending FROM curated.v_cm_elevate {where} ORDER BY pending DESC LIMIT 10"
+    assert p._cm_elevate_plain_pending_file_status(TOP_Q, CME, sql) == \
+        f"SELECT scheme_name, COUNT(*) AS pending FROM curated.v_cm_elevate {expected} ORDER BY pending DESC LIMIT 10"
+
+
+@pytest.mark.parametrize("q", ["How many applications are pending at level 1?",          # level: KI-186 rule
+                               "How many applications are sent back and pending?",       # names a file status
+                               "What is the pending status distribution?",              # a status question
+                               "How many applications are pending or on hold?"])
+def test_file_status_kept_when_the_question_points_at_it(q):
+    sql = "SELECT COUNT(*) FROM curated.v_cm_elevate WHERE LOWER(current_file_status) LIKE 'sendback%'"
+    assert p._cm_elevate_plain_pending_file_status(q, CME, sql) == sql
+
+
+def test_file_status_mixed_with_another_column_is_left_alone():
+    sql = ("SELECT COUNT(*) FROM curated.v_cm_elevate WHERE (current_file_status = 'forward' OR "
+           "lgd_district = 'RI BHOI')")
+    assert p._cm_elevate_plain_pending_file_status(TOP_Q, CME, sql) == sql
+
+
+def test_level_pending_zero_answer_names_the_level():
+    sql = (f"SELECT scheme_name, COUNT(*) AS applications FROM curated.v_cm_elevate WHERE lgd_district = 'RI BHOI' "
+           f"AND (LOWER(current_level) = 'level1' AND scheme_specific ->> 'file_status' = 'Pending') "
+           f"AND scheme_name IN ('{CIN}', '{WAR}') GROUP BY scheme_name")
+    out = p._cme_multi_scheme_total("q", sql, [{"scheme_name": WAR, "applications": 4}], "x")
+    assert out.startswith("There are 4 applications pending at level 1 in Ri Bhoi across the 2 programmes")
 
 
 def test_explicit_on_hold_at_a_level_is_kept():

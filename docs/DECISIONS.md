@@ -376,6 +376,8 @@ not recorded.*
 
 - **Amendment 2026-09-28 (2):** CM Elevate "status" = `current_file_status` (product owner, from the testers' 22 Sep sheet). Pending stays On Hold; nothing else changed.
 
+- **Amendment 2026-10-05 (KI-186):** "pending AT a level" = `LOWER(current_level) = 'levelN'` AND `scheme_specific ->> 'file_status' = 'Pending'` (product owner, asked in session after the screenshot "unique applications pending at level 1 for all of Meghalaya" -> 8,372). The user first said "from current_file_status"; that column holds no pending value (forward / sendback / resubmit), so the options were put to them and they chose file_status = 'Pending'. Level 1 = 8,307 (was 8,372: 64 Rejected + 1 Approved are no longer counted), level 2 = 165, level 0 = 0. Plain "pending" with no level stays `data_verified = 'On Hold'` (also their choice). "unique / distinct applications" = COUNT(DISTINCT request_id) is now guaranteed by a guard.
+
 ### D-028 — Village-grained guards apply to MGNREGA and Focus Plus, not MGNREGA alone
 - **Date:** 2026-09-27 (`app/pipeline.py`; Focus Plus all-blocks / all-villages run, KI-079 to
   KI-083).
@@ -497,3 +499,15 @@ not recorded.*
   catch a correct number attached to the wrong noun).
 - **Revisit if:** a reload lets one pg_id span two places — the "together" sum would then over-count.
 
+### D-032 — Focus Legacy: a duplicate producer group is a group paid more than once
+- **Date:** 2026-10-05, confirmed 2026-10-07 (`app/pipeline.py` `_focus_legacy_duplicate_groups_answer`,
+  `_focus_legacy_answer_notes`; `data/focus_legacy/focuslegacy_few_shot.yaml`; KI-187).
+- **Decision (product owner):** a producer group paid more than once is a duplicate: 2,655 of 11,906 statewide
+  (2,647 paid twice, 8 three times), reported without a year split. A district / block / village / year in the question
+  narrows the rows first. The answer is written from a parameter-bound query and lists the groups with their payment years.
+- **History:** supersedes the 2026-09-25 TC-12 reading ("repeat payments, not duplicates; duplicate records = 0").
+  On 2026-10-06 the owner asked for "paid more than once in the same year" (7: FY 2022-23 = 1, FY 2025-26 = 6); on
+  2026-10-07 the owner restated "the duplicates are 2,655" and chose "2,655, no year split".
+- **Unchanged:** "duplicate payments / records" (same pg_id, same date) is a separate question and keeps the model path.
+- **Alternatives offered and not chosen:** a year-of-repeat breakdown (8 / 22 / 37 / 2,592, overlapping); the same-year
+  subset; same name + same village under different IDs (25 sets / 50 groups).

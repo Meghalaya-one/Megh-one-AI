@@ -1,0 +1,2271 @@
+resolver_version: '1.0'
+resolver_name: nrlm_entity_resolver
+display_name: NRLM Self Help Group Entity Resolver (Meghalaya) - curated star schema
+generated_from:
+- datasets/NRLM/NRLM.csv
+- datasets/NRLM/NRLM_Data_Readiness_Document.pdf
+- SCHEMA_FOR_DEVELOPERS.md (live database extract, 2026-10-05 11:24 UTC)
+generated_on: '2026-10-05'
+companion_schema: nrlm_schema_partitions.yaml
+
+# ===========================================================================
+# v1.0 - 2026-10-05 - FIRST VERSION, WRITTEN AGAINST THE CURATED VIEW
+#
+# Target: curated.v_nrlm over curated.fact_nrlm_shg.
+#
+# Source column -> stored column:
+#   mapped_district_lgd_name -> lgd_district        STORED UPPERCASE
+#   mapped_district_lgd_code -> district_lgd_code   KEPT - authoritative
+#   mapped_block_lgd_name    -> lgd_block           STORED UPPERCASE
+#   mapped_block_lgd_code    -> block_lgd_code      KEPT - authoritative
+#   mapped_village_lgd_name  -> lgd_village_name
+#   mapped_village_lgd_code  -> village_code        (Unresolved placeholder when blank)
+#   mapped_constituency_name -> constituency_name_raw              mixed case
+#   mapped_constituency_name_and_number -> constituency_number_raw '<n> <NAME>'
+#   active_sta               -> is_active           boolean
+#   rf_amount                -> revolving_fund_amount
+#   financial_year           -> formation_financial_year(_short)   FORMATION YEAR
+#   group_form               -> DROPPED AT INGEST. '00:00.0' on every row.
+#
+# The catalogues for district, block, constituency and the village ambiguity
+# registry were GENERATED from NRLM.csv by a script, grouped by LGD CODE (as the
+# database stores them), on 2026-10-05. All counts are source-file figures and
+# have NOT been re-verified against megh_db.
+# ===========================================================================
+
+description: >
+  Value-level entity resolution for the NRLM NLP-to-SQL bot. This file answers exactly
+  one question: the user typed some text - which stored database value did they mean?
+  It does NOT define column meanings or aggregation; that is the companion stage2
+  semantic schema. Resolve entities with this file FIRST, then hand the resolved
+  canonical values to schema linking and SQL generation.
+
+scheme:
+  id: nrlm
+  display_name: NRLM
+  full_name: National Rural Livelihoods Mission (Deendayal Antyodaya Yojana - NRLM)
+  state: Meghalaya
+  implementing_agency: Meghalaya State Rural Livelihoods Society (MSRLS), Community and Rural Development Department
+  aliases: [NRLM, "DAY-NRLM", "DAY NRLM", DAYNRLM, "Aajeevika", "Ajeevika", "National Rural Livelihoods Mission",
+            "National Rural Livelihood Mission", "Deendayal Antyodaya Yojana", MSRLS, SRLM,
+            "Meghalaya State Rural Livelihoods Society", "State Rural Livelihoods Mission",
+            "SHG scheme", "self help group scheme", "livelihood mission", "rural livelihoods"]
+  alias_note: >
+    "SGSY" (the predecessor scheme) and "NULM" / "DAY-NULM" (the URBAN mission) are NOT
+    aliases. SGSY-era groups appear as shg_type 'Pre-Nrlm' at most; NULM is not held -
+    see nrlm_classification_rules.yaml urban_livelihoods_requested.
+
+tables:
+  shgs: curated.v_nrlm                       # primary query surface, 29 columns
+  fact: curated.fact_nrlm_shg                # underlying fact, 30 columns, lineage only
+  reconciliation: meta.v_reconciliation_nrlm # operator check, not readable by megh_readonly
+
+dataset_shape:
+  grain: one row per Self Help Group (shg_code), as at the extract date
+  row_count: unverified_in_db
+  row_count_note: The source file holds 40629 rows. The curated count is unmeasured from this machine.
+  single_table: true
+  snapshot: true
+  emits_no_joins: >
+    curated.v_nrlm already pre-joins dim_geography and dim_year (as formation year) and
+    computes total_members, so the generator emits WHERE and GROUP BY only. See
+    nrlm_foreign_key_augmentation.yaml.
+
+# ---------------------------------------------------------------------------
+# HOW TO USE THIS FILE
+# ---------------------------------------------------------------------------
+how_to_use:
+  step_1_classify: >
+    Decide the entity type of each span of user text. Order matters because block,
+    village and constituency names collide - see cross_dimension_collisions. Try:
+    formation_year -> shg_code -> district -> block -> constituency -> village ->
+    gp_name -> shg_type -> shg_status -> shg_name -> measure.
+  step_2_normalise: Apply normalisation.fold to the user text and to candidate values.
+  step_3_match: Walk matching_pipeline in order; stop at the first stage that hits.
+  step_4_emit: Return an output_contract shape. Never put raw user text into SQL.
+  step_5_predicate: Build WHERE using the dimension's sql_predicate template.
+
+  hard_rules:
+  - "CASE RULE. lgd_district and lgd_block are stored UPPERCASE in dim_geography.
+    lgd_village_name is Title Case. constituency_name_raw is mixed case as typed.
+    shg_type is 'New' / 'Revived' / 'Pre-Nrlm'. Always compare case-folded, and emit the
+    form the column actually stores."
+  - "CODES ARE AUTHORITATIVE. district_lgd_code and block_lgd_code exist on every row and
+    win over any name. A user-supplied LGD code goes straight into the predicate."
+  - Villages are resolved by village_code, never by name alone. 197 village names are
+    shared by two or more different villages.
+  - "SHGs are resolved by shg_code, never by name alone. shg_name is NOT unique - 27,692
+    names for 40,629 SHGs. A name hit on more than one SHG is ambiguous; list and ask."
+  - "The ONLY year is the FORMATION year. A year in a money question is not resolved
+    to formation_financial_year - it is handed to the gate (money_in_a_year_requested)."
+  - "Unresolved SHGs (entity_type = 'Unresolved', 2,032) are in every district and block
+    total and in no village answer."
+  - "gp_name is advisory free text. Resolve to it only when the user says GP, gram
+    panchayat, panchayat or village council. Otherwise a place name is a village."
+  - "Member names, member-level rows, savings, loans and federations do not exist. A
+    lookup for any of them returns not-held, never a guess."
+  - If more than one candidate survives, return ambiguous and ask. Never pick the first row.
+  - If nothing matches above the fuzzy floor, return not_found with suggestions. Never
+    invent a district, block, village, constituency, SHG or type.
+
+# ---------------------------------------------------------------------------
+normalisation:
+  fold:
+  - trim and collapse internal whitespace to single spaces
+  - uppercase
+  - strip trailing qualifier words: BLOCK, C&RD BLOCK, DISTRICT, VILLAGE, CONSTITUENCY, AC, GP, SHG
+  - map & to AND
+  - treat - / ( ) and . as a single space, then re-collapse whitespace
+  squash: remove every non-alphanumeric character from the folded form
+  numeric_ids: >
+    shg_code, village_code, district_lgd_code and block_lgd_code are integers. Cast
+    user-typed codes with int() and strip any trailing .0 before comparing.
+  shg_name_fold: >
+    For SHG names additionally strip the trailing words SHG, S.H.G., SELF HELP GROUP,
+    MSRLS, NRLM before the fuzzy stage - 30,434 names carry 'Shg' and many carry a village
+    suffix ('Kyrshanlang Shg Nangbah'). Never strip them before the exact stage.
+
+matching_pipeline:
+- { stage: 1_exact,     test: folded user text == folded canonical, confidence: 1.0 }
+- { stage: 2_alias,     test: folded user text in the value's aliases, confidence: 0.98 }
+- { stage: 3_squash,    test: squashed user text == squashed canonical or alias, confidence: 0.95 }
+- { stage: 4_acronym,   test: district acronym table only, confidence: 0.95,
+    note: acronyms are defined for districts only - do not invent them for blocks }
+- stage: 5_contains
+  test: folded canonical is a whole-word substring of the user text or vice versa
+  confidence: 0.85
+- stage: 6_fuzzy
+  test: RapidFuzz token_set_ratio over the dimension catalogue
+  accept_at: ">= 90 and runner-up at least 5 points lower"
+  ask_between: 80 - 89, or any score where the runner-up is within 5 points
+  reject_below: 80
+- stage: 7_embedding
+  test: BGE-small nearest neighbour over the dimension catalogue
+  use_when: fuzzy returned nothing at or above 80
+  accept_at: cosine >= 0.88 AND unique within its dimension
+- { stage: 8_fail, action: emit not_found with up to 5 suggestions }
+
+blocked_matches:
+  purpose: >
+    Pairs fuzzy matching gets wrong. Never let stage 6 or 7 resolve the left value to the
+    right one; require an exact or alias hit.
+  pairs:
+  - [Laskein, Thadlaskein]                       # two different West Jaintia Hills blocks
+  - [Thadlaskein, Laskein]
+  - [Mawkynrew, Mawkyrwat]                       # East Khasi Hills vs South West Khasi Hills
+  - [Mawkyrwat, Mawkynrew]
+  - [Mawsynram, Mawshynrut]                      # East Khasi Hills vs West Khasi Hills
+  - [Mawshynrut, Mawsynram]
+  - [Siju, Saipung]
+  - [West Khasi Hills, Eastern West Khasi Hills] # two districts, 279 vs 740
+  - [Eastern West Khasi Hills, West Khasi Hills]
+  - [West Garo Hills, South West Garo Hills]     # 278 vs 663 - the source confuses them
+  - [South West Garo Hills, West Garo Hills]
+  - [West Khasi Hills, South West Khasi Hills]   # 279 vs 658
+  - [Mawphlang, Mawpat]
+  - [Mawlai, Mawhati]
+  - [Rongram, Rongara]
+  - [New, Revived]
+  - [Iatreilang Shg, Iatyllilang Shg]            # the two most common SHG names, 295 and 204 SHGs
+
+output_contract:
+  resolved:
+    status: resolved
+    entity_type: district | block | village | constituency | gp_name | shg_type |
+                 shg_status | shg_code | shg_name | formation_year | measure
+    user_text: <verbatim span>
+    canonical: <exact stored value>
+    lgd_code: <code, geography only>
+    confidence: <0-1>
+    matched_by: <pipeline stage>
+  ambiguous:
+    status: ambiguous
+    entity_type: <type>
+    user_text: <verbatim span>
+    candidates: [ { canonical, lgd_code / shg_code, district, block } ]
+    question: <one short question naming the distinguishing attribute>
+  not_found:
+    status: not_found
+    entity_type: <type or unknown>
+    user_text: <verbatim span>
+    suggestions: [ up to 5 nearest catalogue values ]
+    message: state plainly that the value is not in the NRLM data.
+
+# ---------------------------------------------------------------------------
+overloaded_terms:
+  why: >
+    A handful of words map to more than one column in this dataset. Getting these wrong
+    produces a confidently wrong answer, so they are listed explicitly.
+
+  beneficiaries:
+    readings:
+    - { means: "COUNT(*) - SHGs", when: "the user is asking about groups" }
+    - { means: "SUM(total_members) - members", when: "the user is asking about people, women or households" }
+    default: ask (nrlm_classification_rules.yaml beneficiaries_ambiguous).
+    note: NRLM has no beneficiary row. 40,629 SHGs vs 410,847 members - a 10x difference.
+
+  members:
+    means: SUM(total_members)
+    never: COUNT(*)
+    note: '"members" is a column sum. COUNT(*) counts groups.'
+
+  women:
+    readings:
+    - { means: "SUM(female_members)", when: "women members, women mobilised, how many women" }
+    - { means: "COUNT(*) WHERE male_members = 0", when: "all-women SHGs, women-only groups" }
+    default: SUM(female_members). Say that 39,924 of 40,629 SHGs are all-women.
+
+  new:
+    readings:
+    - { means: "shg_type = 'New'", when: "new SHGs as a TYPE, new vs revived" }
+    - { means: "formation_financial_year_short = '<latest>'", when: "recently formed, newly formed this year" }
+    default: ask (new_shg_word_unclear) unless 'type' or 'revived' is in the question.
+
+  pre_nrlm:
+    readings:
+    - { means: "shg_type = 'Pre-Nrlm'", when: "the user names the type" }
+    - { means: "formation_financial_year_short < '2011-12'", when: "formed before NRLM / before 2011" }
+    default: ask (pre_nrlm_type_vs_year). 432 typed vs 645 formed before 2011-12.
+
+  fund:
+    readings:
+    - { means: SUM(revolving_fund_amount), when: "RF, revolving fund" }
+    - { means: SUM(cif_amount), when: "CIF, community investment fund, investment fund" }
+    - { means: "both, side by side", when: "fund / funds / money / amount with no qualifier" }
+    default: ask, or show both - never silently pick one.
+
+  released_received_disbursed:
+    means: the cumulative amount held as at the extract
+    critical: true
+    note: >
+      'Released', 'disbursed', 'given', 'received', 'sanctioned' all resolve to the same
+      cumulative column. None of them carries a date. "Released IN <year>" is a gate
+      refusal, not a formation-year filter.
+
+  year:
+    means: formation_financial_year_short
+    critical: true
+    note: >
+      Every year the user types resolves to the FORMATION year - and is valid only for
+      SHG count, member and formation questions. With money it goes to the gate.
+
+  active:
+    readings:
+    - { means: "is_active", when: "active, functional, working, live, operational" }
+    - { means: "NOT is_active", when: "inactive, dormant, defunct, non-functional, closed, dissolved" }
+    note: is_active is NOT NULL, so NOT is_active is the exact complement.
+
+  gp:
+    means: gp_name
+    note: >
+      Only when the user says GP, gram panchayat, panchayat, village council or dorbar.
+      gp_name is free text outside LGD; prefer village or block and say why.
+
+# ---------------------------------------------------------------------------
+cross_dimension_collisions:
+  measured:
+    block_names_that_are_also_village_names: 25
+    block_names_that_are_also_constituency_names: 26
+    constituency_names_that_are_also_village_names: 25
+    block_names_that_are_also_gp_names: 22
+    district_collisions: 0
+  block_village_collisions: [Adokgre, Amlarem, Baghmara, Batabari, Demdema, Gambegre, Laskein,
+    Lumshnong, Mawhati, Mawkynrew, Mawkyrwat, Mawlai, Mawpat, Mawryngkneng, Mawshynrut,
+    Nongstoin, Pynursla, Rambrai, Ranikor, Rerapara, Saipung, Songsak, Umling, Umsning, Zikzak]
+  block_constituency_collisions: [Amlarem, Baghmara, Bajengdoba, Chokpot, Dalu, Gambegre, Jirang,
+    Kharkutta, Mairang, Mawhati, Mawkynrew, Mawkyrwat, Mawlai, Mawphlang, Mawryngkneng,
+    Mawshynrut, Mawsynram, Mawthadraishan, Mylliem, Nongstoin, Pynursla, Ranikor,
+    Resubelpara, Selsella, Songsak, Umsning]
+  constituency_only_names_that_look_like_blocks: [Sutnga-saipung, Rambrai jyrngam, Rongara-siju,
+    Shella, Sohing, Dadenggre, Tikrikila]
+  disambiguation_rules:
+  - If the user said "block" or "C&RD block", resolve as block.
+  - If the user said "constituency", "AC", "MLA" or "assembly", resolve as constituency.
+  - If the user said "village" or "gaon", resolve as village.
+  - If the user said "GP", "panchayat" or "village council", resolve as gp_name.
+  - With no qualifier, default to BLOCK - it is the administrative level users mean.
+  - "A block and its same-name constituency cover DIFFERENT areas (e.g. Mawkyrwat block
+    1,106 SHGs vs Mawkyrwat constituency 1,092). Never treat them as the same filter."
+  - State the assumption in the answer whenever the default fired on a colliding name.
+  - Districts never collide with anything; resolve them with no qualifier needed.
+
+# ---------------------------------------------------------------------------
+# DIMENSIONS
+# ---------------------------------------------------------------------------
+dimensions:
+
+  district:
+    name_column: lgd_district
+    code_column: district_lgd_code
+    stored_case: UPPERCASE in curated.dim_geography (lgd_district)
+    distinct: 12
+    complete: true            # all 12 Meghalaya districts present, on every row
+    collisions: none
+    sql_predicate: "lgd_district = UPPER('<canonical>')"
+    sql_predicate_by_code: "district_lgd_code = <lgd_code>"
+    code_note: >
+      UNLIKE PMAY, NRLM carries the district LGD code on every row and it is
+      AUTHORITATIVE over the name (12 source rows carry a contradicting name). Either
+      predicate is valid; the code predicate is immune to the casing trap.
+    prefer: district_lgd_code when the user gave a code; the uppercase name otherwise.
+    alias_provenance: >
+      canonical, lgd_code, shgs, block_count and village_count are read from NRLM.csv,
+      grouped by LGD CODE. Acronyms and spelling variants are the curated forms shared
+      with pmay_entity_resolver.yaml.
+    values:
+    - canonical: "East Garo Hills"
+      stored: "EAST GARO HILLS"
+      lgd_code: 273
+      acronym: EGH
+      region: "Garo Hills"
+      shgs: 2700
+      active_shgs: 2582
+      members: 27020
+      rf_crore: 3.28
+      cif_crore: 3.57
+      block_count: 3
+      village_count: 434
+      unresolved_shgs: 129
+      aliases: ["EGH", "E.G.H.", "East Garo Hill", "East Garo", "E Garo Hills", "E Garo Hill", "E Garo", "EastGaroHills", "East Garo Hills District", "Williamnagar district"]
+    - canonical: "East Jaintia Hills"
+      stored: "EAST JAINTIA HILLS"
+      lgd_code: 657
+      acronym: EJH
+      region: "Jaintia Hills"
+      shgs: 2744
+      active_shgs: 2692
+      members: 26601
+      rf_crore: 3.76
+      cif_crore: 7.75
+      block_count: 3
+      village_count: 162
+      unresolved_shgs: 78
+      aliases: ["EJH", "E.J.H.", "East Jaintia Hill", "East Jaintia", "E Jaintia Hills", "E Jaintia Hill", "E Jaintia", "EastJaintiaHills", "East Jaintia Hills District", "Khliehriat district"]
+      note: >
+        Includes the 12 village-Tangnub SHGs the source file mis-named 'Eastern West
+        Khasi Hills / Mairang' (has_name_code_conflict). By the source NAME this
+        district has 2,732 SHGs; by code, as stored, 2,744.
+    - canonical: "East Khasi Hills"
+      stored: "EAST KHASI HILLS"
+      lgd_code: 274
+      acronym: EKH
+      region: "Khasi Hills"
+      shgs: 6768
+      active_shgs: 6527
+      members: 70636
+      rf_crore: 7.62
+      cif_crore: 10.66
+      block_count: 11
+      village_count: 788
+      unresolved_shgs: 355
+      aliases: ["EKH", "E.K.H.", "East Khasi Hill", "East Khasi", "E Khasi Hills", "E Khasi Hill", "E Khasi", "EastKhasiHills", "East Khasi Hills District", "Shillong district"]
+    - canonical: "Eastern West Khasi Hills"
+      stored: "EASTERN WEST KHASI HILLS"
+      lgd_code: 740
+      acronym: EWKH
+      region: "Khasi Hills"
+      shgs: 1610
+      active_shgs: 1559
+      members: 16743
+      rf_crore: 2.23
+      cif_crore: 7.22
+      block_count: 2
+      village_count: 175
+      unresolved_shgs: 0
+      aliases: ["EWKH", "E.W.K.H.", "Eastern West Khasi Hill", "Eastern West Khasi", "Eastern W Khasi Hills", "Eastern W Khasi Hill", "Eastern W Khasi", "EasternWestKhasiHills", "Eastern West Khasi Hills District", "Mairang district", "E West Khasi Hills", "Eastern WKH"]
+      note: >
+        A real district (LGD 740), carved from West Khasi Hills. Never fold it into
+        West Khasi Hills (279). blocked_matches holds the pair.
+    - canonical: "North Garo Hills"
+      stored: "NORTH GARO HILLS"
+      lgd_code: 656
+      acronym: NGH
+      region: "Garo Hills"
+      shgs: 2832
+      active_shgs: 2806
+      members: 28295
+      rf_crore: 3.42
+      cif_crore: 4.63
+      block_count: 4
+      village_count: 428
+      unresolved_shgs: 17
+      aliases: ["NGH", "N.G.H.", "North Garo Hill", "North Garo", "N Garo Hills", "N Garo Hill", "N Garo", "NorthGaroHills", "North Garo Hills District", "Resubelpara district"]
+    - canonical: "Ri Bhoi"
+      stored: "RI BHOI"
+      lgd_code: 276
+      acronym: RB
+      region: "Ri Bhoi"
+      shgs: 3708
+      active_shgs: 3618
+      members: 38276
+      rf_crore: 5.25
+      cif_crore: 8.85
+      block_count: 5
+      village_count: 458
+      unresolved_shgs: 345
+      aliases: ["RB", "R.B.", "Ribhoi", "Ri-Bhoi", "RI BHOI", "Nongpoh district"]
+    - canonical: "South Garo Hills"
+      stored: "SOUTH GARO HILLS"
+      lgd_code: 277
+      acronym: SGH
+      region: "Garo Hills"
+      shgs: 2016
+      active_shgs: 2000
+      members: 20434
+      rf_crore: 2.54
+      cif_crore: 4.74
+      block_count: 5
+      village_count: 416
+      unresolved_shgs: 136
+      aliases: ["SGH", "S.G.H.", "South Garo Hill", "South Garo", "S Garo Hills", "S Garo Hill", "S Garo", "SouthGaroHills", "South Garo Hills District", "Baghmara district"]
+    - canonical: "South West Garo Hills"
+      stored: "SOUTH WEST GARO HILLS"
+      lgd_code: 663
+      acronym: SWGH
+      region: "Garo Hills"
+      shgs: 3491
+      active_shgs: 3454
+      members: 34196
+      rf_crore: 4.69
+      cif_crore: 6.99
+      block_count: 4
+      village_count: 398
+      unresolved_shgs: 67
+      aliases: ["SWGH", "S.W.G.H.", "South West Garo Hill", "South West Garo", "S W Garo Hills", "S W Garo Hill", "S W Garo", "SouthWestGaroHills", "South West Garo Hills District", "Ampati district", "S West Garo Hills"]
+    - canonical: "South West Khasi Hills"
+      stored: "SOUTH WEST KHASI HILLS"
+      lgd_code: 658
+      acronym: SWKH
+      region: "Khasi Hills"
+      shgs: 1867
+      active_shgs: 1811
+      members: 19671
+      rf_crore: 2.38
+      cif_crore: 7.89
+      block_count: 2
+      village_count: 267
+      unresolved_shgs: 68
+      aliases: ["SWKH", "S.W.K.H.", "South West Khasi Hill", "South West Khasi", "S W Khasi Hills", "S W Khasi Hill", "S W Khasi", "SouthWestKhasiHills", "South West Khasi Hills District", "Mawkyrwat district", "S West Khasi Hills"]
+    - canonical: "West Garo Hills"
+      stored: "WEST GARO HILLS"
+      lgd_code: 278
+      acronym: WGH
+      region: "Garo Hills"
+      shgs: 6526
+      active_shgs: 6248
+      members: 64514
+      rf_crore: 6.9
+      cif_crore: 7.74
+      block_count: 8
+      village_count: 807
+      unresolved_shgs: 440
+      aliases: ["WGH", "W.G.H.", "West Garo Hill", "West Garo", "W Garo Hills", "W Garo Hill", "W Garo", "WestGaroHills", "West Garo Hills District", "Tura district"]
+    - canonical: "West Jaintia Hills"
+      stored: "WEST JAINTIA HILLS"
+      lgd_code: 275
+      acronym: WJH
+      region: "Jaintia Hills"
+      shgs: 4055
+      active_shgs: 3949
+      members: 41049
+      rf_crore: 5.67
+      cif_crore: 18.89
+      block_count: 4
+      village_count: 250
+      unresolved_shgs: 195
+      aliases: ["WJH", "W.J.H.", "West Jaintia Hill", "West Jaintia", "W Jaintia Hills", "W Jaintia Hill", "W Jaintia", "WestJaintiaHills", "West Jaintia Hills District", "Jowai district"]
+    - canonical: "West Khasi Hills"
+      stored: "WEST KHASI HILLS"
+      lgd_code: 279
+      acronym: WKH
+      region: "Khasi Hills"
+      shgs: 2312
+      active_shgs: 2186
+      members: 23412
+      rf_crore: 3.11
+      cif_crore: 9.53
+      block_count: 5
+      village_count: 393
+      unresolved_shgs: 202
+      aliases: ["WKH", "W.K.H.", "West Khasi Hill", "West Khasi", "W Khasi Hills", "W Khasi Hill", "W Khasi", "WestKhasiHills", "West Khasi Hills District", "Nongstoin district"]
+
+  block:
+    name_column: lgd_block
+    code_column: block_lgd_code
+    stored_case: UPPERCASE in curated.dim_geography (lgd_block)
+    distinct: 56
+    integrity: >
+      One name per code except code 2000 (Saipung), which 12 source rows call Mairang -
+      the code is trusted. No block code appears in more than one district.
+    sql_predicate: "lgd_block = UPPER('<canonical>')"
+    sql_predicate_by_code: "block_lgd_code = <lgd_code>"
+    scope_by_district_when_given: true
+    disambiguation: >
+      25 of these 56 names are also village names and 26 are also assembly constituency
+      names. Apply cross_dimension_collisions.disambiguation_rules.
+    values:
+    - canonical: "Dambo Rongjeng"
+      stored: "DAMBO RONGJENG"
+      lgd_code: 1971
+      district: "East Garo Hills"
+      shgs: 1075
+      village_count: 149
+      also_a: []
+      aliases: ["DamboRongjeng", "Dambo-Rongjeng", "Dambo Rongjeng Block", "Dambo Rongjeng C&RD Block"]
+    - canonical: "Samanda"
+      stored: "SAMANDA"
+      lgd_code: 1974
+      district: "East Garo Hills"
+      shgs: 829
+      village_count: 140
+      also_a: []
+      aliases: ["Samanda Block", "Samanda C&RD Block"]
+    - canonical: "Songsak"
+      stored: "SONGSAK"
+      lgd_code: 1973
+      district: "East Garo Hills"
+      shgs: 796
+      village_count: 145
+      also_a: [village, constituency]
+      aliases: ["Songsak Block", "Songsak C&RD Block"]
+    - canonical: "Lumshnong"
+      stored: "LUMSHNONG"
+      lgd_code: 7337
+      district: "East Jaintia Hills"
+      shgs: 328
+      village_count: 34
+      also_a: [village]
+      aliases: ["Lumshnong Block", "Lumshnong C&RD Block"]
+    - canonical: "Saipung"
+      stored: "SAIPUNG"
+      lgd_code: 2000
+      district: "East Jaintia Hills"
+      shgs: 913
+      village_count: 64
+      also_a: [village]
+      aliases: ["Saipung Block", "Saipung C&RD Block"]
+      note: 12 source rows name this block 'Mairang' (has_name_code_conflict). Code 2000 is trusted.
+    - canonical: "Wapung"
+      stored: "WAPUNG"
+      lgd_code: 1999
+      district: "East Jaintia Hills"
+      shgs: 1503
+      village_count: 64
+      also_a: []
+      aliases: ["Wapung Block", "Wapung C&RD Block"]
+    - canonical: "Khatarshnong Laitkroh"
+      stored: "KHATARSHNONG LAITKROH"
+      lgd_code: 1992
+      district: "East Khasi Hills"
+      shgs: 682
+      village_count: 89
+      also_a: []
+      aliases: ["KhatarshnongLaitkroh", "Khatarshnong", "Laitkroh", "Khatarshnong-Laitkroh", "Khatarshnong Laitkroh Block", "Khatarshnong Laitkroh C&RD Block"]
+    - canonical: "Mawkynrew"
+      stored: "MAWKYNREW"
+      lgd_code: 1991
+      district: "East Khasi Hills"
+      shgs: 491
+      village_count: 60
+      also_a: [village, constituency]
+      aliases: ["Mawkynrew Block", "Mawkynrew C&RD Block"]
+    - canonical: "Mawlai"
+      stored: "MAWLAI"
+      lgd_code: 6540
+      district: "East Khasi Hills"
+      shgs: 168
+      village_count: 8
+      also_a: [village, constituency]
+      aliases: ["Mawlai Block", "Mawlai C&RD Block"]
+    - canonical: "Mawpat"
+      stored: "MAWPAT"
+      lgd_code: 6541
+      district: "East Khasi Hills"
+      shgs: 265
+      village_count: 12
+      also_a: [village]
+      aliases: ["Mawpat Block", "Mawpat C&RD Block"]
+    - canonical: "Mawphlang"
+      stored: "MAWPHLANG"
+      lgd_code: 1988
+      district: "East Khasi Hills"
+      shgs: 912
+      village_count: 97
+      also_a: [constituency]
+      aliases: ["Mawphlang Block", "Mawphlang C&RD Block"]
+    - canonical: "Mawryngkneng"
+      stored: "MAWRYNGKNENG"
+      lgd_code: 1990
+      district: "East Khasi Hills"
+      shgs: 668
+      village_count: 49
+      also_a: [village, constituency]
+      aliases: ["Mawryngkneng Block", "Mawryngkneng C&RD Block"]
+    - canonical: "Mawsynram"
+      stored: "MAWSYNRAM"
+      lgd_code: 1993
+      district: "East Khasi Hills"
+      shgs: 1011
+      village_count: 132
+      also_a: [constituency]
+      aliases: ["Mawsynram Block", "Mawsynram C&RD Block"]
+    - canonical: "Mylliem"
+      stored: "MYLLIEM"
+      lgd_code: 1989
+      district: "East Khasi Hills"
+      shgs: 581
+      village_count: 48
+      also_a: [constituency]
+      aliases: ["Mylliem Block", "Mylliem C&RD Block"]
+    - canonical: "Pynursla"
+      stored: "PYNURSLA"
+      lgd_code: 1995
+      district: "East Khasi Hills"
+      shgs: 737
+      village_count: 98
+      also_a: [village, constituency]
+      aliases: ["Pynursla Block", "Pynursla C&RD Block"]
+    - canonical: "Shella Bholaganj"
+      stored: "SHELLA BHOLAGANJ"
+      lgd_code: 1994
+      district: "East Khasi Hills"
+      shgs: 527
+      village_count: 85
+      also_a: []
+      aliases: ["ShellaBholaganj", "Bholaganj", "Shella-Bholaganj", "Shella Bholaganj Block", "Shella Bholaganj C&RD Block"]
+    - canonical: "Sohiong"
+      stored: "SOHIONG"
+      lgd_code: 6542
+      district: "East Khasi Hills"
+      shgs: 726
+      village_count: 110
+      also_a: []
+      aliases: ["Sohiong Block", "Sohiong C&RD Block"]
+    - canonical: "Mairang"
+      stored: "MAIRANG"
+      lgd_code: 1982
+      district: "Eastern West Khasi Hills"
+      shgs: 1069
+      village_count: 123
+      also_a: [constituency]
+      aliases: ["Mairang Block", "Mairang C&RD Block"]
+    - canonical: "Mawthadraishan"
+      stored: "MAWTHADRAISHAN"
+      lgd_code: 1981
+      district: "Eastern West Khasi Hills"
+      shgs: 541
+      village_count: 52
+      also_a: [constituency]
+      aliases: ["Mawthadraishan Block", "Mawthadraishan C&RD Block"]
+    - canonical: "Adokgre"
+      stored: "ADOKGRE"
+      lgd_code: 7334
+      district: "North Garo Hills"
+      shgs: 148
+      village_count: 29
+      also_a: [village]
+      aliases: ["Adokgre Block", "Adokgre C&RD Block"]
+    - canonical: "Bajengdoba"
+      stored: "BAJENGDOBA"
+      lgd_code: 6544
+      district: "North Garo Hills"
+      shgs: 935
+      village_count: 154
+      also_a: [constituency]
+      aliases: ["Bajengdoba Block", "Bajengdoba C&RD Block"]
+    - canonical: "Kharkutta"
+      stored: "KHARKUTTA"
+      lgd_code: 1972
+      district: "North Garo Hills"
+      shgs: 814
+      village_count: 109
+      also_a: [constituency]
+      aliases: ["Kharkutta Block", "Kharkutta C&RD Block"]
+    - canonical: "Resubelpara"
+      stored: "RESUBELPARA"
+      lgd_code: 1970
+      district: "North Garo Hills"
+      shgs: 935
+      village_count: 136
+      also_a: [constituency]
+      aliases: ["Resubelpara Block", "Resubelpara C&RD Block"]
+    - canonical: "Bhoirymbong"
+      stored: "BHOIRYMBONG"
+      lgd_code: 6543
+      district: "Ri Bhoi"
+      shgs: 834
+      village_count: 92
+      also_a: []
+      aliases: ["Bhoirymbong Block", "Bhoirymbong C&RD Block"]
+    - canonical: "Jirang"
+      stored: "JIRANG"
+      lgd_code: 1986
+      district: "Ri Bhoi"
+      shgs: 603
+      village_count: 90
+      also_a: [constituency]
+      aliases: ["Jirang Block", "Jirang C&RD Block"]
+    - canonical: "Mawhati"
+      stored: "MAWHATI"
+      lgd_code: 7456
+      district: "Ri Bhoi"
+      shgs: 69
+      village_count: 12
+      also_a: [village, constituency]
+      aliases: ["Mawhati Block", "Mawhati C&RD Block"]
+    - canonical: "Umling"
+      stored: "UMLING"
+      lgd_code: 1985
+      district: "Ri Bhoi"
+      shgs: 1167
+      village_count: 181
+      also_a: [village]
+      aliases: ["Umling Block", "Umling C&RD Block"]
+    - canonical: "Umsning"
+      stored: "UMSNING"
+      lgd_code: 1987
+      district: "Ri Bhoi"
+      shgs: 1035
+      village_count: 83
+      also_a: [village, constituency]
+      aliases: ["Umsning Block", "Umsning C&RD Block"]
+    - canonical: "Baghmara"
+      stored: "BAGHMARA"
+      lgd_code: 1977
+      district: "South Garo Hills"
+      shgs: 296
+      village_count: 50
+      also_a: [village, constituency]
+      aliases: ["Baghmara Block", "Baghmara C&RD Block"]
+    - canonical: "Chokpot"
+      stored: "CHOKPOT"
+      lgd_code: 1975
+      district: "South Garo Hills"
+      shgs: 517
+      village_count: 128
+      also_a: [constituency]
+      aliases: ["Chokpot Block", "Chokpot C&RD Block"]
+    - canonical: "Gasuapara"
+      stored: "GASUAPARA"
+      lgd_code: 1976
+      district: "South Garo Hills"
+      shgs: 483
+      village_count: 99
+      also_a: []
+      aliases: ["Gasuapara Block", "Gasuapara C&RD Block"]
+    - canonical: "Rongara"
+      stored: "RONGARA"
+      lgd_code: 1978
+      district: "South Garo Hills"
+      shgs: 252
+      village_count: 70
+      also_a: []
+      aliases: ["Rongara Block", "Rongara C&RD Block"]
+    - canonical: "Siju"
+      stored: "SIJU"
+      lgd_code: 7332
+      district: "South Garo Hills"
+      shgs: 468
+      village_count: 69
+      also_a: []
+      aliases: ["Siju Block", "Siju C&RD Block"]
+    - canonical: "Betasing"
+      stored: "BETASING"
+      lgd_code: 1966
+      district: "South West Garo Hills"
+      shgs: 942
+      village_count: 100
+      also_a: []
+      aliases: ["Betasing Block", "Betasing C&RD Block"]
+    - canonical: "Purakhasia"
+      stored: "PURAKHASIA"
+      lgd_code: 7418
+      district: "South West Garo Hills"
+      shgs: 414
+      village_count: 50
+      also_a: []
+      aliases: ["Purakhasia Block", "Purakhasia C&RD Block"]
+    - canonical: "Rerapara"
+      stored: "RERAPARA"
+      lgd_code: 6545
+      district: "South West Garo Hills"
+      shgs: 1149
+      village_count: 121
+      also_a: [village]
+      aliases: ["Rerapara Block", "Rerapara C&RD Block"]
+    - canonical: "Zikzak"
+      stored: "ZIKZAK"
+      lgd_code: 1967
+      district: "South West Garo Hills"
+      shgs: 986
+      village_count: 127
+      also_a: [village]
+      aliases: ["Zikzak Block", "Zikzak C&RD Block"]
+    - canonical: "Mawkyrwat"
+      stored: "MAWKYRWAT"
+      lgd_code: 1984
+      district: "South West Khasi Hills"
+      shgs: 1106
+      village_count: 144
+      also_a: [village, constituency]
+      aliases: ["Mawkyrwat Block", "Mawkyrwat C&RD Block"]
+    - canonical: "Ranikor"
+      stored: "RANIKOR"
+      lgd_code: 1983
+      district: "South West Khasi Hills"
+      shgs: 761
+      village_count: 123
+      also_a: [village, constituency]
+      aliases: ["Ranikor Block", "Ranikor C&RD Block"]
+    - canonical: "Batabari"
+      stored: "BATABARI"
+      lgd_code: 7339
+      district: "West Garo Hills"
+      shgs: 441
+      village_count: 50
+      also_a: [village]
+      aliases: ["Batabari Block", "Batabari C&RD Block"]
+    - canonical: "Dadenggiri"
+      stored: "DADENGGIRI"
+      lgd_code: 1963
+      district: "West Garo Hills"
+      shgs: 528
+      village_count: 78
+      also_a: []
+      aliases: ["Dadenggri", "Dadenggiri Block", "Dadenggiri C&RD Block"]
+    - canonical: "Dalu"
+      stored: "DALU"
+      lgd_code: 1969
+      district: "West Garo Hills"
+      shgs: 1028
+      village_count: 122
+      also_a: [constituency]
+      aliases: ["Dalu Block", "Dalu C&RD Block"]
+    - canonical: "Demdema"
+      stored: "DEMDEMA"
+      lgd_code: 6546
+      district: "West Garo Hills"
+      shgs: 1235
+      village_count: 75
+      also_a: [village]
+      aliases: ["Demdema Block", "Demdema C&RD Block"]
+    - canonical: "Gambegre"
+      stored: "GAMBEGRE"
+      lgd_code: 1968
+      district: "West Garo Hills"
+      shgs: 584
+      village_count: 110
+      also_a: [village, constituency]
+      aliases: ["Gambegre Block", "Gambegre C&RD Block"]
+    - canonical: "Rongram"
+      stored: "RONGRAM"
+      lgd_code: 1965
+      district: "West Garo Hills"
+      shgs: 1264
+      village_count: 156
+      also_a: []
+      aliases: ["Rongram Block", "Rongram C&RD Block"]
+    - canonical: "Selsella"
+      stored: "SELSELLA"
+      lgd_code: 1962
+      district: "West Garo Hills"
+      shgs: 598
+      village_count: 86
+      also_a: [constituency]
+      aliases: ["Selsella Block", "Selsella C&RD Block"]
+    - canonical: "Tikrikilla"
+      stored: "TIKRIKILLA"
+      lgd_code: 1964
+      district: "West Garo Hills"
+      shgs: 848
+      village_count: 130
+      also_a: []
+      aliases: ["Tikrikilla Block", "Tikrikilla C&RD Block"]
+    - canonical: "Amlarem"
+      stored: "AMLAREM"
+      lgd_code: 1998
+      district: "West Jaintia Hills"
+      shgs: 543
+      village_count: 77
+      also_a: [village, constituency]
+      aliases: ["Amlarem Block", "Amlarem C&RD Block"]
+    - canonical: "Laskein"
+      stored: "LASKEIN"
+      lgd_code: 1997
+      district: "West Jaintia Hills"
+      shgs: 1880
+      village_count: 76
+      also_a: [village]
+      aliases: ["Laskein Block", "Laskein C&RD Block"]
+    - canonical: "Namdong"
+      stored: "NAMDONG"
+      lgd_code: 7335
+      district: "West Jaintia Hills"
+      shgs: 297
+      village_count: 23
+      also_a: []
+      aliases: ["Namdong Block", "Namdong C&RD Block"]
+    - canonical: "Thadlaskein"
+      stored: "THADLASKEIN"
+      lgd_code: 1996
+      district: "West Jaintia Hills"
+      shgs: 1335
+      village_count: 74
+      also_a: []
+      aliases: ["Thadlaskein Block", "Thadlaskein C&RD Block"]
+    - canonical: "Mawshynrut"
+      stored: "MAWSHYNRUT"
+      lgd_code: 1979
+      district: "West Khasi Hills"
+      shgs: 619
+      village_count: 121
+      also_a: [village, constituency]
+      aliases: ["Mawshynrut Block", "Mawshynrut C&RD Block"]
+    - canonical: "Nongstoin"
+      stored: "NONGSTOIN"
+      lgd_code: 1980
+      district: "West Khasi Hills"
+      shgs: 888
+      village_count: 114
+      also_a: [village, constituency]
+      aliases: ["Nongstoin Block", "Nongstoin C&RD Block"]
+    - canonical: "Rambrai"
+      stored: "RAMBRAI"
+      lgd_code: 7333
+      district: "West Khasi Hills"
+      shgs: 296
+      village_count: 56
+      also_a: [village]
+      aliases: ["Rambrai Block", "Rambrai C&RD Block"]
+    - canonical: "Ri Muliang"
+      stored: "RI MULIANG"
+      lgd_code: 7336
+      district: "West Khasi Hills"
+      shgs: 286
+      village_count: 52
+      also_a: []
+      aliases: ["RiMuliang", "Ri Muliang Block", "Ri Muliang C&RD Block"]
+    - canonical: "Shallang"
+      stored: "SHALLANG"
+      lgd_code: 7338
+      district: "West Khasi Hills"
+      shgs: 223
+      village_count: 50
+      also_a: []
+      aliases: ["Shallang Block", "Shallang C&RD Block"]
+
+  constituency:
+    name_column: constituency_name_raw
+    number_column: constituency_number_raw
+    stored_case: >
+      constituency_name_raw is MIXED CASE as typed in the source (e.g. 'Sutnga-saipung',
+      'Rambrai jyrngam'). constituency_number_raw is '<number> <UPPERCASE NAME>'.
+    distinct: 55
+    nulls: 2032
+    null_note: NULL on exactly the 2,032 SHGs with no village. A constituency total never reaches the State total.
+    sql_predicate: "constituency_name_raw = '<canonical>'"
+    sql_predicate_by_number: "constituency_number_raw LIKE '<number> %'"
+    number_note: >
+      Keep the trailing space in the LIKE pattern - '3 %' must not match '36 MAWKYRWAT'.
+      Never cast constituency_number_raw to an integer; it holds the name too.
+    not_lgd: >
+      Assembly constituencies are an ELECTORAL hierarchy parallel to LGD. A constituency
+      can span two districts (e.g. Selsella, Rangsakona). Never treat it as a level
+      between district and block.
+    numbering_gaps: >
+      Numbers 16-19 and 51 are absent - those seats (mostly Shillong urban, and Tura)
+      hold no rural SHG in this data. A question about them returns not_found with that
+      explanation, not a zero.
+    values:
+    - canonical: "Nartiang"
+      number: 1
+      numbered: "1 NARTIANG"
+      districts: ["West Jaintia Hills"]
+      shgs: 790
+      also_a: [village]
+      aliases: ["Nartiang constituency", "AC 1", "Nartiang AC"]
+    - canonical: "Jowai"
+      number: 2
+      numbered: "2 JOWAI"
+      districts: ["West Jaintia Hills"]
+      shgs: 327
+      also_a: []
+      aliases: ["Jowai constituency", "AC 2", "Jowai AC"]
+    - canonical: "Raliang"
+      number: 3
+      numbered: "3 RALIANG"
+      districts: ["West Jaintia Hills"]
+      shgs: 1034
+      also_a: [village]
+      aliases: ["Raliang constituency", "AC 3", "Raliang AC"]
+    - canonical: "Mowkaiaw"
+      number: 4
+      numbered: "4 MOWKAIAW"
+      districts: ["West Jaintia Hills"]
+      shgs: 1066
+      also_a: [village]
+      aliases: ["Mowkaiaw constituency", "AC 4", "Mowkaiaw AC"]
+    - canonical: "Sutnga-saipung"
+      number: 5
+      numbered: "5 SUTNGA"
+      districts: ["East Jaintia Hills"]
+      shgs: 1309
+      also_a: []
+      aliases: ["Sutnga", "Sutnga-saipung constituency", "AC 5", "Sutnga-saipung AC", "Sutnga Saipung"]
+    - canonical: "Khliehriat"
+      number: 6
+      numbered: "6 KHLIEHRIAT"
+      districts: ["East Jaintia Hills"]
+      shgs: 1357
+      also_a: [village]
+      aliases: ["Khliehriat constituency", "AC 6", "Khliehriat AC"]
+    - canonical: "Amlarem"
+      number: 7
+      numbered: "7 AMLAREM"
+      districts: ["West Jaintia Hills"]
+      shgs: 643
+      also_a: [block, village]
+      aliases: ["Amlarem constituency", "AC 7", "Amlarem AC"]
+    - canonical: "Mawhati"
+      number: 8
+      numbered: "8 MAWHATI"
+      districts: ["Ri Bhoi"]
+      shgs: 519
+      also_a: [block, village]
+      aliases: ["Mawhati constituency", "AC 8", "Mawhati AC"]
+    - canonical: "Nongpoh"
+      number: 9
+      numbered: "9 NONGPOH"
+      districts: ["Ri Bhoi"]
+      shgs: 692
+      also_a: []
+      aliases: ["Nongpoh constituency", "AC 9", "Nongpoh AC"]
+    - canonical: "Jirang"
+      number: 10
+      numbered: "10 JIRANG"
+      districts: ["Ri Bhoi"]
+      shgs: 905
+      also_a: [block]
+      aliases: ["Jirang constituency", "AC 10", "Jirang AC"]
+    - canonical: "Umsning"
+      number: 11
+      numbered: "11 UMSNING"
+      districts: ["Ri Bhoi"]
+      shgs: 650
+      also_a: [block, village]
+      aliases: ["Umsning constituency", "AC 11", "Umsning AC"]
+    - canonical: "Umroi"
+      number: 12
+      numbered: "12 UMROI"
+      districts: ["Ri Bhoi"]
+      shgs: 597
+      also_a: []
+      aliases: ["Umroi constituency", "AC 12", "Umroi AC"]
+    - canonical: "Mawryngkneng"
+      number: 13
+      numbered: "13 MAWRYNGKNENG"
+      districts: ["East Khasi Hills", "West Khasi Hills"]
+      shgs: 527
+      also_a: [block, village]
+      aliases: ["Mawryngkneng constituency", "AC 13", "Mawryngkneng AC"]
+    - canonical: "Pynthorumkhrah"
+      number: 14
+      numbered: "14 PYNTHORUMKHRAH"
+      districts: ["East Khasi Hills"]
+      shgs: 37
+      also_a: []
+      aliases: ["Pynthorumkhrah constituency", "AC 14", "Pynthorumkhrah AC"]
+    - canonical: "Mawlai"
+      number: 15
+      numbered: "15 MAWLAI"
+      districts: ["East Khasi Hills"]
+      shgs: 168
+      also_a: [block, village]
+      aliases: ["Mawlai constituency", "AC 15", "Mawlai AC"]
+    - canonical: "Mylliem"
+      number: 20
+      numbered: "20 MYLLIEM"
+      districts: ["East Khasi Hills"]
+      shgs: 539
+      also_a: [block]
+      aliases: ["Mylliem constituency", "AC 20", "Mylliem AC"]
+    - canonical: "Nongthymmai"
+      number: 21
+      numbered: "21 NONGTHYMMAI"
+      districts: ["East Khasi Hills"]
+      shgs: 65
+      also_a: [village]
+      aliases: ["Nongthymmai constituency", "AC 21", "Nongthymmai AC"]
+    - canonical: "Nongkrem"
+      number: 22
+      numbered: "22 NONGKREM"
+      districts: ["East Khasi Hills"]
+      shgs: 73
+      also_a: [village]
+      aliases: ["Nongkrem constituency", "AC 22", "Nongkrem AC"]
+    - canonical: "Sohing"
+      number: 23
+      numbered: "23 SOHIONG"
+      districts: ["East Khasi Hills"]
+      shgs: 837
+      also_a: []
+      aliases: ["Sohiong", "Sohing constituency", "AC 23", "Sohing AC"]
+      spelling_note: The two source fields spell this differently ('Sohing' vs 'SOHIONG'). Same constituency.
+    - canonical: "Mawphlang"
+      number: 24
+      numbered: "24 MAWPHLANG"
+      districts: ["East Khasi Hills"]
+      shgs: 836
+      also_a: [block]
+      aliases: ["Mawphlang constituency", "AC 24", "Mawphlang AC"]
+    - canonical: "Mawsynram"
+      number: 25
+      numbered: "25 MAWSYNRAM"
+      districts: ["East Khasi Hills"]
+      shgs: 1011
+      also_a: [block]
+      aliases: ["Mawsynram constituency", "AC 25", "Mawsynram AC"]
+    - canonical: "Shella"
+      number: 26
+      numbered: "26 SHELLA"
+      districts: ["East Khasi Hills"]
+      shgs: 408
+      also_a: []
+      aliases: ["Shella constituency", "AC 26", "Shella AC"]
+    - canonical: "Pynursla"
+      number: 27
+      numbered: "27 PYNURSLA"
+      districts: ["East Khasi Hills"]
+      shgs: 715
+      also_a: [block, village]
+      aliases: ["Pynursla constituency", "AC 27", "Pynursla AC"]
+    - canonical: "Sohra"
+      number: 28
+      numbered: "28 SOHRA"
+      districts: ["East Khasi Hills"]
+      shgs: 624
+      also_a: []
+      aliases: ["Sohra constituency", "AC 28", "Sohra AC"]
+    - canonical: "Mawkynrew"
+      number: 29
+      numbered: "29 MAWKYNREW"
+      districts: ["East Khasi Hills"]
+      shgs: 575
+      also_a: [block, village]
+      aliases: ["Mawkynrew constituency", "AC 29", "Mawkynrew AC"]
+    - canonical: "Mairang"
+      number: 30
+      numbered: "30 MAIRANG"
+      districts: ["Eastern West Khasi Hills"]
+      shgs: 660
+      also_a: [block]
+      aliases: ["Mairang constituency", "AC 30", "Mairang AC"]
+    - canonical: "Mawthadraishan"
+      number: 31
+      numbered: "31 MAWTHADRAISHAN"
+      districts: ["Eastern West Khasi Hills", "West Khasi Hills"]
+      shgs: 956
+      also_a: [block]
+      aliases: ["Mawthadraishan constituency", "AC 31", "Mawthadraishan AC"]
+    - canonical: "Nongstoin"
+      number: 32
+      numbered: "32 NONGSTOIN"
+      districts: ["West Khasi Hills"]
+      shgs: 564
+      also_a: [block, village]
+      aliases: ["Nongstoin constituency", "AC 32", "Nongstoin AC"]
+    - canonical: "Rambrai jyrngam"
+      number: 33
+      numbered: "33 RAMBRAI"
+      districts: ["West Khasi Hills"]
+      shgs: 666
+      also_a: []
+      aliases: ["Rambrai", "Rambrai jyrngam constituency", "AC 33", "Rambrai jyrngam AC", "Rambrai Jyrngam"]
+    - canonical: "Mawshynrut"
+      number: 34
+      numbered: "34 MAWSHYNRUT"
+      districts: ["West Khasi Hills"]
+      shgs: 872
+      also_a: [block, village]
+      aliases: ["Mawshynrut constituency", "AC 34", "Mawshynrut AC"]
+    - canonical: "Ranikor"
+      number: 35
+      numbered: "35 RANIKOR"
+      districts: ["South West Khasi Hills"]
+      shgs: 707
+      also_a: [block, village]
+      aliases: ["Ranikor constituency", "AC 35", "Ranikor AC"]
+    - canonical: "Mawkyrwat"
+      number: 36
+      numbered: "36 MAWKYRWAT"
+      districts: ["South West Khasi Hills"]
+      shgs: 1092
+      also_a: [block, village]
+      aliases: ["Mawkyrwat constituency", "AC 36", "Mawkyrwat AC"]
+    - canonical: "Kharkutta"
+      number: 37
+      numbered: "37 KHARKUTTA"
+      districts: ["North Garo Hills"]
+      shgs: 954
+      also_a: [block]
+      aliases: ["Kharkutta constituency", "AC 37", "Kharkutta AC"]
+    - canonical: "Mendipathar"
+      number: 38
+      numbered: "38 MENDIPATHAR"
+      districts: ["North Garo Hills"]
+      shgs: 503
+      also_a: []
+      aliases: ["Mendipathar constituency", "AC 38", "Mendipathar AC"]
+    - canonical: "Resubelpara"
+      number: 39
+      numbered: "39 RESUBELPARA"
+      districts: ["North Garo Hills"]
+      shgs: 412
+      also_a: [block]
+      aliases: ["Resubelpara constituency", "AC 39", "Resubelpara AC"]
+    - canonical: "Bajengdoba"
+      number: 40
+      numbered: "40 BAJENGDOBA"
+      districts: ["North Garo Hills"]
+      shgs: 939
+      also_a: [block]
+      aliases: ["Bajengdoba constituency", "AC 40", "Bajengdoba AC"]
+    - canonical: "Songsak"
+      number: 41
+      numbered: "41 SONGSAK"
+      districts: ["East Garo Hills"]
+      shgs: 908
+      also_a: [block, village]
+      aliases: ["Songsak constituency", "AC 41", "Songsak AC"]
+    - canonical: "Rongjeng"
+      number: 42
+      numbered: "42 RONGJENG"
+      districts: ["East Garo Hills"]
+      shgs: 1015
+      also_a: []
+      aliases: ["Rongjeng constituency", "AC 42", "Rongjeng AC"]
+    - canonical: "William Nagar"
+      number: 43
+      numbered: "43 WILLIAM"
+      districts: ["East Garo Hills"]
+      shgs: 648
+      also_a: []
+      aliases: ["William", "William Nagar constituency", "AC 43", "William Nagar AC", "Williamnagar"]
+    - canonical: "Raksamgre"
+      number: 44
+      numbered: "44 RAKSAMGRE"
+      districts: ["West Garo Hills", "North Garo Hills"]
+      shgs: 629
+      also_a: [village]
+      aliases: ["Raksamgre constituency", "AC 44", "Raksamgre AC"]
+    - canonical: "Tikrikila"
+      number: 45
+      numbered: "45 TIKRIKILLA"
+      districts: ["West Garo Hills"]
+      shgs: 719
+      also_a: []
+      aliases: ["Tikrikilla", "Tikrikila constituency", "AC 45", "Tikrikila AC"]
+      spelling_note: The two source fields spell this differently ('Tikrikila' vs 'TIKRIKILLA'). Same constituency.
+    - canonical: "Phulbari"
+      number: 46
+      numbered: "46 PHULBARI"
+      districts: ["West Garo Hills"]
+      shgs: 605
+      also_a: []
+      aliases: ["Phulbari constituency", "AC 46", "Phulbari AC"]
+    - canonical: "Rajabala"
+      number: 47
+      numbered: "47 RAJABALA"
+      districts: ["West Garo Hills"]
+      shgs: 586
+      also_a: [village]
+      aliases: ["Rajabala constituency", "AC 47", "Rajabala AC"]
+    - canonical: "Selsella"
+      number: 48
+      numbered: "48 SELSELLA"
+      districts: ["West Garo Hills", "South West Garo Hills"]
+      shgs: 550
+      also_a: [block]
+      aliases: ["Selsella constituency", "AC 48", "Selsella AC"]
+    - canonical: "Dadenggre"
+      number: 49
+      numbered: "49 DADENGGRE"
+      districts: ["West Garo Hills"]
+      shgs: 1028
+      also_a: [village]
+      aliases: ["Dadenggre constituency", "AC 49", "Dadenggre AC", "Dadenggiri"]
+    - canonical: "North Tura"
+      number: 50
+      numbered: "50 NORTH TURA"
+      districts: ["West Garo Hills"]
+      shgs: 450
+      also_a: []
+      aliases: ["North Tura constituency", "AC 50", "North Tura AC"]
+    - canonical: "Rangsakona"
+      number: 52
+      numbered: "52 RANGSAKONA"
+      districts: ["South West Garo Hills", "West Garo Hills"]
+      shgs: 1114
+      also_a: [village]
+      aliases: ["Rangsakona constituency", "AC 52", "Rangsakona AC"]
+    - canonical: "Ampathi"
+      number: 53
+      numbered: "53 AMPATI"
+      districts: ["South West Garo Hills"]
+      shgs: 934
+      also_a: []
+      aliases: ["Ampati", "Ampathi constituency", "AC 53", "Ampathi AC"]
+      spelling_note: The two source fields spell this differently ('Ampathi' vs 'AMPATI'). Same constituency.
+    - canonical: "Mahendraganj"
+      number: 54
+      numbered: "54 MAHENDRAGANJ"
+      districts: ["South West Garo Hills"]
+      shgs: 739
+      also_a: []
+      aliases: ["Mahendraganj constituency", "AC 54", "Mahendraganj AC"]
+    - canonical: "Salmanpara"
+      number: 55
+      numbered: "55 SALMANPARA"
+      districts: ["South West Garo Hills", "West Garo Hills"]
+      shgs: 621
+      also_a: [village]
+      aliases: ["Salmanpara constituency", "AC 55", "Salmanpara AC"]
+    - canonical: "Gambegre"
+      number: 56
+      numbered: "56 GAMBEGRE"
+      districts: ["West Garo Hills", "South West Garo Hills"]
+      shgs: 947
+      also_a: [block, village]
+      aliases: ["Gambegre constituency", "AC 56", "Gambegre AC"]
+    - canonical: "Dalu"
+      number: 57
+      numbered: "57 DALU"
+      districts: ["West Garo Hills"]
+      shgs: 595
+      also_a: [block]
+      aliases: ["Dalu constituency", "AC 57", "Dalu AC"]
+    - canonical: "Rongara-siju"
+      number: 58
+      numbered: "58 RONGARA"
+      districts: ["South Garo Hills"]
+      shgs: 682
+      also_a: []
+      aliases: ["Rongara", "Rongara-siju constituency", "AC 58", "Rongara-siju AC", "Rongara Siju"]
+    - canonical: "Chokpot"
+      number: 59
+      numbered: "59 CHOKPOT"
+      districts: ["South Garo Hills"]
+      shgs: 498
+      also_a: [block]
+      aliases: ["Chokpot constituency", "AC 59", "Chokpot AC"]
+    - canonical: "Baghmara"
+      number: 60
+      numbered: "60 BAGHMARA"
+      districts: ["South Garo Hills"]
+      shgs: 700
+      also_a: [block, village]
+      aliases: ["Baghmara constituency", "AC 60", "Baghmara AC"]
+
+  village:
+    name_column: lgd_village_name
+    code_column: village_code
+    stored_case: >
+      Title Case in dim_geography.lgd_village_name. UNLIKE district and block, the village
+      name is NOT uppercased in the curated layer.
+    distinct_names: 4712
+    distinct_codes: 4976
+    unresolved_shgs: 2032
+    integrity: >
+      Verified clean in the source: no village code carries more than one name, and no
+      village code appears in more than one block. The code is a reliable key; the NAME
+      is not.
+    sql_predicate_preferred: "village_code = <lgd_code>"
+    sql_predicate_fallback: "lgd_village_name = '<canonical>'"
+    counting_villages: >
+      Use COUNT(DISTINCT village_code) FILTER (WHERE entity_type <> 'Unresolved'), never
+      COUNT(DISTINCT name) - 264 villages would be lost to shared names, and the
+      placeholders would be counted as villages.
+    unresolved_placeholder:
+      critical: true
+      text: >
+        The 2,032 SHGs with no source village carry their BLOCK's synthetic Unresolved
+        placeholder code. That code is not a village. Never return it as a village match,
+        never list its label as a village name, never count it as a village.
+    not_gp: >
+      A place name that matches only gp_name (and no LGD village) is NOT a village. Return
+      ambiguous offering the GP reading, or not_found.
+
+    resolution_strategy:
+    - 1. If the user gave a 6-digit numeric code, resolve on village_code directly.
+    - 2. Fold the name and look it up scoped by any district or block also given.
+    - 3. If exactly one code survives, resolve and emit the CODE, not the name.
+    - 4. If more than one survives, return ambiguous with candidate codes plus their
+         district and block. Ask which one.
+    - 5. If none survive, run fuzzy then embedding, then not_found with 5 suggestions.
+
+    ambiguity:
+      shared_names: 197
+      detail: >
+        197 village names are used by two or more physically different villages. Village
+        name alone is NEVER a key.
+      resolve_by_district: 160
+      resolve_by_block: 37      # every copy sits in ONE district, so naming the
+                                # district does not help - ask for the block
+      registry_key: "NAME: { codes, districts, resolve_by }"
+      district_codes_used: >
+        EGH East Garo Hills, EJH East Jaintia Hills, EKH East Khasi Hills,
+        EWKH Eastern West Khasi Hills, NGH North Garo Hills, RB Ri Bhoi,
+        SGH South Garo Hills, SWGH South West Garo Hills, SWKH South West Khasi Hills,
+        WGH West Garo Hills, WJH West Jaintia Hills, WKH West Khasi Hills
+      registry:
+        ADUGRE: { codes: 5, districts: [SGH, SWGH, WGH], resolve_by: district }
+        AGALGRE: { codes: 3, districts: [SGH, SWGH, WGH], resolve_by: district }
+        AKINPARA: { codes: 2, districts: [SWGH, WGH], resolve_by: district }
+        AMBARI: { codes: 2, districts: [SWGH, WGH], resolve_by: district }
+        AMONGGRE: { codes: 2, districts: [SGH, WGH], resolve_by: district }
+        AMPANGGRE: { codes: 3, districts: [EGH, SGH, WGH], resolve_by: district }
+        AMTULI: { codes: 2, districts: [NGH, SWGH], resolve_by: district }
+        ANCHENGGRE: { codes: 3, districts: [SGH, SWGH, WGH], resolve_by: district }
+        APALGRE: { codes: 3, districts: [SWGH, WGH], resolve_by: district }
+        ASIMGRE: { codes: 5, districts: [EGH, SGH, SWGH, WGH], resolve_by: district }
+        ASIRAGRE: { codes: 2, districts: [EGH, WGH], resolve_by: district }
+        BALADINGGRE: { codes: 4, districts: [SGH, SWGH, WGH], resolve_by: district }
+        BALALGRE: { codes: 2, districts: [SWGH, WGH], resolve_by: district }
+        BALUPARA: { codes: 2, districts: [WGH], resolve_by: block }
+        BATABARI: { codes: 2, districts: [SGH, WGH], resolve_by: district }
+        BAWEGRE: { codes: 2, districts: [EGH, WGH], resolve_by: district }
+        BELBARI: { codes: 3, districts: [SWGH, WGH], resolve_by: district }
+        BERUPARA: { codes: 2, districts: [SWGH, WGH], resolve_by: district }
+        BIBRAGRE: { codes: 2, districts: [SGH, WGH], resolve_by: district }
+        BILKONA: { codes: 2, districts: [SGH], resolve_by: block }
+        BOLBOKGRE: { codes: 2, districts: [WGH], resolve_by: block }
+        BOLCHUGRE: { codes: 3, districts: [SWGH, WGH], resolve_by: district }
+        BOLDAMGRE: { codes: 4, districts: [SGH, WGH], resolve_by: district }
+        BOLLONGGRE: { codes: 2, districts: [SWGH, WGH], resolve_by: district }
+        BOLSALGRE: { codes: 3, districts: [SWGH, WGH], resolve_by: district }
+        BORJHORA: { codes: 2, districts: [NGH, SWGH], resolve_by: district }
+        BORSORA: { codes: 2, districts: [EJH, SWKH], resolve_by: district }
+        CHAMAGURI: { codes: 2, districts: [SWGH, WGH], resolve_by: district }
+        CHANDIGRE: { codes: 3, districts: [SGH, WGH], resolve_by: district }
+        CHERAN SONGGITCHAM: { codes: 2, districts: [EGH, WGH], resolve_by: district }
+        CHERANGRE: { codes: 3, districts: [EGH, WGH], resolve_by: district }
+        CHIBOKGRE: { codes: 3, districts: [SGH, WGH], resolve_by: district }
+        CHIDEKGRE: { codes: 2, districts: [SWGH, WGH], resolve_by: district }
+        CHIGITCHAKGRE: { codes: 4, districts: [SGH, SWGH, WGH], resolve_by: district }
+        CHIGRANGGRE: { codes: 2, districts: [NGH, SGH], resolve_by: district }
+        CHIOKGRE: { codes: 2, districts: [EGH, WGH], resolve_by: district }
+        CHOLLONGPARA: { codes: 2, districts: [WGH], resolve_by: block }
+        DABIGRE: { codes: 2, districts: [SGH, WGH], resolve_by: district }
+        DAGALGRE: { codes: 2, districts: [SGH, WGH], resolve_by: district }
+        DALMAGRE: { codes: 2, districts: [WGH], resolve_by: block }
+        DAMALGRE: { codes: 3, districts: [SGH, SWGH, WGH], resolve_by: district }
+        DAMJONGGRE: { codes: 2, districts: [WGH], resolve_by: block }
+        DANGSAPARA: { codes: 2, districts: [SWGH, WGH], resolve_by: district }
+        DARECHIKGRE: { codes: 2, districts: [WGH], resolve_by: block }
+        DASPARA: { codes: 2, districts: [SWGH, WGH], resolve_by: district }
+        DEMTHRING: { codes: 2, districts: [EKH, WJH], resolve_by: district }
+        DEWSAW: { codes: 3, districts: [EKH, EWKH], resolve_by: district }
+        DIGRANGGRE: { codes: 2, districts: [SGH, WGH], resolve_by: district }
+        DILNIGRE: { codes: 2, districts: [SGH, WGH], resolve_by: district }
+        DIPOGRE: { codes: 2, districts: [SGH, WGH], resolve_by: district }
+        DIRANG: { codes: 2, districts: [SWKH, WKH], resolve_by: district }
+        DOMBAGRE: { codes: 2, districts: [SWGH], resolve_by: block }
+        DOMJRI: { codes: 2, districts: [EKH, WKH], resolve_by: district }
+        DOMSOHPIAN: { codes: 2, districts: [EKH, SWKH], resolve_by: district }
+        DOMTRAW: { codes: 2, districts: [EWKH, SWKH], resolve_by: district }
+        DOPANANGGRE: { codes: 3, districts: [SGH, WGH], resolve_by: district }
+        DURAGRE: { codes: 2, districts: [SGH, WGH], resolve_by: district }
+        GALWANGGRE: { codes: 2, districts: [WGH], resolve_by: block }
+        GAMBARIGRE: { codes: 2, districts: [WGH], resolve_by: block }
+        GIMBILGRE: { codes: 3, districts: [SWGH, WGH], resolve_by: district }
+        GOLAGRE: { codes: 2, districts: [SWGH, WGH], resolve_by: district }
+        HARIBHANGA: { codes: 2, districts: [WGH], resolve_by: block }
+        JANGRAPARA: { codes: 2, districts: [WGH], resolve_by: block }
+        JARAIN: { codes: 3, districts: [EJH, EKH, WJH], resolve_by: district }
+        JONGDIKGRE: { codes: 2, districts: [SWGH, WGH], resolve_by: district }
+        KALUPARA: { codes: 2, districts: [SGH, WGH], resolve_by: district }
+        KIMDEGRE: { codes: 2, districts: [NGH, SWGH], resolve_by: district }
+        KODALDHOWA: { codes: 2, districts: [SWGH, WGH], resolve_by: district }
+        KONGWANG: { codes: 2, districts: [EKH, WJH], resolve_by: district }
+        KORAIBARI: { codes: 2, districts: [SWKH, WGH], resolve_by: district }
+        KOSIGRE: { codes: 2, districts: [SGH, WGH], resolve_by: district }
+        KOTCHUGRE: { codes: 2, districts: [WGH], resolve_by: block }
+        KREMMYRSIANG: { codes: 2, districts: [EJH, WJH], resolve_by: district }
+        LAITMAWSIANG: { codes: 2, districts: [EKH], resolve_by: block }
+        LALMATI: { codes: 2, districts: [RB, WGH], resolve_by: district }
+        LANGTOR: { codes: 2, districts: [EWKH, SWKH], resolve_by: district }
+        LAPALANG: { codes: 2, districts: [EKH], resolve_by: block }
+        LAWSIEJ: { codes: 2, districts: [EWKH, SWKH], resolve_by: district }
+        LUMDIENGNGAN: { codes: 2, districts: [EKH, RB], resolve_by: district }
+        LUMKYA: { codes: 2, districts: [RB, WJH], resolve_by: district }
+        LUMMAWBAH: { codes: 2, districts: [EKH, SWKH], resolve_by: district }
+        LUMPYNGNGAD: { codes: 4, districts: [SWKH, WJH, WKH], resolve_by: district }
+        LUMSOHPHOH: { codes: 2, districts: [RB], resolve_by: block }
+        LYNGNGAI: { codes: 2, districts: [EKH], resolve_by: block }
+        MAGURMARI: { codes: 2, districts: [SWGH, WGH], resolve_by: district }
+        MALCHAPARA: { codes: 2, districts: [NGH, SWGH], resolve_by: district }
+        MANDAGRE: { codes: 4, districts: [SWGH, WGH], resolve_by: district }
+        MANDALGRE: { codes: 2, districts: [EGH, SWGH], resolve_by: district }
+        MARAKAPARA: { codes: 3, districts: [SGH, WGH], resolve_by: district }
+        MATCHOKGRE: { codes: 2, districts: [WGH], resolve_by: block }
+        MATCHOKPARA: { codes: 2, districts: [SWGH, WGH], resolve_by: district }
+        MAWBEH: { codes: 2, districts: [EKH], resolve_by: block }
+        MAWBLANG: { codes: 3, districts: [EKH, RB], resolve_by: district }
+        MAWBRI: { codes: 4, districts: [EKH, RB, SWKH, WKH], resolve_by: district }
+        MAWEITKSAR: { codes: 2, districts: [EKH, WKH], resolve_by: district }
+        MAWIAPBANG: { codes: 2, districts: [EKH, RB], resolve_by: district }
+        MAWIONG: { codes: 4, districts: [EKH, RB, SWKH, WKH], resolve_by: district }
+        MAWKHAN: { codes: 2, districts: [EKH, EWKH], resolve_by: district }
+        MAWKHAP: { codes: 3, districts: [EKH, RB, WKH], resolve_by: district }
+        MAWLANG: { codes: 2, districts: [EKH, RB], resolve_by: district }
+        MAWLEIN: { codes: 2, districts: [EKH, WKH], resolve_by: district }
+        MAWLIEH: { codes: 3, districts: [EKH, EWKH, WKH], resolve_by: district }
+        MAWLONG: { codes: 4, districts: [EKH, RB, WJH], resolve_by: district }
+        MAWLYNDEP: { codes: 2, districts: [EKH, RB], resolve_by: district }
+        MAWNGAP: { codes: 3, districts: [WJH, WKH], resolve_by: district }
+        MAWPAT: { codes: 2, districts: [RB, SWKH], resolve_by: district }
+        MAWPDANG: { codes: 2, districts: [EKH, RB], resolve_by: district }
+        MAWPEN: { codes: 2, districts: [EKH, EWKH], resolve_by: district }
+        MAWROH: { codes: 2, districts: [EWKH], resolve_by: block }
+        MAWRYNGKANG: { codes: 3, districts: [EKH, RB], resolve_by: district }
+        MAWSAW: { codes: 3, districts: [SWKH, WKH], resolve_by: district }
+        MAWSAWA: { codes: 2, districts: [EKH, EWKH], resolve_by: district }
+        MAWSHUT: { codes: 2, districts: [RB, WKH], resolve_by: district }
+        MAWSMAI: { codes: 4, districts: [EKH, EWKH, RB, WKH], resolve_by: district }
+        MEGADOP: { codes: 2, districts: [SGH, WKH], resolve_by: district }
+        MEGAPGRE: { codes: 3, districts: [SGH, SWGH, WGH], resolve_by: district }
+        MEGONGGRE: { codes: 3, districts: [WGH], resolve_by: block }
+        MYNSAIN: { codes: 2, districts: [EKH, RB], resolve_by: district }
+        MYRIAW: { codes: 2, districts: [EWKH, SWKH], resolve_by: district }
+        NAYAPARA: { codes: 3, districts: [SWGH, SWKH, WGH], resolve_by: district }
+        NEPALGRE: { codes: 2, districts: [SWGH, WGH], resolve_by: district }
+        NOGORPARA: { codes: 2, districts: [SWGH, WGH], resolve_by: district }
+        NOKATGRE: { codes: 3, districts: [SGH, SWGH], resolve_by: district }
+        NOLBARI: { codes: 2, districts: [NGH, SGH], resolve_by: district }
+        NONGBAH: { codes: 2, districts: [WJH, WKH], resolve_by: district }
+        NONGDEWSAW: { codes: 2, districts: [RB, SWKH], resolve_by: district }
+        NONGDHAR: { codes: 2, districts: [WJH, WKH], resolve_by: district }
+        NONGDOM: { codes: 3, districts: [EWKH, WKH], resolve_by: district }
+        NONGJRI: { codes: 2, districts: [SWKH, WKH], resolve_by: district }
+        NONGKASEN: { codes: 2, districts: [EKH, EWKH], resolve_by: district }
+        NONGKYNDANG: { codes: 2, districts: [WKH], resolve_by: block }
+        NONGKYNRIH: { codes: 2, districts: [RB, WJH], resolve_by: district }
+        NONGLAIT: { codes: 2, districts: [EKH, EWKH], resolve_by: district }
+        NONGLANG: { codes: 3, districts: [EWKH, SWKH, WKH], resolve_by: district }
+        NONGLUM: { codes: 2, districts: [RB], resolve_by: block }
+        NONGMADAN: { codes: 2, districts: [EKH], resolve_by: block }
+        NONGMAWLEIN: { codes: 2, districts: [SWKH, WKH], resolve_by: district }
+        NONGMAWLONG: { codes: 2, districts: [RB, WKH], resolve_by: district }
+        NONGPRIANG: { codes: 2, districts: [EKH, EWKH], resolve_by: district }
+        NONGRAH: { codes: 2, districts: [EKH, RB], resolve_by: district }
+        NONGRYNGKOH: { codes: 2, districts: [EKH, WJH], resolve_by: district }
+        NONGSDER: { codes: 2, districts: [EKH, RB], resolve_by: district }
+        NONGSHILLIANG: { codes: 2, districts: [EWKH, WKH], resolve_by: district }
+        NONGTHYMMAI: { codes: 3, districts: [EWKH, WKH], resolve_by: district }
+        NONGTHYMME: { codes: 2, districts: [EJH, WJH], resolve_by: district }
+        NONGTRAW: { codes: 3, districts: [EKH, RB, WKH], resolve_by: district }
+        NOONMATI: { codes: 2, districts: [SWGH], resolve_by: block }
+        PANBARI: { codes: 2, districts: [NGH, WGH], resolve_by: district }
+        PHOTJALEI: { codes: 2, districts: [SWKH, WKH], resolve_by: district }
+        POMLUM: { codes: 2, districts: [EKH], resolve_by: block }
+        PYRDA: { codes: 2, districts: [EKH, EWKH], resolve_by: district }
+        RAJABALA: { codes: 2, districts: [RB, WGH], resolve_by: district }
+        RANGMALGRE: { codes: 2, districts: [NGH, WGH], resolve_by: district }
+        RANGSAGRE: { codes: 3, districts: [SWGH, WGH], resolve_by: district }
+        RONGALGRE: { codes: 3, districts: [EGH, WGH], resolve_by: district }
+        RONGBAKGRE: { codes: 2, districts: [SWGH, WGH], resolve_by: district }
+        RONGBOKGRE: { codes: 2, districts: [SGH, WGH], resolve_by: district }
+        RONGCHIGRE: { codes: 2, districts: [WGH], resolve_by: block }
+        RONGDENGGRE: { codes: 2, districts: [SGH, WGH], resolve_by: district }
+        RONGKONGRE: { codes: 2, districts: [SWGH, WGH], resolve_by: district }
+        RONGRAMGRE: { codes: 3, districts: [SWGH, WGH], resolve_by: district }
+        RONGRONGGRE: { codes: 2, districts: [EGH, SGH], resolve_by: district }
+        RONGSIGRE: { codes: 2, districts: [SGH], resolve_by: block }
+        RTIANG: { codes: 2, districts: [RB, WJH], resolve_by: district }
+        SAMPALGRE: { codes: 2, districts: [EGH, WGH], resolve_by: district }
+        SELBALGRE: { codes: 2, districts: [WGH], resolve_by: block }
+        SHYRWANG: { codes: 2, districts: [EJH, EWKH], resolve_by: district }
+        SIEJIONG: { codes: 2, districts: [EKH, SWKH], resolve_by: district }
+        SILBARIPARA: { codes: 2, districts: [SGH, SWGH], resolve_by: district }
+        SILDUBI: { codes: 2, districts: [NGH, WKH], resolve_by: district }
+        SOHPHOH: { codes: 3, districts: [EKH, RB, WJH], resolve_by: district }
+        SONGMAGRE: { codes: 2, districts: [EGH, WGH], resolve_by: district }
+        TARAPARA: { codes: 2, districts: [SWGH, WGH], resolve_by: district }
+        TEBRONGGRE: { codes: 2, districts: [WGH], resolve_by: block }
+        TEKSRAGRE: { codes: 3, districts: [WGH], resolve_by: block }
+        TIEHBAH: { codes: 3, districts: [EKH, EWKH, WKH], resolve_by: district }
+        TIMBOGRE: { codes: 2, districts: [RB, WGH], resolve_by: district }
+        TLUH: { codes: 2, districts: [EJH, EKH], resolve_by: district }
+        ULUBARI: { codes: 2, districts: [RB, SWGH], resolve_by: district }
+        UMBIR: { codes: 2, districts: [RB, SWKH], resolve_by: district }
+        UMIONG: { codes: 2, districts: [RB, WKH], resolve_by: district }
+        UMKREM: { codes: 2, districts: [EKH, EWKH], resolve_by: district }
+        UMPUNG: { codes: 2, districts: [RB, SWKH], resolve_by: district }
+        UMSALANG: { codes: 2, districts: [WJH], resolve_by: block }
+        UMSARANG: { codes: 2, districts: [RB], resolve_by: block }
+        UMSAW: { codes: 7, districts: [EKH, RB, SWKH, WKH], resolve_by: district }
+        UMSOHLANG: { codes: 2, districts: [RB], resolve_by: block }
+        UMTHAM: { codes: 2, districts: [RB], resolve_by: block }
+        UMTHLI: { codes: 2, districts: [EKH, WKH], resolve_by: district }
+        UMTHLONG: { codes: 2, districts: [EKH, WKH], resolve_by: district }
+        WADAGRE: { codes: 2, districts: [SWGH, WGH], resolve_by: district }
+        WAGEBOKGRE: { codes: 2, districts: [SGH], resolve_by: block }
+        WAHIAJER: { codes: 2, districts: [EJH, WJH], resolve_by: district }
+        WAHLYNGDOH: { codes: 2, districts: [EKH, WKH], resolve_by: district }
+        WAKANTAGRE: { codes: 3, districts: [SWGH, WGH], resolve_by: district }
+        WANKOLAGRE: { codes: 2, districts: [WGH], resolve_by: block }
+        WATREGRE: { codes: 3, districts: [SGH, SWGH, WGH], resolve_by: district }
+
+  gp_name:
+    column: gp_name
+    status: advisory
+    stored_case: as typed in the source (mostly Title Case, e.g. 'Kyndong Tuber')
+    distinct: 3990
+    nulls: 0
+    lgd_level: false
+    sql_predicate: "gp_name ILIKE '<canonical>'"
+    rule: >
+      Free text with no code and no place in the LGD hierarchy. The same GP name appears
+      in more than one block. Resolve only when the user names the GP level, scope it by
+      block whenever a block is known, and attach the caveat that it differs from the LGD
+      village on about a quarter of SHGs.
+    sample_values: [Madanmaroid, Barato, Kyndong Tuber, Mawlong, Rymbai, Mawryng Kneng]
+    spelling_note: >
+      GP and village spellings of the same place often differ by a space ('Kyndong Tuber'
+      vs village 'Kyndongtuber', 'Mawryng Kneng' vs 'Mawryngkneng'). Use the squash stage.
+
+  shg_type:
+    column: shg_type
+    stored_case: as shown
+    distinct: 3
+    closed_set: true
+    nulls: 0
+    sql_predicate: "shg_type = '<canonical>'"
+    ordering: Pre-Nrlm -> Revived -> New
+    values:
+    - canonical: "New"
+      shgs: 38453
+      active: 37313
+      members: 387333
+      rf_crore: 47.99
+      cif_crore: 92.86
+      aliases: ["new", "newly formed", "new SHG", "new group", "NRLM formed", "fresh", "new type"]
+      collision: "'New' as a type vs 'newly formed recently' - see overloaded_terms.new"
+    - canonical: "Revived"
+      shgs: 1744
+      active: 1689
+      members: 18801
+      rf_crore: 2.27
+      cif_crore: 3.88
+      aliases: ["revived", "revival", "revitalised", "revitalized", "reactivated", "re-formed", "reformed", "revived SHG"]
+    - canonical: "Pre-Nrlm"
+      shgs: 432
+      active: 430
+      members: 4713
+      rf_crore: 0.60
+      cif_crore: 1.73
+      aliases: ["pre NRLM", "pre-NRLM", "prenrlm", "pre NRLM SHG", "existing before NRLM", "old SHG", "SGSY SHG", "SGSY group", "legacy SHG"]
+      collision: "'Pre-NRLM' as a type (432) vs 'formed before 2011-12' (645) - see overloaded_terms.pre_nrlm"
+    definitions_note: Code list and definitions are unconfirmed by the client (readiness doc section 3).
+
+  shg_status:
+    column: is_active
+    type: boolean
+    nulls: 0
+    values:
+    - canonical: true
+      label: Active
+      shgs: 39432
+      aliases: ["active", "functional", "working", "live", "operational", "running", "functioning"]
+      sql_predicate: "is_active"
+    - canonical: false
+      label: Inactive
+      shgs: 1197
+      aliases: ["inactive", "dormant", "defunct", "non-functional", "nonfunctional", "not active", "closed", "dissolved", "defunct SHG"]
+      sql_predicate: "NOT is_active"
+      note: >
+        'closed' and 'dissolved' resolve here only with a stated assumption - there is no
+        dissolution status, only the active flag. All 1,197 show 0 RF and 0 CIF (NR-15).
+
+  formation_year:
+    stored_column: formation_financial_year_short on curated.v_nrlm
+    long_column: formation_financial_year
+    key_column: formation_year_key
+    source: curated.dim_year, pre-joined into curated.v_nrlm
+    definition: April 1 to March 31, labelled 'YYYY-YY', the year the SHG was FORMED
+    meaning:
+      critical: true
+      text: >
+        This is the FORMATION year (live comment, NR-02) - not a reporting, funding or
+        release year. Resolve a year to it only for SHG count, member and formation
+        questions. A year attached to money is handed to the gate.
+    sql_predicate: "formation_financial_year_short = '<canonical>'"
+    sql_predicate_before: "formation_financial_year_short < '<canonical>'"
+    sql_predicate_after: "formation_financial_year_short > '<canonical>'"
+    range: { first: '1984-85', last: '2022-23', distinct: 30 }
+    absent_years_inside_range: ['1985-86', '1986-87', '1987-88', '1988-89', '1989-90', '1990-91',
+                                '1991-92', '1992-93', '1994-95']
+    accepted_forms:
+    - "2020-21"       # canonical
+    - "2020-2021"     # long form -> formation_financial_year
+    - "FY 2020-21"
+    - "FY20-21"
+    - "FY21"          # ambiguous between 2020-21 and 2021-22 - ask (ambiguous_year_shorthand)
+    - "2020"          # bare year - ask (bare_year_formation_or_fy) unless context is formation
+    values:
+    - { canonical: '2022-23', shgs: 1680, note: "latest; may be incomplete in this extract" }
+    - { canonical: '2021-22', shgs: 6028 }
+    - { canonical: '2020-21', shgs: 11354, note: peak }
+    - { canonical: '2019-20', shgs: 10604 }
+    - { canonical: '2018-19', shgs: 4368 }
+    - { canonical: '2017-18', shgs: 3634 }
+    - { canonical: '2016-17', shgs: 1279 }
+    - { canonical: '2015-16', shgs: 582 }
+    - { canonical: '2014-15', shgs: 169 }
+    - { canonical: '2013-14', shgs: 98 }
+    - { canonical: '2012-13', shgs: 83 }
+    - { canonical: '2011-12', shgs: 105, note: NRLM launch year }
+    - { canonical: '2010-11', shgs: 77 }
+    - { canonical: '2009-10', shgs: 56 }
+    - { canonical: '2008-09', shgs: 71 }
+    - { canonical: '2007-08', shgs: 81 }
+    - { canonical: '2006-07', shgs: 82 }
+    - { canonical: '2005-06', shgs: 48 }
+    - { canonical: '2004-05', shgs: 53 }
+    - { canonical: '2003-04', shgs: 49 }
+    - { canonical: '2002-03', shgs: 56 }
+    - { canonical: '2001-02', shgs: 33 }
+    - { canonical: '2000-01', shgs: 21 }
+    - { canonical: '1999-00', shgs: 8, note: "stored short form is '1999-00', not '1999-2000'" }
+    - { canonical: '1998-99', shgs: 3 }
+    - { canonical: '1997-98', shgs: 2 }
+    - { canonical: '1996-97', shgs: 2 }
+    - { canonical: '1995-96', shgs: 1 }
+    - { canonical: '1993-94', shgs: 1 }
+    - { canonical: '1984-85', shgs: 1 }
+    relative_terms:
+      latest: '2022-23'
+      previous: '2021-22'
+      earliest: '1984-85'
+      before_nrlm: "< '2011-12'"
+      this_year: "not held - the data stops at 2022-23. Say so; do not return 0 silently."
+    dim_year_coverage_conflict:
+      unresolved: true
+      text: >
+        The 2026-10-05 schema doc estimates dim_year at ~9 rows, but formation_year_key is
+        NOT NULL with an FK to dim_year and needs 30 distinct years, and the reconciliation
+        view expects 0 quarantined. Either the row estimate is stale or dim_year was
+        extended for NRLM. The view uses an INNER JOIN to dim_year - if a year were
+        missing, SHGs would vanish from every query. Verify before shipping.
+
+  identifiers:
+    shg_code:
+      column: shg_code
+      type: integer
+      unique: true
+      range: [2, 46368]
+      role: THE natural key of an SHG. Unique constraint fact_nrlm_shg_shg_code_key.
+      aliases: [SHG code, SHG id, SHG number, group code, group id, group number]
+      sql_predicate: "shg_code = <int>"
+      rule: identifier only - never SUM or AVG.
+      parse: >
+        Accept 'SHG 7194', 'SHG code 7194', '#7194', 'code 7194'. A bare 4-5 digit number
+        is an shg_code only when the question is about a single group; a 6-digit number is
+        a village code; a 3-digit number may be a district code; a 4-digit number may also be
+        a block code - ask when the context does not decide.
+    shg_name:
+      column: shg_name
+      unique: false
+      distinct: 27692
+      most_shared: { "Iatreilang Shg": 295, "Iatyllilang Shg": 204, "Synroplang Shg": 137,
+                     "Chibasal Shg": 125, "Iatreilang": 109, "Tyllilang Shg": 104 }
+      same_name_same_village: 174
+      sql_predicate: "shg_name ILIKE '<canonical>'"
+      rule: >
+        Resolve to a LIST, never to one SHG, unless exactly one row matches. Return
+        ambiguous with shg_code, village, block and district per candidate. Scope by any
+        geography the user gave before counting candidates.
+      variant_note: >
+        'Iatreilang' and 'Iatreilang Shg' are different stored strings for what are
+        separate SHGs. A search for the bare word should match both (ILIKE '<word>%').
+    nrlm_fact_id:
+      column: nrlm_fact_id
+      type: bigint
+      unique: true
+      role: surrogate primary key
+      unstable: Regenerated on every reload (the table is replaced). Never quote it back to a user.
+      rule: identifier only - never SUM or AVG.
+    source_row_id:
+      column: fact_nrlm_shg.source_row_id
+      role: >
+        The source file's `id`. Not in the view. A user who says "row id" or "record id"
+        from the spreadsheet means this - answer from fact_nrlm_shg only for lineage.
+
+measure_vocabulary:
+  shgs:
+    aggregate: COUNT(*)
+    aliases: [SHGs, groups, self help groups, number of SHGs, SHG count, how many SHGs, collectives]
+    unit: SHGs
+  members:
+    column: total_members
+    aggregate: SUM(total_members)
+    aliases: [members, membership, total members, SHG members, people, persons, women mobilised]
+    unit: persons
+    note: Households are NOT recorded; 'households' resolves here only with a stated assumption.
+  women_members:
+    column: female_members
+    aggregate: SUM(female_members)
+    aliases: [women, women members, female members, female, mahila]
+  men_members:
+    column: male_members
+    aggregate: SUM(male_members)
+    aliases: [men, male members, male]
+  revolving_fund:
+    column: revolving_fund_amount
+    aggregate: SUM(revolving_fund_amount)
+    aliases: [revolving fund, RF, RF amount, revolving fund amount, RF released, RF received, RF disbursed]
+    unit: rupees (assumed, NR-07)
+    distinct_values: 10
+    norm: 15000
+    cumulative: true
+    note: >
+      Effectively a flat entitlement - 33,241 SHGs hold exactly Rs 15,000. A ranking by
+      total RF is close to a ranking by count of RF-receiving SHGs. Say so when ranking.
+  cif:
+    column: cif_amount
+    aggregate: SUM(cif_amount)
+    aliases: [CIF, community investment fund, CIF amount, investment fund, CIF released, CIF received, CIF disbursed]
+    unit: rupees (assumed, NR-07)
+    distinct_values: 355
+    zero_share: 0.733
+    cumulative: true
+    note: The measure that genuinely varies. 39 values above Rs 5 lakh are unconfirmed (NR-25).
+  total_funds:
+    expression: SUM(revolving_fund_amount + cif_amount)
+    aliases: [total funds, total community funds, RF plus CIF, all funds]
+    note: Only when the user asks for the combined figure.
+  derived:
+    active_share: "ROUND(100.0 * COUNT(*) FILTER (WHERE is_active) / COUNT(*), 2)"
+    cif_coverage: "ROUND(100.0 * COUNT(*) FILTER (WHERE cif_amount > 0) / COUNT(*), 2)"
+    rf_coverage: "ROUND(100.0 * COUNT(*) FILTER (WHERE revolving_fund_amount > 0) / COUNT(*), 2)"
+    members_per_shg: "ROUND(AVG(total_members), 1)"
+    cif_per_recipient: "ROUND(AVG(cif_amount) FILTER (WHERE cif_amount > 0), 0)"
+  not_held:
+    - savings / corpus / internal lending
+    - bank linkage / bank loan / credit / loan outstanding / repayment / NPA
+    - start-up fund / vulnerability reduction fund / interest subvention
+    - utilisation / expenditure of funds
+    - households / population / eligible women
+
+region_groupings:
+  note: >
+    Users group districts by hill range. These are not columns - expand into an IN list
+    (by district_lgd_code) and state which districts were included. Counts are by LGD code.
+  groups:
+    "Garo Hills":
+      districts: [East Garo Hills, North Garo Hills, South Garo Hills,
+                  South West Garo Hills, West Garo Hills]
+      district_codes: [273, 656, 277, 663, 278]
+      shgs: 17565
+      aliases: [Garo, Garo region, Garo Hills region, GH]
+    "Khasi Hills":
+      districts: [East Khasi Hills, Eastern West Khasi Hills, South West Khasi Hills,
+                  West Khasi Hills]
+      district_codes: [274, 740, 658, 279]
+      shgs: 12557
+      aliases: [Khasi, Khasi region, Khasi Hills region, KH]
+    "Jaintia Hills":
+      districts: [East Jaintia Hills, West Jaintia Hills]
+      district_codes: [657, 275]
+      shgs: 6799
+      aliases: [Jaintia, Jaintia region, Jaintia Hills region, JH]
+    "Ri Bhoi":
+      districts: [Ri Bhoi]
+      district_codes: [276]
+      shgs: 3708
+      aliases: [Ri Bhoi region, Bhoi]
+      note: >
+        Ri Bhoi belongs to no hill range - it is its own district and its own group. Do not
+        fold it into Khasi Hills.
+  whole_state:
+    aliases: [Meghalaya, state, statewide, whole state, all districts, overall]
+    behaviour: no district filter at all.
+    shgs: 40629
+
+# ---------------------------------------------------------------------------
+# WORKED EXAMPLES
+# ---------------------------------------------------------------------------
+worked_examples:
+
+- user: "how many SHGs in EGH"
+  resolve:
+  - { text: EGH, type: district, canonical: East Garo Hills, lgd_code: 273,
+      matched_by: 4_acronym }
+  - { text: "how many SHGs", type: measure, canonical: "COUNT(*)" }
+  sql: "SELECT COUNT(*) FROM curated.v_nrlm WHERE lgd_district = 'EAST GARO HILLS';"
+  expected: 2700
+
+- user: "SHGs in district 657"
+  resolve:
+  - { text: "657", type: district, canonical: East Jaintia Hills, lgd_code: 657, matched_by: 1_exact }
+  sql: "SELECT COUNT(*) FROM curated.v_nrlm WHERE district_lgd_code = 657;"
+  expected: 2744
+  note: >
+    By code. A source-name count would give 2,732 - the 12 Tangnub SHGs are named
+    Eastern West Khasi Hills in the file but coded 657.
+
+- user: "women members in west khasi"
+  resolve:
+  - { text: "west khasi", type: district, canonical: West Khasi Hills, lgd_code: 279, matched_by: 2_alias }
+  - { text: "women members", type: measure, canonical: "SUM(female_members)" }
+  note: >
+    "west khasi" must NOT fuzzy-match Eastern West Khasi Hills (blocked pair). If the user
+    meant 740 they will say "eastern".
+
+- user: "SHGs in Mawlai"
+  resolve:
+  - { text: Mawlai, type: block, canonical: Mawlai, lgd_code: 6540,
+      assumption: default_level }
+  note: >
+    Mawlai is a block (168 SHGs), a constituency (168 SHGs) and a village in Shallang
+    block (5 SHGs). With no qualifier the default is block; state it.
+
+- user: "SHGs in Asimgre"
+  resolve:
+  - { text: Asimgre, type: village, status: ambiguous }
+  response:
+    status: ambiguous
+    candidates: 5 distinct village codes named ASIMGRE
+    districts: [East Garo Hills, South Garo Hills, South West Garo Hills, West Garo Hills]
+    question: "Asimgre exists in four districts - and twice in West Garo Hills (Dadenggiri and Dalu blocks). Which one did you mean?"
+  note: never pick the first row.
+
+- user: "SHGs in Nongbah village"
+  resolve:
+  - { text: Nongbah, type: village, status: ambiguous }
+  response:
+    candidates:
+    - { village_code: 279159, block: Thadlaskein, district: West Jaintia Hills, shgs: 79 }
+    - { village_code: 276721, block: Rambrai, district: West Khasi Hills, shgs: 9 }
+    question: "Nongbah in Thadlaskein (West Jaintia Hills) or in Rambrai (West Khasi Hills)?"
+
+- user: "show Iatreilang Shg"
+  resolve:
+  - { text: Iatreilang Shg, type: shg_name, status: ambiguous, matches: 295 }
+  response_guidance: >
+    295 SHGs share this name across 7 districts. Ask for the district, block or SHG code;
+    or, if the user wants them all, list with shg_code, village and block (LIMIT 100).
+
+- user: "SHG 3329"
+  resolve:
+  - { text: "SHG 3329", type: shg_code, canonical: 3329, matched_by: 1_exact }
+  sql: "SELECT * FROM curated.v_nrlm WHERE shg_code = 3329;"
+  note: Unique - exactly one row (the largest CIF holder, Rs 13.6 lakh - carry the NR-25 caveat).
+
+- user: "SHGs in Mawkyrwat constituency"
+  resolve:
+  - { text: Mawkyrwat, type: constituency, canonical: Mawkyrwat, number: 36,
+      matched_by: 1_exact, qualifier: constituency }
+  sql: "SELECT COUNT(*) FROM curated.v_nrlm WHERE constituency_name_raw = 'Mawkyrwat';"
+  expected: 1092
+  note: The block of the same name holds 1,106 SHGs. Different area.
+
+- user: "SHGs in Sohiong constituency"
+  resolve:
+  - { text: Sohiong, type: constituency, canonical: Sohing, number: 23, matched_by: 2_alias }
+  note: >
+    The name field stores 'Sohing'; the numbered field says '23 SOHIONG'. Both resolve to
+    the same constituency. Without "constituency", Sohiong is the BLOCK (6542).
+
+- user: "how many revived SHGs formed in 2019-20"
+  resolve:
+  - { text: revived, type: shg_type, canonical: Revived }
+  - { text: "2019-20", type: formation_year, canonical: '2019-20' }
+  sql: "SELECT COUNT(*) FROM curated.v_nrlm WHERE shg_type = 'Revived' AND formation_financial_year_short = '2019-20';"
+
+- user: "RF released in 2021-22"
+  resolve:
+  - { text: RF released, type: measure, canonical: revolving_fund_amount }
+  - { text: "2021-22", type: formation_year, status: refused_for_money }
+  response: >
+    Gate: money_in_a_year_requested. The year cannot be applied to a cumulative undated
+    amount. Offer "RF held by SHGs formed in 2021-22", labelled as such.
+
+- user: "dormant groups in Ri Bhoi"
+  resolve:
+  - { text: dormant, type: shg_status, canonical: false, matched_by: 2_alias }
+  - { text: Ri Bhoi, type: district, canonical: Ri Bhoi, lgd_code: 276 }
+  sql: "SELECT COUNT(*) FROM curated.v_nrlm WHERE NOT is_active AND lgd_district = 'RI BHOI';"
+  note: State that 'dormant' was read as inactive - the only status besides active.
+
+- user: "SHGs in Khasi Hills"
+  resolve:
+  - { text: Khasi Hills, type: region, districts: [274, 740, 658, 279] }
+  sql: "SELECT COUNT(*) FROM curated.v_nrlm WHERE district_lgd_code IN (274, 740, 658, 279);"
+  expected: 12557
+  note: Name the four districts in the answer. Ri Bhoi is not included.
+
+- user: "how many beneficiaries in NRLM"
+  resolve:
+  - { text: beneficiaries, type: measure, status: ambiguous }
+  question: "SHGs (40,629) or SHG members (410,847)?"
+
+- user: "SHG savings in Jirang"
+  resolve:
+  - { text: savings, type: measure, status: not_found }
+  response: >
+    Not held. Gate: savings_or_corpus_requested. Offer RF and CIF received, and never
+    present them as savings.
+
+# ---- v1.1 additions (2026-10-05) - all figures from NRLM.csv by LGD code ----
+
+- user: "SHGs in Umsaw"
+  resolve:
+  - { text: Umsaw, type: village, status: ambiguous }
+  response:
+    candidates:
+    - { village_code: 276758, block: Nongstoin,        district: West Khasi Hills,       shgs: 13 }
+    - { village_code: 278882, block: Shella Bholaganj, district: East Khasi Hills,       shgs: 11 }
+    - { village_code: 277690, block: Jirang,           district: Ri Bhoi,                shgs: 10 }
+    - { village_code: 278130, block: Sohiong,          district: East Khasi Hills,       shgs: 9 }
+    - { village_code: 276867, block: Mawkyrwat,        district: South West Khasi Hills, shgs: 7 }
+    - { village_code: 278394, block: Mawryngkneng,     district: East Khasi Hills,       shgs: 3 }
+    - { village_code: 277827, block: Bhoirymbong,      district: Ri Bhoi,                shgs: 2 }
+    question: "There are 7 villages called Umsaw across 4 districts. Which block?"
+  note: The most-shared village name in NRLM. Naming the district is not enough for East Khasi Hills (3 copies) or Ri Bhoi (2).
+
+- user: "SHGs in Umsaw, Jirang"
+  resolve:
+  - { text: Jirang, type: block, canonical: Jirang, lgd_code: 1986 }
+  - { text: Umsaw, type: village, canonical: Umsaw, lgd_code: 277690, matched_by: 1_exact, scoped_by: block }
+  sql: "SELECT COUNT(*) FROM curated.v_nrlm WHERE village_code = 277690;"
+  expected: 10
+
+- user: "SHGs in Umtham"
+  resolve:
+  - { text: Umtham, type: village, status: ambiguous }
+  response:
+    candidates:
+    - { village_code: 277592, block: Umling,  district: Ri Bhoi, shgs: 11 }
+    - { village_code: 277925, block: Umsning, district: Ri Bhoi, shgs: 8 }
+    question: "Umtham in Umling or in Umsning block? Both are in Ri Bhoi."
+  note: A resolve_by_block name - both copies are in ONE district, so asking for the district would not help.
+
+- user: "SHGs in Jarain"
+  resolve:
+  - { text: Jarain, type: village, status: ambiguous }
+  response:
+    candidates:
+    - { village_code: 279522, block: Saipung,               district: East Jaintia Hills, shgs: 18 }
+    - { village_code: 279298, block: Amlarem,               district: West Jaintia Hills, shgs: 14 }
+    - { village_code: 278578, block: Khatarshnong Laitkroh, district: East Khasi Hills,   shgs: 4 }
+
+- user: "SHGs in Rajabala"
+  resolve:
+  - { text: Rajabala, type: constituency, canonical: Rajabala, number: 47, assumption: default_level }
+  note: >
+    Rajabala is a constituency (47, 586 SHGs) and two villages (Batabari block 21 SHGs,
+    Jirang block 1). It is NOT a block, so the block default does not apply; the
+    constituency is the only administrative-scale reading. State it, and offer the
+    villages.
+
+- user: "Mawhati SHGs"
+  resolve:
+  - { text: Mawhati, type: block, canonical: Mawhati, lgd_code: 7456, assumption: default_level }
+  expected: 69
+  note: >
+    The highest-stakes collision in the file. Mawhati block = 69 SHGs, Mawhati
+    constituency = 519, Mawhati village = 7. Always state which was used.
+
+- user: "SHGs in Laskein"
+  resolve:
+  - { text: Laskein, type: block, canonical: Laskein, lgd_code: 1997, assumption: default_level }
+  expected: 1880
+  note: Also a village (45 SHGs) and a GP name. Laskein is not a constituency. Must never fuzzy-match Thadlaskein (blocked pair).
+
+- user: "SHGs in Thadlaskein"
+  resolve:
+  - { text: Thadlaskein, type: block, canonical: Thadlaskein, lgd_code: 1996, matched_by: 1_exact }
+  expected: 1335
+  note: 183 of these 1,335 have no village - the second-highest Unresolved count of any block.
+
+- user: "Saipung SHGs"
+  resolve:
+  - { text: Saipung, type: block, canonical: Saipung, lgd_code: 2000, assumption: default_level }
+  expected: 913
+  note: >
+    Includes the 12 Tangnub SHGs the source calls 'Mairang'. Saipung is also a village
+    (42 SHGs). The constituency is 'Sutnga-saipung' (number 5, 1,309 SHGs) - a contains
+    match on 'Saipung' must not pick it without the word "constituency".
+
+- user: "SHGs in Sutnga"
+  resolve:
+  - { text: Sutnga, type: constituency, canonical: Sutnga-saipung, number: 5, matched_by: 2_alias }
+  expected: 1309
+  note: Sutnga is also a village in Wapung block (76 SHGs). With no qualifier, prefer the constituency only because no block is called Sutnga - and say so.
+
+- user: "SHGs in William Nagar"
+  resolve:
+  - { text: William Nagar, type: constituency, canonical: William Nagar, number: 43, matched_by: 1_exact }
+  expected: 648
+  note: The numbered field stores this as '43 WILLIAM'. Williamnagar is also an alias of East Garo Hills district ("Williamnagar district") - only with the word "district".
+
+- user: "SHGs in AC 36"
+  resolve:
+  - { text: "AC 36", type: constituency, canonical: Mawkyrwat, number: 36, matched_by: 2_alias }
+  sql: "SELECT COUNT(*) FROM curated.v_nrlm WHERE constituency_number_raw LIKE '36 %';"
+  expected: 1092
+
+- user: "SHGs in constituency 16"
+  resolve:
+  - { text: "constituency 16", type: constituency, status: not_found }
+  response: >
+    Number 16 is not in the NRLM data - numbers 16-19 and 51 hold no rural SHG (mostly
+    Shillong urban seats). Say so; do not return 0 as if it were a count.
+
+- user: "ewkh active shgs"
+  resolve:
+  - { text: ewkh, type: district, canonical: Eastern West Khasi Hills, lgd_code: 740, matched_by: 4_acronym }
+  - { text: active, type: shg_status, canonical: true }
+  sql: "SELECT COUNT(*) FROM curated.v_nrlm WHERE district_lgd_code = 740 AND is_active;"
+  expected: 1559
+
+- user: "SHGs in Mairang district"
+  resolve:
+  - { text: "Mairang district", type: district, canonical: Eastern West Khasi Hills, lgd_code: 740, matched_by: 2_alias }
+  expected: 1610
+  note: '"Mairang" alone is the BLOCK (1,069 SHGs). "Mairang district" is the alias of 740. The qualifier decides.'
+
+- user: "SHGs in Jowai district"
+  resolve:
+  - { text: "Jowai district", type: district, canonical: West Jaintia Hills, lgd_code: 275, matched_by: 2_alias }
+  expected: 4055
+  note: Jowai alone is a constituency (number 2, 327 SHGs).
+
+- user: "south west garo"
+  resolve:
+  - { text: south west garo, type: district, canonical: South West Garo Hills, lgd_code: 663, matched_by: 2_alias }
+  expected: 3491
+  note: Must not land on West Garo Hills (blocked pair) even though "west garo" is a substring.
+
+- user: "revitalised groups in North Garo Hills"
+  resolve:
+  - { text: revitalised groups, type: shg_type, canonical: Revived, matched_by: 2_alias }
+  - { text: North Garo Hills, type: district, canonical: North Garo Hills, lgd_code: 656 }
+  sql: "SELECT COUNT(*) FROM curated.v_nrlm WHERE shg_type = 'Revived' AND district_lgd_code = 656;"
+  expected: 253
+
+- user: "SGSY groups in East Garo Hills"
+  resolve:
+  - { text: SGSY groups, type: shg_type, canonical: Pre-Nrlm, matched_by: 2_alias, assumption: stated }
+  sql: "SELECT COUNT(*) FROM curated.v_nrlm WHERE shg_type = 'Pre-Nrlm' AND district_lgd_code = 273;"
+  expected: 116
+  note: State that SGSY-era groups were read as the Pre-NRLM type - the data has no SGSY flag.
+
+- user: "non-functional SHGs in Dadenggiri"
+  resolve:
+  - { text: non-functional, type: shg_status, canonical: false, matched_by: 2_alias }
+  - { text: Dadenggiri, type: block, canonical: Dadenggiri, lgd_code: 1963 }
+  expected: 81
+  note: Dadenggiri has the lowest active share of any block (84.66%).
+
+- user: "Dadenggre block"
+  resolve:
+  - { text: Dadenggre, type: block, canonical: Dadenggiri, lgd_code: 1963, matched_by: 2_alias, qualifier: block }
+  note: Dadenggre without "block" is the CONSTITUENCY (49, 1,028 SHGs); with "block" it is Dadenggiri (528). Spellings differ by one letter and the areas by 500 SHGs.
+
+- user: "SHGs formed in 2019-2020"
+  resolve:
+  - { text: "2019-2020", type: formation_year, canonical: '2019-20', matched_by: 3_squash }
+  expected: 10604
+
+- user: "groups formed in 1999-2000"
+  resolve:
+  - { text: "1999-2000", type: formation_year, canonical: '1999-00', matched_by: 3_squash }
+  expected: 8
+  note: The stored short form is '1999-00' - a naive 'YYYY-(YY+1)' formatter would produce '1999-100'.
+
+- user: "SHG 34950"
+  resolve:
+  - { text: "SHG 34950", type: shg_code, canonical: 34950 }
+  response: >
+    Green Hills Shg Msrls, Gumaijhora(Muslim), Demdema block, formed 2021-22, active,
+    10 members, RF Rs 15,000. Flag: is_possible_duplicate - SHG 36695 is identical
+    except for its code.
+
+- user: "Chibasal Shg in South Garo Hills"
+  resolve:
+  - { text: Chibasal Shg, type: shg_name, status: ambiguous, matches_statewide: 125 }
+  - { text: South Garo Hills, type: district, canonical: South Garo Hills, lgd_code: 277 }
+  response: "32 SHGs called Chibasal Shg are in South Garo Hills. Which block, or which SHG code?"
+  note: Scoping by district cut 125 candidates to 32 - still ambiguous, so ask again.
+
+- user: "Mahila Bhobisshot Ujjwala"
+  resolve:
+  - { text: Mahila Bhobisshot Ujjwala, type: shg_name, canonical: Mahila Bhobisshot Ujjwala, shg_code: 8666, matched_by: 1_exact }
+  note: Exactly one match, so resolve directly. The largest SHG in the State (38 members, Mawsynram).
+
+- user: "SHGs in Kyndong Tuber GP"
+  resolve:
+  - { text: Kyndong Tuber, type: gp_name, canonical: Kyndong Tuber, qualifier: GP }
+  note: >
+    With "GP" it is the gp_name. Without it, the squash stage maps it to the LGD village
+    Kyndongtuber (279247, Laskein, 92 SHGs, Rs 90.40 lakh CIF - the highest-CIF village in
+    the State). Prefer the village and mention the GP reading.
+
+- user: "how many groups in meghalaya"
+  resolve:
+  - { text: groups, type: measure, canonical: "COUNT(*)" }
+  - { text: meghalaya, type: region, canonical: whole_state }
+  expected: 40629
+
+- user: "how much aajeevika money in WJH"
+  resolve:
+  - { text: aajeevika, type: scheme, canonical: nrlm, matched_by: 2_alias }
+  - { text: money, type: measure, status: ambiguous }
+  - { text: WJH, type: district, canonical: West Jaintia Hills, lgd_code: 275, matched_by: 4_acronym }
+  response: "Which fund - Revolving Fund (Rs 5.67 crore) or CIF (Rs 18.89 crore)? Both are cumulative to date."
+
+maintenance:
+  source_files:
+  - datasets/NRLM/NRLM.csv                          # 40629 x 20
+  - datasets/NRLM/NRLM_Data_Readiness_Document.pdf  # client questionnaire, 8 pages
+  schema_authority: SCHEMA_FOR_DEVELOPERS.md         # live database extract, 2026-10-05
+  catalogue_generator: >
+    District, block, constituency and village-registry sections were generated by a
+    pandas script grouping NRLM.csv by LGD code. Re-run it on a new extract rather than
+    editing counts by hand.
+  row_counts_at_generation: { source_file: 40629, curated.v_nrlm: unverified_in_db }
+  data_span_in_source: { first_formation_year: '1984-85', last_formation_year: '2022-23' }
+  last_generated: '2026-10-05'
+
+  open_verification_tasks:
+    critical: true
+    note: >
+      v1.0 was written from structure and the source file. NOTHING below has been measured
+      against megh_db. Each item is a query to run before any NRLM answer ships.
+    tasks:
+    - "Row count: SELECT COUNT(*) FROM curated.v_nrlm - expect 40629."
+    - "dim_year coverage: do all 30 formation years resolve? See formation_year.dim_year_coverage_conflict."
+    - "Geography casing: confirm lgd_district and lgd_block are UPPERCASE, and that district 740 is stored as 'EASTERN WEST KHASI HILLS'."
+    - "Unresolved: SELECT COUNT(*) FROM curated.v_nrlm WHERE entity_type = 'Unresolved' - expect 2032."
+    - "Name-code conflict: confirm the 12 has_name_code_conflict rows show lgd_district = 'EAST JAINTIA HILLS'."
+    - "dim_scheme: read NRLM's scheme_code and money_unit."
+    - "Flags: count is_possible_duplicate (expect 10) and member_count_out_of_norm (expect 178)."
+
+  regeneration_rules:
+  - Re-profile NRLM.csv AND re-query megh_db. Diff every count here. Explain each change.
+  - The table is a SNAPSHOT - a new extract replaces it. Every count in this file can move.
+  - APPEND new canonical values and aliases. Never delete one - old questions must keep
+    resolving.
+  - Re-run the village ambiguity registry. If a name gains a code it must appear here.
+  - Re-check shg_code uniqueness. If it breaks, the grain has changed - stop.
+  - Re-check whether money gained a date column. If it did, the year-for-money refusal
+    must be lifted across all seven files.
+  - Bump resolver_version.
+  companion_files:
+  - Annotations/NRLM/nrlm_schema_partitions.yaml
+  - Annotations/NRLM/nrlm_classification_rules.yaml
+  - Annotations/NRLM/nrlm_foreign_key_augmentation.yaml
+  - SCHEMA_FOR_DEVELOPERS.md
+  - Annotations/NRLM/README.md

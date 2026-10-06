@@ -96,7 +96,11 @@ def test_the_reported_conversation(monkeypatch):
 
 def test_it_keeps_moving_on_and_continuations_follow_a_pick(monkeypatch):
     ask = _conversation(monkeypatch)
+    # One pick phrase per pickable programme: 5 until NRLM was onboarded
+    # (2026-10-06), 6 now. CM Elevate Legacy is not pickable on its own — it
+    # shares the CM-ELEVATE knowledge base with CM Elevate.
     order = [ask(q)["schemes"][0] for q in
-             ("pick any scheme", "pick another one", "one more", "next one", "another one")]
+             ("pick any scheme", "pick another one", "one more", "next one",
+              "another one", "pick another one")]
     assert order == p._pickable_schemes()                    # every programme once, in order
     assert ask("one more")["schemes"] == ["MGNREGA"]         # then cycles

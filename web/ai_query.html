@@ -468,6 +468,7 @@
   .scheme-card.unified-card { background: linear-gradient(135deg, #F0FDFA 0%, #D6F0EC 100%); }
   .scheme-card.elevate-card { background: linear-gradient(135deg, #FFFBEB 0%, #FBF0DE 100%); }
   .scheme-card.cmelevate-card { background: linear-gradient(135deg, #EFF6FF 0%, #DBEAFE 100%); }
+  .scheme-card.nrlm-card { background: linear-gradient(135deg, #FFF1F2 0%, #FFE4E6 100%); }
   .scheme-card-head { display: flex; align-items: center; gap: 10px; margin-bottom: 6px; }
   .scheme-card .ico {
     width: 36px; height: 36px; border-radius: 10px; display: flex;
@@ -477,6 +478,7 @@
   .unified-card .ico { background: var(--teal-bg); color: var(--teal); }
   .elevate-card .ico { background: var(--amber-bg); color: var(--amber); }
   .cmelevate-card .ico { background: var(--blue-bg); color: var(--blue); }
+  .nrlm-card .ico { background: #FFE4E6; color: #BE123C; }
   .scheme-card h3 { margin: 0; font-size: 15px; font-weight: 700; color: var(--ink); }
   .scheme-card .meta {
     font-size: 11.5px; color: var(--ink-3); font-weight: 500; line-height: 1.45;
@@ -1509,7 +1511,7 @@
           <div class="hero" id="hero">
             <div class="hero-eyebrow" id="heroEyebrow" style="display:none"></div>
             <h1 data-i18n="heroTitle">What would you like to know?</h1>
-            <p data-i18n="heroSub">Ask about Meghalaya's MGNREGA, PMAY-G, FOCUS+, CM Elevate, Focus Legacy and CM Elevate Legacy — data questions and how the schemes work.</p>
+            <p data-i18n="heroSub">Ask about Meghalaya's MGNREGA, PMAY-G, FOCUS+, CM Elevate, Focus Legacy, CM Elevate Legacy and NRLM — data questions and how the schemes work.</p>
           </div>
 
           <!-- SCHEME OVERVIEW (informational only — questions auto-route to the right scheme).
@@ -1608,6 +1610,20 @@
                 <div><div class="stat-val">₹82.90 Cr*</div><div class="stat-lbl">Disbursed (subsidy + loan)*</div></div>
               </div>
             </div>
+            <div data-scheme="nrlm" class="scheme-card nrlm-card">
+              <div class="scheme-card-head">
+                <div class="ico">🤝</div>
+                <div>
+                  <h3>NRLM</h3>
+                  <div class="meta">Self Help Group register (DAY-NRLM / Aajeevika, MSRLS) · one row per SHG · formation years 1984-85 to 2022-23 · funds are cumulative totals with no release date</div>
+                </div>
+              </div>
+              <div class="stats">
+                <div><div class="stat-val">40,629</div><div class="stat-lbl">Self Help Groups</div></div>
+                <div><div class="stat-val">4,10,847</div><div class="stat-lbl">Members</div></div>
+                <div><div class="stat-val">₹149.34 Cr*</div><div class="stat-lbl">RF + CIF received to date*</div></div>
+              </div>
+            </div>
             </div>
             <button class="carousel-arrow next" id="schemeArrowNext" type="button"
                     aria-label="Next schemes" aria-controls="schemeCards" onclick="scrollSchemes(1)">
@@ -1634,7 +1650,7 @@
     <div class="composer-wrap">
       <div class="composer-inner">
         <div class="composer">
-          <textarea class="composer-input" id="queryInput" rows="1" placeholder="Ask about MGNREGA, PMAY-G, FOCUS+, CM Elevate, Focus Legacy or CM Elevate Legacy — person-days, houses, disbursements, eligibility…" data-i18n-ph="composerPh"></textarea>
+          <textarea class="composer-input" id="queryInput" rows="1" placeholder="Ask about MGNREGA, PMAY-G, FOCUS+, CM Elevate, Focus Legacy, CM Elevate Legacy or NRLM — person-days, houses, disbursements, SHGs, eligibility…" data-i18n-ph="composerPh"></textarea>
           <div class="composer-bar">
             <button class="pill-btn mic-pill" id="micBtn" type="button" onclick="toggleMic()"
                     title="Speak your question" aria-label="Speak your question">
@@ -1802,7 +1818,7 @@ const PRODUCTS = {
   unified_auto: {
     label: 'Megh One AI',
     get base() { return API_BASE; },
-    greeting: "Khublei! Ask me anything about Meghalaya's MGNREGA, PMAY-G, FOCUS+, CM Elevate, Focus Legacy and CM Elevate Legacy data — person-days, wages and expenditure, houses sanctioned and completed, FOCUS+ disbursements, CM Elevate applications by scheme, by district, block or year.<br><br>I work out which scheme it's about (or compare across schemes) and answer with text and tables. I can also explain how the schemes work — eligibility, documents, components.",
+    greeting: "Khublei! Ask me anything about Meghalaya's MGNREGA, PMAY-G, FOCUS+, CM Elevate, Focus Legacy, CM Elevate Legacy and NRLM data — person-days, wages and expenditure, houses sanctioned and completed, FOCUS+ disbursements, CM Elevate applications by scheme, NRLM Self Help Groups and their members, by district, block or year.<br><br>I work out which scheme it's about (or compare across schemes) and answer with text and tables. I can also explain how the schemes work — eligibility, documents, components.",
     samples: [
       { ico:'📅', text:'Total MGNREGA person-days in 2023-24' },
       { ico:'💳', text:'Job cards issued in 2025-26' },
@@ -1855,9 +1871,9 @@ let currentLang = 'en';
 const UI_STRINGS = {
   en: {
     heroTitle:   "What would you like to know?",
-    heroSub:     "Ask about Meghalaya's MGNREGA, PMAY-G, FOCUS+, CM Elevate, Focus Legacy and CM Elevate Legacy — data questions and how the schemes work.",
+    heroSub:     "Ask about Meghalaya's MGNREGA, PMAY-G, FOCUS+, CM Elevate, Focus Legacy, CM Elevate Legacy and NRLM — data questions and how the schemes work.",
     promptsTitle:"Try a question",
-    composerPh:  "Ask about MGNREGA, PMAY-G, FOCUS+, CM Elevate, Focus Legacy or CM Elevate Legacy — person-days, houses, disbursements, eligibility…",
+    composerPh:  "Ask about MGNREGA, PMAY-G, FOCUS+, CM Elevate, Focus Legacy, CM Elevate Legacy or NRLM — person-days, houses, disbursements, SHGs, eligibility…",
     sendBtn:     "Send",
     micBtn:      "Speak",
     greeting:    null   // null → keep the product's own English greeting
@@ -1865,9 +1881,9 @@ const UI_STRINGS = {
   kha: {
     // TODO(translation): replace with Khasi copy.
     heroTitle:   "What would you like to know?",
-    heroSub:     "Ask about Meghalaya's MGNREGA, PMAY-G, FOCUS+, CM Elevate, Focus Legacy and CM Elevate Legacy — data questions and how the schemes work.",
+    heroSub:     "Ask about Meghalaya's MGNREGA, PMAY-G, FOCUS+, CM Elevate, Focus Legacy, CM Elevate Legacy and NRLM — data questions and how the schemes work.",
     promptsTitle:"Try a question",
-    composerPh:  "Ask about MGNREGA, PMAY-G, FOCUS+, CM Elevate, Focus Legacy or CM Elevate Legacy — person-days, houses, disbursements, eligibility…",
+    composerPh:  "Ask about MGNREGA, PMAY-G, FOCUS+, CM Elevate, Focus Legacy, CM Elevate Legacy or NRLM — person-days, houses, disbursements, SHGs, eligibility…",
     sendBtn:     "Send",
     micBtn:      "Speak",
     greeting:    null
@@ -1875,9 +1891,9 @@ const UI_STRINGS = {
   gar: {
     // TODO(translation): replace with Garo copy.
     heroTitle:   "What would you like to know?",
-    heroSub:     "Ask about Meghalaya's MGNREGA, PMAY-G, FOCUS+, CM Elevate, Focus Legacy and CM Elevate Legacy — data questions and how the schemes work.",
+    heroSub:     "Ask about Meghalaya's MGNREGA, PMAY-G, FOCUS+, CM Elevate, Focus Legacy, CM Elevate Legacy and NRLM — data questions and how the schemes work.",
     promptsTitle:"Try a question",
-    composerPh:  "Ask about MGNREGA, PMAY-G, FOCUS+, CM Elevate, Focus Legacy or CM Elevate Legacy — person-days, houses, disbursements, eligibility…",
+    composerPh:  "Ask about MGNREGA, PMAY-G, FOCUS+, CM Elevate, Focus Legacy, CM Elevate Legacy or NRLM — person-days, houses, disbursements, SHGs, eligibility…",
     sendBtn:     "Send",
     micBtn:      "Speak",
     greeting:    null
@@ -2475,6 +2491,8 @@ function prettyName(s) {
     .replace(/fact_focus_plus_/gi, 'FOCUS+ ')
     .replace(/v_focus_plus/gi, 'FOCUS+ disbursements')
     .replace(/v_cm_elevate_disbursement/gi, 'CM Elevate Legacy')
+    .replace(/fact_nrlm_shg/gi, 'NRLM SHG register')
+    .replace(/v_nrlm/gi, 'NRLM Self Help Groups')
     .replace(/focus_plus/gi, 'FOCUS+')
     .replace(/^v_/i, '')
     .replace(/mgnrega/gi, 'MGNREGA')
@@ -2672,7 +2690,8 @@ function buildFollowUp(question, response) {
       if (pretty && !seen.includes(pretty)) seen.push(pretty);
     }
     // Keep only real scheme tables (drop subquery aliases that slipped through).
-    const schemes = seen.filter(n => ['FOCUS+', 'Focus', 'CM Elevate', 'CM Elevate Legacy'].includes(n));
+    const schemes = seen.filter(n => ['FOCUS+', 'Focus', 'CM Elevate', 'CM Elevate Legacy',
+                                      'NRLM Self Help Groups', 'NRLM SHG register'].includes(n));
     tableChip = (schemes.length ? schemes : seen).join(', ');
   }
   const groupMatch = sql.match(/group\s+by\s+([a-z0-9_.,\s"]+?)(?:order\s+by|limit|having|$)/i);
@@ -3437,6 +3456,21 @@ const CARD_QUESTIONS = {
       { ico:'🏦', text:'CM Elevate Legacy loans by lender' },
       { ico:'📅', text:'CM Elevate Legacy records by financial year' },
       { ico:'📈', text:'How much of the sanctioned amount has been disbursed under CM Elevate Legacy?' }
+    ]
+  },
+  nrlm: {
+    product: 'nrlm',
+    title: 'Try an NRLM (Self Help Group) question',
+    // No money-by-year chip on purpose: NRLM's RF and CIF are cumulative totals
+    // with no release date, so "RF in FY 2021-22" is the one question this
+    // scheme must refuse. The year chip is a FORMATION-count chip.
+    items: [
+      { ico:'🤝', text:'How many NRLM Self Help Groups are there in Meghalaya?' },
+      { ico:'👥', text:'NRLM SHGs and members by district' },
+      { ico:'📅', text:'How many SHGs were formed in each financial year?' },
+      { ico:'💰', text:'What Revolving Fund and CIF have SHGs received to date, by district?' },
+      { ico:'✅', text:'How many SHGs are active and how many inactive?' },
+      { ico:'📊', text:'How many SHGs are there of each type — New, Revived and Pre-NRLM?' }
     ]
   },
   cross_scheme: {

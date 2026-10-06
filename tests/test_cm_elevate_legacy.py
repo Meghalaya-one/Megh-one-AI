@@ -329,7 +329,10 @@ def test_scheme_listing_shows_cm_elevate_once_and_counts_correctly():
     ans = p._scheme_listing_answer("what schemes do you have?")["answer"]
     bullets = [line for line in ans.splitlines() if line.startswith("- **")]
     assert ans.startswith(f"I cover {p._count_word(len(bullets))} ")
-    assert len(bullets) == 5
+    # 5 programmes until NRLM was onboarded (2026-10-06), 6 now. CM Elevate and
+    # CM Elevate Legacy still collapse to ONE bullet (the point of this test), so
+    # 7 schemes list as 6 programmes.
+    assert len(bullets) == 6
     assert not any(b.startswith("- **CM Elevate Legacy**") for b in bullets)
     cm = next(b for b in bullets if b.startswith("- **CM Elevate**"))
     assert "CM Elevate Legacy" in cm and "applications" in cm

@@ -489,7 +489,8 @@ def test_follow_up_answers_only_what_the_user_typed():
 def test_result_table_holds_only_the_asked_figures():
     r = row("SELSELLA", "SELSELLA", 5028, 653640000, 647401500, completed=4457, st_roof_cast=412)
     spec = p._pmay_facts_query("How many PMAY beneficiaries are there in Selsella block?", PM, {"block": "SELSELLA"})
-    assert p._pmay_display_rows(spec, [r]) == [{"block": "Selsella", "houses": 5028}]
+    # a beneficiary question's column is "beneficiaries" (every record, KI-127)
+    assert p._pmay_display_rows(spec, [r]) == [{"block": "Selsella", "beneficiaries": 5028}]
     spec = p._pmay_facts_query("Give me the PMAY financial summary for Selsella block.", PM, {"block": "SELSELLA"})
     assert list(p._pmay_display_rows(spec, [r])[0]) == ["block", "sanctioned amount (Rs)", "amount released (Rs)",
                                                         "still to be released (Rs)"]
@@ -504,4 +505,21 @@ def test_calendar_year_zero_is_a_genuine_zero():
     spec = p._pmay_facts_query("How many PMAY houses were sanctioned in Ri Bhoi during 2016?", PM,
                                {"district": "RI BHOI"}, calendar_year=2016)
     assert "No PMAY-G houses were sanctioned" in p._pmay_facts_answer(spec, [])
+
+
+# ---------------------------------------------------------------- KI-127 decided 2026-10-03: beneficiaries = every record
+def test_beneficiaries_include_zero_sanction_records():
+    spec = p._pmay_facts_query("How many PMAY beneficiaries are there in LASKEIN block across all financial years", PM,
+                               {"block": "LASKEIN"})
+    assert spec["all_beneficiaries"] and "NOT is_placeholder" not in spec["sql"].split("WHERE")[-1].split("GROUP")[0]
+    r = row("LASKEIN", "LASKEIN", 5232, 1, 1, beneficiaries=5251)
+    ans = p._pmay_facts_answer(spec, [r])
+    assert ans.endswith(": 5,251.") and p._pmay_display_rows(spec, [r]) == [{"block": "Laskein", "beneficiaries": 5251}]
+
+
+def test_other_figures_keep_excluding_zero_sanction_records():
+    spec = p._pmay_facts_query("How many PMAY houses have been completed in Laskein block?", PM, {"block": "LASKEIN"})
+    assert not spec["all_beneficiaries"] and "WHERE NOT is_placeholder" in spec["sql"]
+    spec = p._pmay_facts_query("How many PMAY beneficiaries are there in Laskein block?", PM, {"block": "LASKEIN"})
+    assert "COUNT(*) FILTER (WHERE NOT is_placeholder AND " in spec["sql"]       # e.g. full_release, stages
 

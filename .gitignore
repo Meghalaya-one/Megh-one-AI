@@ -27,3 +27,10 @@ NeuralAiGovernanceProject*.zip
 
 # Reference material and rotated-secret backups — never part of a deploy.
 archive/
+
+# Raw scheme source extracts and QA spreadsheets dropped at the repo root.
+# Several contain unmasked beneficiary names, mobile numbers, bank account
+# numbers and IFSC codes (see KNOWN_ISSUES KI-022). Never commit raw source.
+/*.csv
+/*.xlsx
+!/Use_Cases_-_Focus.csv

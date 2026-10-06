@@ -100,6 +100,10 @@ _SCHEME_DOC_NAMES = {
                           "shares the programme's reference material with CM Elevate"),
     "MGNREGA": ("MGNREGA", "MGNREGA"),
     "PMAY-G": ("PMAY-G", "PMAY-G / PMAY-Gramin"),
+    # The docs open as "NRLM (DAY-NRLM ...)" and use NRLM, DAY-NRLM and
+    # Aajeevika interchangeably, so the composer is told all three are one name.
+    "NRLM": ("NRLM", "NRLM / DAY-NRLM / Aajeevika, the National Rural Livelihoods "
+             "Mission, run in Meghalaya by MSRLS"),
 }
 
 

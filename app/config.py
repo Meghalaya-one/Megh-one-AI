@@ -255,9 +255,10 @@ class Settings(BaseSettings):
     # 2024-25" came back as "twenty twenty four twenty five".
     ASR_PROMPT: str = (
         "Questions about Meghalaya government schemes (MGNREGA, PMAY-G, Focus Plus, "
-        "Focus Legacy, CM Elevate, CM Elevate Legacy), with numbers written as digits, "
-        "e.g. FY 2023-24, 2024-25, top 5, Rs 10,000. Beneficiaries, producer groups "
-        "(PGs), disbursement, sanctioned, person-days. Districts: East Khasi Hills, "
+        "Focus Legacy, CM Elevate, CM Elevate Legacy, NRLM), with numbers written as "
+        "digits, e.g. FY 2023-24, 2024-25, top 5, Rs 10,000. Beneficiaries, producer "
+        "groups (PGs), disbursement, sanctioned, person-days, Self Help Groups (SHGs), "
+        "Revolving Fund, CIF. Districts: East Khasi Hills, "
         "West Khasi Hills, South West Khasi Hills, Eastern West Khasi Hills, Ri Bhoi, "
         "East Jaintia Hills, West Jaintia Hills, East Garo Hills, West Garo Hills, "
         "North Garo Hills, South Garo Hills, South West Garo Hills."

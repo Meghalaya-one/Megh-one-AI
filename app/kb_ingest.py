@@ -44,6 +44,9 @@ _SOURCES = [
     # paths still match what the SMEs handed over.
     ("reference/FOCUS_legacy_Complete_Reference.md", "Focus Legacy"),
     ("reference/FOCUS_LEGACY_FAQ.md", "Focus Legacy"),
+    # NRLM, delivered with this casing like the Focus Legacy pair above.
+    ("reference/NRLM_Complete_Reference.md", "NRLM"),
+    ("reference/NRLM_FAQ.md", "NRLM"),
 ]
 
 # Scraped encyclopedic / official background, dropped into data/web/*.md by
@@ -78,6 +81,12 @@ _CANONICAL_SCHEME = {
     "cm elevate legacy": "CM Elevate", "cmelevate legacy": "CM Elevate",
     "cmelevatelegacy": "CM Elevate", "cm-elevate legacy": "CM Elevate",
     "cm elevate disbursement": "CM Elevate",
+    # NRLM has its OWN knowledge base (unlike CM Elevate Legacy, which folds into
+    # CM Elevate): it is a separate programme, not a second dataset of one.
+    "nrlm": "NRLM", "day-nrlm": "NRLM", "day nrlm": "NRLM", "aajeevika": "NRLM",
+    "ajeevika": "NRLM", "msrls": "NRLM",
+    "national rural livelihoods mission": "NRLM",
+    "national rural livelihood mission": "NRLM",
 }
 
 
@@ -114,6 +123,11 @@ def _web_sources() -> list[tuple[str, str]]:
                 # share one knowledge base (see _CANONICAL_SCHEME).
                 elif "ELEVATE" in name:
                     raw = "CM Elevate"
+                # Before "LEGACY"/"FOCUS": nothing in an NRLM filename collides,
+                # but keeping it above the generic Focus fallbacks means a future
+                # "NRLM_legacy_*.md" cannot be mis-filed as Focus Legacy.
+                elif "NRLM" in name or "AAJEEVIKA" in name or "AJEEVIKA" in name:
+                    raw = "NRLM"
                 elif "LEGACY" in name:
                     raw = "Focus Legacy"
                 elif "FOCUS" in name:

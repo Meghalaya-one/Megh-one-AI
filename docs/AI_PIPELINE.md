@@ -126,6 +126,9 @@ In order:
     out-of-area test (`_mask_group_name`, KI-152), so "Rakkam China Banana Group" is not refused.
   - Resolution, explicit "X village": the whole `_VILLAGE_PHRASE_RE` phrase from the text
     replaces an extractor fragment when the DB holds it exactly (KI-153; all village schemes).
+  - Focus Legacy "duplicate producer groups" (= paid more than once, D-032, confirmed 2026-10-07) is answered right after `resolve_entities` by `_focus_legacy_duplicate_groups_answer`
+    (deterministic; district / block / village / year filters; skipped when a constituency or other filter is
+    attached, which then gets the D-032 composer note) (KI-187).
   - Focus Legacy id/name-only group lists are written by `_focus_legacy_group_list_answer`
     (KI-154, D-031).
   - Village-disambiguation chips are pinned for Focus Legacy too (`_mgnrega_village_chip_pin`,
@@ -348,6 +351,10 @@ retry, then the deterministic answer.
   details. For a rewritten follow-up, `_run_pipeline` sets `_PMAY_TYPED_TURN` to the typed text and
   `_pmay_facts_query` keeps only the figures the user typed when they are a subset of the rewrite's (a typed
   follow-up with no figure, e.g. 'and in East Khasi Hills?', keeps the rewrite's).
+- **Beneficiaries = every record (KI-127, 2026-10-03):** for a question that says "beneficiaries" and asks the
+  count, `_pmay_facts_query` drops `NOT is_placeholder` from WHERE and puts it into every other column
+  (`_P` / `_PF`), adding `COUNT(*) AS beneficiaries`; `_pmay_head` picks that count for the answer, the
+  comparison and the result table. All other questions keep the exact previous SQL.
 - **Result table (KI-129):** the facts path returns `_pmay_display_rows` (place + asked figures, readable
   column names) as `rows` / `data`, not its 30-column working row.
 
@@ -469,7 +476,34 @@ steps in order.
     `data_verified = '…'` in the WHERE moves that test into `COUNT(*) FILTER (…)`, so sectors
     with 0 stay listed.
   - `_cm_elevate_level_pending`: "pending at level N" drops an AND-ed `data_verified = 'On
-    Hold'` when `current_level` is filtered.
+    Hold'` when `current_level` is filtered, and (KI-186, decided 2026-10-05) wraps every
+    `current_level = 'levelN'` test as `(… AND scheme_specific ->> 'file_status' = 'Pending')`,
+    in the WHERE or inside a COUNT FILTER. An explicit "on hold" in the question is left alone.
+  - `_cm_elevate_unique_applications` (KI-186): an explicit "unique / distinct applications"
+    turns `COUNT(*)` into `COUNT(DISTINCT request_id)`. Plain "applications" stays the row count.
+  - `_cm_elevate_case_safe_literals` (KI-186, runs before `_uppercase_geo_literals`):
+    - `LOWER(lgd_district) = 'NORTH GARO HILLS'` (never matches) becomes `lgd_district = …`;
+    - `current_level = 'level 1'` / `'Level-1'` becomes `LOWER(current_level) = 'level1'`.
+
+    Live, the first caused 3 "couldn't build a working query" answers (the verifier rejected
+    every attempt), and the second caused a false 0 against 1,624.
+  - Verifier false positive (KI-186). With the new `file_status` test beside
+    `LOWER(current_level)`, the 4B verifier claimed on every attempt that the SQL "uses
+    LOWER(lgd_district)", although it held `lgd_district = 'NORTH GARO HILLS'` verbatim.
+    `_verifier_scheme_specific_complaint_is_false` now discards a check-2 complaint that names a
+    place when all of these hold:
+    - every resolved entity is a place;
+    - each place is filtered as plain `column = 'VALUE'`, with no LOWER or UPPER;
+    - every programme literal is an exact programme name.
+
+    A misspelt programme still raises.
+  - `_cm_elevate_plain_pending_file_status` (KI-186 regression, 2026-10-05). After the level rule
+    was added to the prompt, "Which programmes have the highest number of pending applications?"
+    came back 4 times in 6 filtered on `current_file_status LIKE 'sendback%'`. With the old
+    prompt it was 6 of 6 On Hold. The prompt wording that named current_file_status beside
+    "pending" was removed. In addition, a plain "pending" question (no level, stage, status,
+    sent-back or on-hold word) has a WHERE conjunct that tests only `current_file_status`
+    swapped back to `data_verified = 'On Hold'`. A test mixed with other columns is left alone.
   - `_cm_elevate_pending_without_level`: a plain "pending" (no level or stage named) that was
     filtered on `current_level = 'levelN'` is swapped back to `data_verified = 'On Hold'`.
   - `_cm_elevate_decision_status_column`: `current_file_status = 'approved' / 'rejected' /
@@ -656,6 +690,8 @@ dropped from the extracted village name when only the bare name is a stored vill
      - On failure → **one strict retry (9B)** → then `_deterministic_answer`.
    - **Hedge guard:** if the answer hedges ("not covered", "no data") over a real non-zero value
      → `_deterministic_answer` or `_deterministic_list_answer`.
+     Sentences naming a financial year that the resolver's year-gap note marks as absent are set
+     aside before this check (KI-183): "no data for FY 2023-24" restates the gap, it is not a hedge.
 3. **Post-composition guarantees:**
    - Focus Legacy (2026-09-29): `_focus_legacy_answer_guarantees` — month numbers become month
      names in the right calendar year of the FY (`_focus_legacy_month_labels`), money cells and
@@ -700,7 +736,38 @@ dropped from the extracted village name when only the bare name is a stored vill
         "Total N". A "which is highest" answer naming its top few is left alone.
      4. `_cme_multi_scheme_total`: SQL with a `scheme_name IN (…)` list gets any missing
         programme figure plus "Combined across these N programmes". The sum is exact because
-        `request_id` never repeats across programmes.
+        `request_id` never repeats across programmes. **KI-182 (2026-10-05):** a programme
+        named in the `IN (…)` list that has no row is a true 0 and is stated as
+        "<programme>: 0 (none recorded)" (helper `_cme_requested_zero_programmes`). This now
+        runs on a one-row result too. When the only other filters are places and at most one
+        status the wording can name (On Hold, Valid, level 0-2), `_cme_zero_breakdown_answer`
+        rebuilds the whole answer (user screenshot 2026-10-05: the appended line read as a stub):
+        "There are 2 applicants in West Garo Hills across the 2 programmes you asked about:", then
+        one line per programme in the question's order (the 0 one as "0 — no applicants recorded
+        in West Garo Hills"), then where the applicants are. Any other filter keeps the appended
+        line, so no filter is ever dropped from the wording. A 0 counts as already stated only when a sentence names
+        that programme with 0 / "zero" / "none" / "no applicants"; "no separate count
+        provided" does not count. The 0 is filled only when absence provably means 0:
+        - one plain SELECT, with no JOIN, WITH, HAVING or OR;
+        - the figures are COUNTs (no SUM, AVG, MIN, MAX, ROUND or division);
+        - no LIMIT smaller than the number of programmes asked;
+        - every `IN` literal is an exact programme name (`_CME_PROGRAMME_WORDS`). A misspelt
+          literal also returns no row, and that is not a 0.
+
+        When every named programme is 0 the result is EMPTY. `compose_response` (CM Elevate
+        only) then calls `_cme_zero_programmes_answer` before `_no_data_answer`, which answers
+        "There are no applicants under the A or the B in <place> — the data records 0 for each."
+        It does this only when:
+        - every programme literal is exact;
+        - the figure is a plain COUNT;
+        - GROUP BY is on scheme_name only (or absent);
+        - the only other filters are place equalities (lgd_district, lgd_block,
+          lgd_village_name, village_code; LOWER/UPPER/ILIKE allowed), plus `entity_type <> 'Unresolved'`;
+        - the app's own parameter-bound `SELECT 1 … LIMIT 1` confirms that place exists in
+          `v_cm_elevate`. The identifiers come from a whitelist.
+
+        Anything else (a misspelt place, a status or level filter, any other scheme) keeps
+        "couldn't find any matching records" (2026-10-05).
      5. `_cme_comparison`: a compare cue on a programme × place result gets "Differences: …
         higher by D (a vs b)" per programme and per place. A one-label two-row result reuses
         `_fp_comparison`.

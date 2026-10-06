@@ -42,6 +42,9 @@ _SCHEME_DIRS = {
     "CM Elevate": _DATA_PART / "cm_elevate",
     "Focus Legacy": _DATA_PART / "focus_legacy",
     "CM Elevate Legacy": _DATA_PART / "cm_elevate_legacy",
+    # The folder is upper-case "NRLM" on disk, unlike the six lower-case scheme
+    # folders beside it — the SME layer was delivered that way; do not rename it.
+    "NRLM": _DATA_PART / "NRLM",
 }
 _FEW_SHOT_FILE = {
     "MGNREGA": "few_shot.yaml",
@@ -53,6 +56,9 @@ _FEW_SHOT_FILE = {
     # cmelevatelegacy_few_shot.yaml beside it — v1 marks refusals
     # `status: REFUSED`, which this loader does not treat as a negative example.
     "CM Elevate Legacy": "cmelevatelegacy_prompt_few_shots.yaml",
+    # NRLM ships one bank only (v1.1, 103 validated pairs). There is no
+    # *_prompt_few_shots.yaml beside it, so no v1/v2 choice to get wrong.
+    "NRLM": "nrlm_few_shot.yaml",
 }
 _FK_FILE = {
     "MGNREGA": "foreign_key_augmentation.yaml",
@@ -61,6 +67,7 @@ _FK_FILE = {
     "CM Elevate": "cmelevate_foreign_key_augmentation.yaml",
     "Focus Legacy": "focuslegacy_foreign_key_augmentation.yaml",
     "CM Elevate Legacy": "cmelevatelegacy_foreign_key_augmentation.yaml",
+    "NRLM": "nrlm_foreign_key_augmentation.yaml",
 }
 
 _few_shot_cache: dict[str, list[dict]] = {}
