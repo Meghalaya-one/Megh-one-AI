@@ -50,7 +50,7 @@ and `maybe_update_summary`, all best-effort. The order matters: many steps exist
 | # | Step | Function(s) | Model? | Returns early with |
 |---|---|---|---|---|
 | a | Spelling fix of scheme names | `_correct_scheme_spelling` | – | – |
-| b | Pin bare "CM Elevate" to a dataset | `_pin_cm_elevate_dataset` | – | – |
+| b | Pin bare "CM Elevate" to a dataset (an all-years scope — "across all financial years", the year chip's "All financial years combined" — is not a Legacy cue since 2026-10-10, KI-225; a specific FY, "each financial year" and money words still pin) | `_pin_cm_elevate_dataset`, `_ALL_FINANCIAL_YEARS_SCOPE` | – | – |
 | c | **Resume a paused clarification**: merge `"<paused q>, <reply>"` unless the reply is a chip (full question), conversational, or a new question (`_reply_abandons_scope_pause`) | reads `session.pending_scope_q` | – | – |
 | c' | **Resume a scheme pause** (`SCHEME_PAUSE_RULES`): a typed scheme name becomes that chip's question; anything else passes through unchanged (§5.2) | `_resume_scheme_pause`, reads `pending_scope_rule/options` | – | – |
 | c'' | **Continuation gate** (2026-09-29, KI-130): does the message share anything with the previous turn? `has_context` = antecedent AND a signal (or a pause resume). Without one: edge whitelist applies, no rewrite, no KNOWLEDGE scheme fallback (§5.7) | `context_policy.continuation_signals` | – | – |
@@ -101,8 +101,22 @@ near-miss pause uses `entity-ambiguous`.
 In order:
 1. `_unsupported_scheme_named` → a clarification naming the scheme we don't hold.
 2. `_wants_cross_scheme_money_ranking` → `_cross_scheme_money_answer`: deterministic SQL across
-   every money-bearing scheme. **Returns.**
-3. `_is_ambiguous_focus` → the "which Focus?" two-way ask.
+   every money-bearing scheme. **Returns.** Since 2026-10-10 only when the question names fewer than two
+   schemes; "which scheme has a higher …: A or B?" goes to step 2a restricted to A and B (KI-214 added
+   "financial assistance / support" and "higher / lower" to its vocabulary).
+2a. `_cross_scheme_compare_plan` → `_cross_scheme_compare_data` (D-034, 2026-10-10): a comparison across
+   schemes (two or more named, not only MGNREGA + PMAY-G, or "each scheme" / "across the schemes" /
+   "which scheme") about beneficiaries, money, coverage, performance or a summary, with no specific year and
+   no single-scheme measure. Resolves the place (`resolve_entities`; a hill range expands to its districts,
+   never a pause), then `_cross_scheme_compare_answer` runs one parameter-bound query per scheme and
+   measure — statewide, a district, a district list or one block, optionally per district — and writes the
+   answer from the rows: each scheme's own figure and unit, never a combined total, CM Elevate money "not
+   recorded", the leader when asked, each scheme's data years. **Returns**, before the scheme / scope / year
+   pauses — or None (a village, constituency, year, tranche or sub-scheme resolved) and the path continues
+   unchanged. `classify_intent` returns DATA for the same questions (KI-222).
+3. `_is_ambiguous_focus` → the "which Focus?" two-way ask. Since 2026-10-10 (D-033) a bare "Focus" is
+   rewritten to "Focus Legacy" by `_pin_bare_focus` at the top of `_run_pipeline` (and after a typed
+   chip resume or a follow-up rewrite), so this ask no longer fires for it.
 4. `_needs_scheme_clarification` (`SCHEME_CLARIFY_ENABLED`) → the which-scheme chips.
 5. `_needs_topn_clarification` (`TOPN_CLARIFY_ENABLED`) → the Top 3/5/10/all chips.
 
@@ -366,7 +380,9 @@ retry, then the deterministic answer.
    year. It is skipped on a resume.
 4. **Year gate:** `_needs_year_clarification` fires when the place is fixed but the year isn't.
    The chips come from `_SCHEME_DATA_YEARS`, which `refresh_scheme_years` refreshes from the DB
-   at startup.
+   at startup. When the schemes hold different years, the message states each scheme's own years
+   (`_scheme_years_text`) and warns that a single year compares only the schemes that have it — it used
+   to claim the union of years for all of them (KI-219, 2026-10-10). The chips are unchanged.
 5. **Tranche gate:** `_needs_tranche_clarification` (Focus Plus only).
 6. **Tranche conflict:** `_person_level_tranche_conflict` (Focus Plus; person-level columns exist
    only on Tranch 4) → a deterministic explanation.
@@ -541,6 +557,7 @@ instruction:
 |---|---|
 | `_focusplus_stated_amount_missing` (Focus Plus, KI-132, 2026-09-29) | a stated payment amount ("a loan of five thousand", "₹2,500 payments") with no `amount_disbursed = N` filter |
 | `_resolved_scope_missing` (all schemes, KI-034, 2026-09-29) | a resolved district / block / comparison list / year_key absent from the SQL. Not required: geography beside a resolved village_code, a hill-range expansion, a year for CM Elevate or an all-years question; LIKE on the distinctive word counts |
+| `_cross_scheme_sql_issue` (two or more schemes, 2026-10-10) | `v_cross_scheme_money_district_year` filtered on a scheme_code other than 'MGNREGA'/'PMAY' (KI-218); a constant 0 / NULL CM Elevate amount (KI-220); `COUNT(*)` on v_focus_plus as "beneficiaries" (KI-213); a UNION / subquery part reading a scheme view with no aggregate beside aggregated ones, `SELECT DISTINCT` key lists exempt (KI-223); a resolved district / block missing from any one scheme's part (KI-227). Parts are found by `_scheme_read_segments` (scalar subqueries such as MGNREGA's `MAX(year_key)` are not parts) |
 | `_mgnrega_village_filter_missing` (MGNREGA, KI-054) | a village was resolved but the SQL filters no village (it would return a block or statewide total) |
 | `_mgnrega_village_list_issue` (MGNREGA, KI-045) | "which villages …" SQL with no `lgd_village_name`, or "received employment" without `HAVING SUM(persons_employed) > 0` |
 | `_mgnrega_comparison_without_figures` (MGNREGA, KI-047; checked on the result, after execution) | a comparison ("more on wages or materials?") whose rows hold no number, only a CASE label |
@@ -566,6 +583,9 @@ instruction:
   - `_verifier_wants_suppressed_geography`
   - `_verifier_check2_on_empty_entities`
   - `_verifier_join_complaint_is_false`
+  - `_verifier_join_complaint_on_aggregates` (2026-10-10, KI-221): a "prohibited join" complaint when
+    every outer FROM / JOIN operand is a subquery that already aggregates — the FAMILY C shape
+    `schema_context.py` prescribes for one figure per scheme. A raw view on either side keeps it.
   - `_verifier_scheme_specific_complaint_is_false` (CM Elevate, 2026-09-27): the 4B model said
     `v_cm_elevate` has no `scheme_specific` column. The complaint is discarded when the SQL reads
     only the live-verified keys (`file_status`, `sector_id`, `gender_id`, `occupation_id`).
@@ -665,6 +685,16 @@ dropped from the extracted village name when only the bare name is a stored vill
      - `_answer_numbers_faithful`: every number stated must appear in the result or the digest,
        within 0.5% tolerance;
      - `_answer_covers_metrics`: a single row must have every metric reported.
+     - `_range_claim_misstated` (2026-10-10, KI-226): a "ranging from A to B" / "counts between A and
+       B" claim must be the min and max of the rows it is about (rows sharing a label that hold both
+       numbers). Subset wording ("the remaining districts"), change wording ("rose from") and year
+       pairs are left alone. Otherwise → `_deterministic_answer`.
+     - `_cross_unit_total_stated` (2026-10-10, KI-220): a "total / combined / together" number equal
+       to the sum of two or more schemes' figures, when a scheme other than MGNREGA / PMAY-G is in the
+       comparison → `_cross_scheme_side_by_side` (each scheme's figure and measure, not added; KI-229),
+       else `_deterministic_answer`.
+     - `_cm_elevate_no_money_note` (last, after the hedge check, KI-229): a money question naming CM
+       Elevate whose result has no CM Elevate row says it has no figure (no payment data).
      - MGNREGA empty and zero results (KI-056): `_mgnrega_empty_answer` handles an all-NULL
        single row. A parameter-bound row count decides the wording:
        - "No MGNREGA … is recorded for X" when nothing matched;
@@ -936,7 +966,7 @@ Previously a typed "Focus Plus" was answered as a new question and the paused as
 **2026-09-29 (KI-181): every chip pause resumes from a typed reply. VERIFIED live.**
 - Three pause families now. `SCOPE_MERGE_RULES` (scope / year / entity / ranking count): the
   free-text reply is merged into the paused question, unchanged. `SCHEME_PAUSE_RULES`: as above.
-  **Any other rule that offers options** (`swap-measure-unavailable`, `year-out-of-range`,
+  **Any other rule that offers options** (`swap-measure-unavailable`, `measure-unavailable`, `year-out-of-range`,
   `tranche-not-specified`, `region-needs-district`, `ac-narrow-scope`,
   `sericulture-spelling-ambiguous`, `cm-scheme-group-ambiguous`, `amount-not-held`,
   `village-or-outside-place`, `no-time-dimension`, `scheme-comparison-not-specified`, …): the
@@ -1218,6 +1248,20 @@ all financial years" means the **same operation on another scheme**.
   for the same scope (`_swap_scope_phrase`: state place + FY / all years; CM Elevate gets no
   year). Money and counts exist in every scheme and are left to the generator. Since KI-181 the pause is remembered (§5.2): a typed "houses sanctioned" or "the second one"
   resumes the chip.
+- `_measure_gap_answer(question, schemes)` (2026-10-10, KI-231), called in `_answer_data` right after
+  `classify_scheme` and before `resolve_entities` or any model call: the DIRECT form of the same gap.
+  A question that names exactly one scheme (`_named_schemes`, so a classifier guess never fires it) and
+  asks it for a measure another scheme owns (`_SCHEME_OWN_MEASURES`; "self-employment" is masked first)
+  raises `ClarificationNeeded(rule="measure-unavailable")`: "CM Elevate doesn't record person-days —
+  only MGNREGA does, so there is no person-days figure for CM Elevate for all of Meghalaya". Chips: first
+  the same question under the owner scheme (the user's words with the scheme name swapped, spoken lead-ins
+  such as "So" dropped; `_MEASURE_OWNER_OFFERS` when a fuzzy-spelled name cannot be swapped), then the
+  named scheme's `_SCHEME_HEADLINE_OFFERS` for the scope read deterministically from the question
+  (`_measure_gap_scope_phrase`: catalogued block or district via `entity_resolver.named_places`, a typed
+  year via `_parse_year_key`, "in Meghalaya" as "for all of Meghalaya"; CM Elevate gets no year).
+  Comparisons between schemes keep the D-034 path (two schemes named). Before this the generator
+  wrote four queries for a column the scheme does not have and the user got "couldn't build a working
+  query". Remembered like every chip pause (§5.2), so a typed "applications" or "the first one" resumes it.
 
 ---
 

@@ -840,3 +840,27 @@ def test_duplicate_groups_answer_leaves_other_shapes_to_the_model(monkeypatch):
     assert asyncio.run(p._focus_legacy_duplicate_groups_answer("Are there duplicate payments?", {}, {})) is None
     assert asyncio.run(p._focus_legacy_duplicate_groups_answer(
         "Are there duplicate producer groups in Songsak constituency?", {"assembly_constituency": "SONGSAK"}, {})) is None
+
+
+# ── 2026-10-10: a bare "Focus" is Focus Legacy (D-033) ────────────────────────
+@pytest.mark.parametrize("q,expected", [
+    ("What is focus?", "What is Focus Legacy?"),
+    ("How many beneficiaries under FOCUS scheme?", "How many beneficiaries under Focus Legacy scheme?"),
+    ("Total focus disbursement in 2024-25", "Total Focus Legacy disbursement in 2024-25"),
+    ("Compare Focus+ and FOCUS beneficiaries", "Compare Focus+ and Focus Legacy beneficiaries"),
+    ("focus plus vs focus", "focus plus vs Focus Legacy"),
+])
+def test_bare_focus_is_pinned_to_focus_legacy(q, expected):
+    assert p._pin_bare_focus(q) == expected
+
+
+@pytest.mark.parametrize("q", [
+    "Focus Plus beneficiaries in 2025-26", "FOCUS+ farmers", "Focus Legacy producer groups", "old focus groups",
+    "What is the main focus of PMAY-G?", "MGNREGA focuses on women", "How many members are there in Focus Bibari?",
+])
+def test_other_focus_mentions_are_left_alone(q):
+    assert p._pin_bare_focus(q) == q
+
+
+def test_pinned_question_no_longer_asks_which_focus():
+    assert not p._is_ambiguous_focus(p._pin_bare_focus("How many beneficiaries under FOCUS?"))

@@ -1,13 +1,299 @@
 # Current State
 
-**Last updated:** 2026-10-06, by the Focus Legacy duplicate-groups session (KI-187, D-032 confirmed 2026-10-07 = paid more than once; code changed, uncommitted). Earlier the same day: by the CM Elevate OFF-009 all-pairs re-test and KI-182 fix session (code changed, uncommitted). Before that: 2026-10-03, by the Focus Legacy FY-comparison report session (KI-183; code changed, uncommitted). Before that: 2026-09-29 (early morning), by the conversational scheme-swap session (KI-180; code changed, uncommitted). Before that: 2026-09-29 (late night), by the CM Elevate Legacy use-case re-test session (no code changed; KI-166..168 opened). Before that: 2026-09-29 (night), by the Focus Legacy all-levels fix session (KI-020, KI-145..165, D-031; code changed, uncommitted). Before that: 2026-09-29, by the context-relevance / semantic-contract session (code changed, uncommitted; D-030, KI-030/032/034 and KI-130 to KI-135; **offline-verified only**, VPN down). Before that: 2026-09-28 (evening), by the CM Elevate all-blocks / all-villages fix session (code changed in `app/pipeline.py`, tests; uncommitted). Before that: 2026-09-28, by the PMAY-G fix session (code changed, uncommitted; D-029, KI-089 to KI-097). Before that: 2026-09-27 night, by the Focus Plus all-blocks / all-villages session (code changed in `app/pipeline.py`, tests in `tests/test_focusplus_usecase_fixes.py` and `tests/test_mgnrega_usecase_fixes.py`; **uncommitted**). Earlier the same day: the CM Elevate use-case QA **and fix** session (code changed in `app/pipeline.py` and `app/schema_context.py`, plus a new test file; **uncommitted**). Before that, the same day: the Focus Plus use-case QA **and fix** session (code changed in `app/pipeline.py` and `app/routers/query.py`, **uncommitted**, on top of the uncommitted 2026-09-26 MGNREGA and context work).
-**Branch / commit:** `main` @ `f38ea1b` (2026-09-29), plus uncommitted work (VERIFIED by `git status` on 2026-10-05).
+**Last updated:** 2026-10-10 (night), by the **measure-gap session** (KI-231: "person days under CM Elevate" now says the measure is MGNREGA's and offers it; `_measure_gap_answer` in `app/pipeline.py`, new `tests/test_measure_gap_direct.py`; code changed, uncommitted). Before that, the same evening: the **cross-scheme FIX session** — the 20 officer cross-scheme cases now **20/20 live (36/36 with typed variants and the UI screenshot question)**; D-034 deterministic cross-scheme comparison + KI-213/214/218..228 fixed; **code changed, uncommitted** (`app/pipeline.py`, new `tests/test_cross_scheme_compare.py`). Before that, the same day: the **cross-scheme LIVE retest session** (VPN up: the DB and bot columns finally run on the post-D-033 code; **4 PASS / 16 FAIL**; KI-212/215 verified fixed, KI-216 closed as not-a-defect, KI-213 magnitude corrected, KI-218..224 opened; **no code changed**; report `docs/Cross_Scheme_UseCase_Retest_Report_2026-10-10.md`). Before that: 2026-10-10, by the bare-Focus = Focus Legacy session (D-033; code changed, uncommitted). Before that: by the **cross-scheme use-case audit session** (the 20 cases in `Cross Scheme Test Cases.csv`; raw baseline for all six schemes computed, static pipeline audit done, **DB and bot columns NOT run — VPN down**; KI-212 to KI-216 opened; **no code changed**; report `docs/Cross_Scheme_UseCase_Test_Report_2026-10-10.md`). Before that: 2026-10-09, by the **use-cases-modal session** (KI-210 rows not clickable + KI-211 only 3 of 7 schemes listed; `web/ai_query.html` and the new `tests/test_ui_use_cases.py`; code changed, uncommitted). Before that: 2026-10-07, by the **NRLM use-case QA + fix session** (43 NRLM use cases: 16/43 → **43/43**; KI-188 to KI-195 opened AND fixed, plus two verifier false positives; code changed, uncommitted). Before that: 2026-10-06, by the Focus Legacy duplicate-groups session (KI-187, D-032 confirmed 2026-10-07 = paid more than once; code changed, uncommitted). Earlier the same day: by the CM Elevate OFF-009 all-pairs re-test and KI-182 fix session (code changed, uncommitted). Before that: 2026-10-03, by the Focus Legacy FY-comparison report session (KI-183; code changed, uncommitted). Before that: 2026-09-29 (early morning), by the conversational scheme-swap session (KI-180; code changed, uncommitted). Before that: 2026-09-29 (late night), by the CM Elevate Legacy use-case re-test session (no code changed; KI-166..168 opened). Before that: 2026-09-29 (night), by the Focus Legacy all-levels fix session (KI-020, KI-145..165, D-031; code changed, uncommitted). Before that: 2026-09-29, by the context-relevance / semantic-contract session (code changed, uncommitted; D-030, KI-030/032/034 and KI-130 to KI-135; **offline-verified only**, VPN down). Before that: 2026-09-28 (evening), by the CM Elevate all-blocks / all-villages fix session (code changed in `app/pipeline.py`, tests; uncommitted). Before that: 2026-09-28, by the PMAY-G fix session (code changed, uncommitted; D-029, KI-089 to KI-097). Before that: 2026-09-27 night, by the Focus Plus all-blocks / all-villages session (code changed in `app/pipeline.py`, tests in `tests/test_focusplus_usecase_fixes.py` and `tests/test_mgnrega_usecase_fixes.py`; **uncommitted**). Earlier the same day: the CM Elevate use-case QA **and fix** session (code changed in `app/pipeline.py` and `app/schema_context.py`, plus a new test file; **uncommitted**). Before that, the same day: the Focus Plus use-case QA **and fix** session (code changed in `app/pipeline.py` and `app/routers/query.py`, **uncommitted**, on top of the uncommitted 2026-09-26 MGNREGA and context work).
+**Branch / commit:** `main` @ `36b7427` (pushed to `origin/main`), plus the 2026-10-10 work committed on top (VERIFIED by `git status` on 2026-10-10).
 `docs/HANDOFF.md` was restored on 2026-10-07 (it had been deleted in the working tree although CLAUDE.md
 requires it every session) — conflict RESOLVED, VERIFIED.
 Still outstanding on 2026-10-07: the QA evidence folders, 9 `.xlsx` test reports and
 `docs/CM_Elevate_Legacy_DB_Issues.md` remain **deleted in the working tree and not committed**, because this
 document and KNOWN_ISSUES.md still cite them as the evidence for specific KI numbers. Awaiting a decision on
 whether that evidence is retired (update the citing docs) or was removed by accident (restore it).
+
+## A measure another scheme owns, asked under a named scheme (2026-10-10, night) — KI-231
+- "So what is the total person days in Meghalaya under CM Elevate?" (UI screenshot) used to end in "I understood the
+  question but couldn't build a working query". Now `_measure_gap_answer` (`_answer_data`, after `classify_scheme`,
+  before any model call) pauses with `measure-unavailable`: "CM Elevate doesn't record person-days — only MGNREGA
+  does, so there is no person-days figure for CM Elevate for all of Meghalaya", the same question under MGNREGA as
+  the first chip, then CM Elevate's own measures for the same scope. Same measure registry as the KI-180 swap check
+  (MGNREGA person-days / job cards / wages / material / employment; PMAY-G houses). Only when the scheme is named,
+  only for one scheme; "self-employment" under CM Elevate is not MGNREGA employment. VERIFIED live (chips answer
+  27,264,054 person-days FY 2023-24 and 8,627 applications). pytest **1,879 passed, 2 skipped** (35 files, +22).
+  Nothing else changed. Code changed, uncommitted.
+
+## Bare "Focus" = Focus Legacy (2026-10-10) — D-033, KI-217 (closes KI-212)
+- A question naming only "Focus" is rewritten to "Focus Legacy" before routing (`_pin_bare_focus`), on the DATA and
+  KNOWLEDGE paths; the which-Focus question no longer fires. Focus Plus / Focus+ / noun use / group names untouched. VERIFIED
+  live: "What is focus?" → Focus Legacy KB; "…disbursed under focus in FY 2024-25" → ₹11,49,90,000 (= DB); Focus Plus
+  question unchanged; live context suite 43/43. CLAUDE.md §4 updated. Code changed, uncommitted.
+
+## Cross-scheme use cases: FIXED — 20/20 live (2026-10-10) — D-034, KI-213..228
+
+**All 20 officer cases (`Cross Scheme Test Cases.csv`) answer correctly live**, and so do 15 typed-scope
+variants and the user's UI screenshot question — **36/36**, each figure checked against megh_db by an
+independent verifier (its own SQL, not the app's). 19/20 answer in one turn; CROSS-9 asks one legitimate
+block-or-village question. Report: `docs/Cross_Scheme_UseCase_Retest_Report_2026-10-10.md` ("AFTER FIXES").
+
+**What changed (all `app/pipeline.py`):**
+- **D-034 — deterministic cross-scheme comparison** (`_cross_scheme_compare_plan` / `_data` / `_answer`),
+  run in `_answer_data` before the scheme / scope / year pauses: one parameter-bound query per scheme and
+  measure, each scheme's own unit (MGNREGA households latest FY, PMAY-G houses, Focus Plus
+  `COUNT(DISTINCT beneficiary_key)`, CM Elevate applicants, Focus Legacy memberships in groups, CM Elevate
+  Legacy records, NRLM members), never a combined total, CM Elevate money "no money recorded", each
+  scheme's data years stated. Narrow by design — MGNREGA+PMAY-G-only, a specific year, a single-scheme
+  measure, a village / constituency / sub-scheme / tranche all keep the old path.
+- KI-214 money-ranking vocabulary; KI-225 an all-years scope no longer moves CM-ELEVATE to Legacy; KI-219
+  per-scheme years in the year pause; KI-222 DATA intent for comparisons.
+- Guards for every other wording on the model path: `_cross_scheme_sql_issue` (KI-213/218/220/223/227),
+  `_verifier_join_complaint_on_aggregates` (KI-221), `_range_claim_misstated` (KI-226),
+  `_cross_unit_total_stated` (KI-220).
+
+**Tests:** pytest **1,854 passed, 2 skipped** (34 files, +64 in `test_cross_scheme_compare.py`); plain
+scripts **14/14** (`test_admin_level_collision.py` failed once only while the VPN was down — passes with
+it up); live context suite **43/43, follow-ups 29/29, SQL 20/20**; 8 live control questions outside the
+comparison keep their previous path and figures.
+
+**Open, for the officers (not code):** CROSS-7 / 18 name no scheme, so all seven are compared and NRLM's
+SHG members lead 8 districts; if they mean the five schemes of the other cases, the question should name
+them. Focus Legacy has no person record, so its "beneficiaries" are stated as memberships in groups.
+
+## Cross-scheme use cases: LIVE retest — 4 PASS / 16 FAIL (2026-10-10) — KI-218..224
+
+> **Corrected the same day (typed-scope retest):** **5 PASS / 4 PARTIAL / 11 FAIL**, not 4/16. The first live run answered the year pause via the chip; typing the scope into the question (as officers do) skips the pause and works better — CROSS-1 passes that way. See §0 of the retest report. New: KI-225 (a typed year flips CM-ELEVATE to CM Elevate Legacy), KI-226 (composer misstates a max that was in the result), KI-227 (one UNION branch drops the district filter), KI-228 ("Focus Legacy beneficiaries" = 102,021 or 11,906 depending on phrasing). KI-221 is narrower: the verifier rejections cluster on the chip-resume path.
+
+The 20 officer cases re-run **with the VPN up**, on the post-D-033 code. The DB and bot columns
+the earlier audit could not produce are now done. **No code changed this session.**
+Report: `docs/Cross_Scheme_UseCase_Retest_Report_2026-10-10.md`.
+
+**4 PASS** (CROSS-3, 17, 18, 20) **/ 16 FAIL.** The distribution is the point: 9 failures are
+*visible* (6 "I couldn't build a working query", 3 endless pause chains) and **7 are silent** —
+4 confident wrong numbers and 3 data questions answered from the knowledge base.
+
+**Resolved by this run:**
+- **KI-212 / KI-215 FIXED** (D-033, verified live): all 8 bare-FOCUS cases pin to Focus Legacy;
+  CROSS-17/20 now resolve all 5 schemes, CROSS-2 resolves 2 with the cross-scheme block loaded.
+- **KI-216 CLOSED, not a defect:** `v_cross_scheme_money_district_year` holds only MGNREGA and
+  PMAY, so `_CROSS_SCHEME_MONEY_SQL`'s separate Focus Plus branch is correct. The view's totals
+  also reconcile with the raw figures (3,628.68 vs 3,628.67 cr; 2,185.24 vs 2,185.26 cr).
+- **KI-213 corrected:** Focus Plus beneficiaries are **105,813** (`COUNT(DISTINCT
+  beneficiary_key)`), not 12,527 — `member_id` exists only on the 12.5K cohort, the 93K cohort
+  has none. Two wrong readings now: `COUNT(*)` +3.64x, `member_id` -8.45x.
+
+**The worst result — KI-214 made concrete (now CRITICAL).** CROSS-12 answered *"Focus Plus
+provided the highest total financial assistance with 1197392500.00"* (no unit) when **MGNREGA is
+highest at 3,628.67 crore, 30x larger**. One missing vocabulary token (`assistance`) in
+`_MONEY_SUPERLATIVE` meant the deterministic ranking never fired; LLM SQL then omitted the
+MGNREGA and PMAY-G branches and `ORDER BY..LIMIT 1` turned a partial list into a superlative.
+
+**New (KI-218..224):** the generator ignores the D-033 pin and tells the user data is missing
+when it is present (218); the year pause offers a **union of 9 years no single scheme has**, hit
+by 13 of 20 cases (219); the composer states a **cross-unit total** "across all four schemes"
+when 7 were resolved and three schemes with money in that district were dropped (220); the 4B
+verifier **rejects the prompt's own prescribed** aggregate-then-CROSS-JOIN as a "PROHIBITED
+JOIN" — 9 of 11 repair attempts, and the sole cause of all 6 no-answer cases (221);
+cross-scheme superlatives with no money word fall through to RAG and return encyclopaedia prose
+(222); an un-aggregated UNION branch floods the answer with ~997 junk rows (223); three cases
+dead-end in three pauses whose last one re-asks the scheme the question already named (224).
+
+**The actionable pattern:** every PASS used the LONG (UNION ALL) shape; every no-answer case
+attempted the WIDE (CROSS JOIN) shape that the prompt mandates for one-figure-per-scheme
+questions. **The WIDE shape is effectively unusable today** — that is KI-221.
+
+**Next, in priority order:** KI-214 (smallest change, fixes the worst answer) -> KI-221
+(unblocks 6 cases) -> KI-220 -> KI-219 -> KI-222 -> KI-218/223/224/213. Each needs a regression
+test on the real function, and `live_context_validation.py` re-run for anything touching
+routing or pauses.
+
+## Cross-scheme use cases: audited, 11 of 20 fail on code evidence (2026-10-10) — KI-212..216
+
+The 20 officer cases in `Cross Scheme Test Cases.csv`, tested against the raw sources and the
+pipeline's own routing code. **No code was changed this session.** Full report:
+`docs/Cross_Scheme_UseCase_Test_Report_2026-10-10.md`.
+
+**The run is incomplete, by design-of-circumstance.** The request was raw vs DB vs bot;
+`10.48.242.4` was unreachable (ping 100% loss; 5432/6333/8000/8001 all time out) and that one
+host serves Postgres, Qdrant **and** every model endpoint, so the DB and bot columns could not
+be produced. What *was* possible needed no VPN: the raw baseline, and a static audit that
+executes the real pipeline functions offline.
+
+**Raw baseline (computed this session, aggregate-only for the two PII partitions):**
+MGNREGA person-days **90,915,181** and expenditure **₹362,866.57 lakh**; PMAY-G **171,107
+houses**, released **₹2,185.26 cr**; Focus Plus **385,671 payments** but only **12,527 unique
+members**, ₹119.74 cr; Focus Legacy **14,569 payments / 11,906 groups / 102,021 memberships**,
+₹51.01 cr; CM Elevate **8,627 applications, no money and no year**; CM Elevate Legacy **2,823
+applicants**, ₹82.90 cr. Money ranking: MGNREGA 3,628.67 › PMAY-G 2,185.26 › Focus Plus 119.74
+› CM Elevate Legacy 82.90 › Focus Legacy 51.01 › CM Elevate **not held**.
+
+**11 of 20 fail on code evidence alone, and none would surface as a visible error:**
+- **KI-212 (High)** — "Focus+ … and FOCUS" drops Focus Legacy **silently**: a Focus Plus match
+  makes `_is_ambiguous_focus` early-return False, so the which-Focus pause never fires. 8 cases.
+- **KI-213 (High)** — the Focus Plus beneficiary guard is disabled on every multi-scheme
+  question by its own first line, leaving only the prose rule against reading `COUNT(*)` as
+  beneficiaries: **385,671 vs 105,813, a 3.64x overstatement** (corrected by the live retest; 12,527
+  was `member_id`, the 12.5K cohort only), which also **reorders the
+  district ranking** (uneven 20x–65x fan-out). 8 cases.
+- **KI-214 (Medium)** — the deterministic money ranking misses "financial **assistance**"
+  (CROSS-12) and "**higher** … : A or B?" (CROSS-5), losing the verbatim "CM Elevate holds no
+  money" statement on the very case that needs it.
+- **KI-215 (Medium)** — CROSS-2 routes as a **one**-scheme set, so the `_CROSS_SCHEME` guidance
+  block is omitted from the SQL prompt entirely.
+- **KI-216 (High if confirmed)** — **UNKNOWN:** if `v_cross_scheme_money_district_year` already
+  carries Focus Plus, `_CROSS_SCHEME_MONEY_SQL` **double-counts** it. One query settles it.
+
+**The framing finding:** "beneficiary count" is not a defined quantity across these schemes.
+One row is a village-year, a house, a payment, an application, a group payment or an SHG
+depending on the scheme; CM Elevate has **no money column at all** (so CROSS-4/5/10/11/19/20 are
+impossible as asked, not merely hard); Focus Legacy has **no person record of any kind** (so the
+beneficiary cases must answer in groups or memberships); and **no two schemes share a full year
+window**. A "pass" means the bot states the mismatch and gives each scheme's own correct figure
+side by side — a single blended total is the wrong answer however well phrased.
+
+**What the prompt gets right and must not be weakened:** the `_CROSS_SCHEME` block correctly
+calls a CM Elevate money comparison "IMPOSSIBLE", warns that
+`v_cross_scheme_village_coverage` has no Focus Plus and no CM Elevate column, and defines Focus
+Plus beneficiaries as `COUNT(DISTINCT beneficiary_key)` — verified present for every
+multi-scheme set.
+
+**Next:** fix KI-212 and KI-214 first (10 cases re-test unchanged otherwise), settle KI-216 with
+one query, then run the live DB and bot columns per §6 of the report.
+
+## Use-cases modal: clickable, and all seven schemes (2026-10-09) — KI-210, KI-211
+
+A UI-only session, no Python changed. Two defects in the **Use cases** modal of
+`web/ai_query.html`, both user-reported.
+
+**KI-211 — the modals listed 3 of the 7 schemes.** All three hand-maintained lists — `USE_CASES`
+(Use cases), `GLOSSARY` (Glossary) and the sidebar `SAMPLE_CATEGORIES` — covered only MGNREGA,
+PMAY-G and FOCUS+, the schemes that existed when they were written. Focus Legacy, CM Elevate,
+CM Elevate Legacy and NRLM had no examples and no glossary terms at all. All three now
+carry all seven — **34 rows in 8 sections** — with the questions taken from the officers' own
+use-case files (`CM Elevate.csv`, `Focus +_Use_Cases.csv`, `PMAY-G.csv`, `NRLM_Use_Cases.xlsx`,
+`Use_Cases_-_Focus.csv`, `Use_Cases_-_CM_Elevate_legacy.csv`) and the `[district]` / `[block]`
+placeholders replaced by real places. The scheme rules are respected: no bare "Focus" or bare
+"CM Elevate" (both are collisions that must never be guessed), CM Elevate gets COUNT questions
+only (no money, no time dimension), and no NRLM row puts RF/CIF in a financial year (cumulative
+and undated — that scheme's highest-risk wrong-number path).
+
+**Verified by routing, not by eye:** all 34 questions go through the pipeline's own
+`_shortcut_scheme`, and **34/34 resolve to the scheme of the section they are filed under**.
+
+The **Glossary** went from 15 terms in 3 sections to **49 terms in 7**. Its definitions are taken
+from `app/schema_context.py` `SCHEME_METRICS` and `docs/SCHEMES.md`, so it states what the
+pipeline enforces — deliberately including the traps that produce a plausible wrong number:
+Focus Legacy's three counting subjects (payments / groups / memberships are three different
+numbers) and memberships-not-people; CM Elevate having no money and no time dimension at all;
+CM Elevate Legacy's stored `total_disbursement` and its own 13 schemes; and NRLM's `COUNT(*)` =
+groups with members as a COLUMN, plus RF/CIF being cumulative undated grants that must never sit
+in a financial year or be called savings or loans. Every figure quoted was checked against its
+source.
+
+**KI-210 — clicking a row did nothing.**
+
+A UI-only fix, no Python touched. The **Use cases** modal rendered its 14 example questions
+with an inline `onclick="closeModal(); ask(${JSON.stringify(q)});"`. `JSON.stringify` emits a
+real double quote, which terminates the `onclick="` attribute, so every row's handler was the
+truncated, invalid `closeModal(); ask(` and **no row did anything when clicked**.
+
+`web/ai_query.html` now puts the question in `data-ask="${escapeHTML(q)}"` and binds the click
+in `bindModalAsk()` with `addEventListener`, after `openModal()` has inserted the rows — the
+pattern `bindRichActions()` already used for rich-message actions, whose comment names this
+exact failure. Rows are `role="button" tabindex="0"`, respond to Enter and Space, and reveal a
+`→` on hover or focus so they read as clickable.
+
+Verified in a real DOM against the **served** page (jsdom): the modal opens, **all 34 rows click
+through to `ask()` with the exact question text and close the modal**, Enter works, and the same
+DOM parses the old markup to `onclick = "closeModal(); ask("` with no handler bound. Both inline
+`<script>` blocks pass `node --check`.
+
+**Tests.** New `tests/test_ui_use_cases.py` (**52 tests**) pins the invariants, not the wording:
+no inline `onclick`, the question in an escaped `data-ask`, rows focusable and keyboard-operable,
+every scheme in `SCHEME_CATALOG` has its own section, every question routes to its section, no
+bare "Focus", no CM Elevate money/year, no NRLM money-in-a-year, no unfilled placeholder. Proven
+to bite by reintroducing each defect (inline handler → 3 fail; NRLM use-case section renamed
+→ 8 fail; a Glossary section renamed → 3 fail).
+Full run: pytest **1,777 passed, 2 skipped** (33 files; 1,725 before this suite) and plain
+scripts **14/14**. The live context suite was not re-run — no routing, rewrite or state change.
+
+**One thing found and deliberately left alone:** the sidebar chip list is **dead code**. Its
+container `queriesContainer` exists nowhere in the page (also true in `HEAD`), so
+`loadSampleQuestions()` returns at its guard and no chip renders. It was updated for consistency
+and moved off its own fragile inline `onclick`, but reviving that sidebar is a separate decision.
+
+## NRLM use-case QA and fixes (2026-10-07) — 16/43 → 43/43
+
+NRLM was wired as the **seventh** scheme on 2026-10-06 (`docs/SCHEME_ONBOARD_NRLM.md`) but had
+never been run live. This session ran the 43 use cases, fixed everything they found, and re-ran
+them.
+
+- **Round 1: 16 of 43 passed.** After the fixes: **43 / 43**, live, on the final code.
+  Report with per-case proof images: `NRLM_UseCase_Test_Report_2026-10-07.xlsx` (repo root).
+- **The data reconciles exactly.** 34 scalar metrics plus the district, block, year,
+  constituency and village breakdowns agree between the raw `NRLM to share to BLH.csv` and
+  `curated.v_nrlm` (40,629 rows in both). Every failure was pipeline behaviour. VERIFIED.
+- **Eight defects, KI-188 to KI-195, all fixed the same day** — each as a deterministic guard,
+  because the prose rules for the two money defects already existed and did not hold under
+  sampling (CLAUDE.md §5):
+  - **KI-188** (11 cases) a capped page of rows reported as the whole answer — Umling block
+    answered "40" against a true **1,167**; a district comparison said "five districts /
+    twenty-seven financial years" against **12 and 30**; the all-blocks CIF was understated by
+    92%. Fixed in four places: repair a count question that lists rows, drop an unrequested
+    LIMIT from an every-group question, re-count a list that is still cut short, and lead the
+    deterministic answer with that total.
+  - **KI-189** (6 cases) the token **"SHG" resolved to the district South Garo Hills** (alias
+    `SGH`) and paused every NRLM question. Fixed with a scheme-vocabulary exclusion.
+  - **KI-190** (3 cases) a rupee total stated with **no unit** ("…is 98.48" for ₹98.48 crore).
+  - **KI-191** (2 cases) cumulative CIF/RF attributed to a financial year and presented as a
+    trend — the scheme's documented highest-risk wrong-number path.
+  - **KI-192** a one-block constituency paused for a narrowing that selects the same rows;
+    **KI-193** a data question answered with a KB "not in the reference material" refusal;
+    **KI-194** a true zero (NR-15) reported as missing data; **KI-195** a name search matching
+    exactly instead of containing (found 2 of 20).
+  - **KI-196** 12 raw rows contradict their own district LGD code; the DB is right. For the
+    ingestion team — no code change.
+- **Two SQL-verifier false positives** found while re-testing and fixed: it demanded
+  `year_key` when NRLM's only year column is `formation_financial_year_short`, and it demanded
+  an aggregate on a per-SHG money column although one `v_nrlm` row **is** one SHG. Each had
+  killed a use case outright (UC33, UC30) by exhausting the repair budget.
+- **KI-197 (user report, same day): NRLM was refused as "a scheme I don't cover", and the
+  chip it offered looped for ever.** `_UNSUPPORTED_SCHEME` still listed NRLM's aliases from
+  before onboarding, so "…for NRLM" was refused, the NRLM chip re-asked the same question,
+  and it was refused again. Fixed: aliases removed; the refusal text and the three
+  `edge.py` coverage replies now name all seven schemes; and
+  `tests/test_supported_scheme_not_refused.py` (25 tests) fails if any alias of a loaded
+  scheme is ever in that pattern again, or if any refusal chip can loop. The reported
+  question now answers **517 SHGs in Chokpot block** (= DB = raw CSV).
+- **KI-198 (user report, same day): a year chip the pipeline OFFERED was refused as out of
+  range, looping for ever.** A loop sweep that follows chips like the UI found **8 of 58
+  paths looping**, all NRLM. Each paused for a year, offered **FY 1984-85**, then said
+  "data is available only for … 1984-85 …" and showed the list again. `_parse_year_key`
+  only understood 2010-2039; NRLM is the first scheme with data before 2010. Fixed: an
+  explicit `NNNN-NN` range now parses from 1900 on, while a bare four-digit number stays
+  2010-2039 so "top 2000 villages" is still not a year. Also fixed in the same report:
+  following those chips reached a genuine zero that was worded "the data doesn't cover"
+  — `_nrlm_counted_zero_answer` now states the measured zero (KI-194's reasoning on the
+  non-empty path). **Sweep after the fix: 258 paths, 0 loops, 0 dead ends.**
+- **KI-199 to KI-208 (exhaustive all-blocks / all-constituencies / all-villages /
+  all-SHGs run, 2026-10-07..08): nine more defects, all fixed.** 45,728 questions, each
+  expected answer read from `curated.v_nrlm` AND cross-checked against the raw CSV.
+  **Districts 12/12, blocks 56/56, constituencies 55/55 and villages 4,936/4,936 all
+  pass on the final code**; the 40,629 SHG lookups are still running. Every defect was a
+  silent wrong number or an endless thread, never a visible error:
+  KI-199 a block literal (name or `*_lgd_code`) beside a resolved village_code zeroed the
+  answer (23 SHGs -> 0; 21 of the first 30 village failures); KI-200 a village question
+  naming its own block still asked which village, and looped; KI-201 the BLOCK name was
+  resolved as the village (9 for a village holding 8); KI-202 the village scan backstop
+  never ran for questions that SAY "village"; KI-203 an SHG question was answered from
+  Focus Legacy; KI-204 a named SHG was then asked for a district and a year; KI-205 an
+  EXACT village name was offered as ambiguous against a look-alike; KI-206 a block NAME in
+  an integer code column killed the query (5 Ranikor villages, reproducible only under
+  concurrency); KI-207 "&" in a village name truncated the scan; KI-208 a one-figure
+  answer stated the ROW COUNT, not the figure ("There is 1 SHG" for a COUNT of 12,
+  intermittent 3-of-5).
+  **Four of the nine trace to one thing:** the LLM mention-extractor dropping or
+  mis-slotting the village when a question names both a village and a block
+  (village=None on 6 of 8 identical calls). Every fix is a deterministic backstop.
+- **Tests:** pytest **1,709 passed, 2 skipped** over 32 files (1,498 baseline + 71 in `tests/test_nrlm_usecase_fixes.py`
+  + 25 in `tests/test_supported_scheme_not_refused.py` + 36 in `tests/test_year_chip_no_loop.py`
+  + 45 in `tests/test_village_block_narrowing.py` + 28 in `tests/test_nrlm_shg_lookup.py`); plain scripts **14/14**; NRLM use cases **43/43** live.
 
 ## Project status
 - **Stage (INFERRED):** internal UAT with live QA passes per scheme.

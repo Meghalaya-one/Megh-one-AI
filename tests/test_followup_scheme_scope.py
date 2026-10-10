@@ -89,8 +89,8 @@ def test_the_reported_conversation(monkeypatch):
         return r
 
     assert ask("how to apply for cm elevate")["answer"] == "KB:CM Elevate"
-    with pytest.raises(p.ClarificationNeeded) as pause:      # a pause records no turn
-        asyncio.run(p._run_pipeline("for focus", session=sess))
-    assert pause.value.rule == "focus-scheme-ambiguous"
+    # 2026-10-10 (D-033): a bare "Focus" is Focus Legacy — no which-Focus pause any more
+    r = ask("for focus")
+    assert r["answer"] == "KB:Focus Legacy" and r["rewritten_question"] == "how to apply for Focus Legacy"
     r = ask("give same like for remaining schemes")
-    assert r["answer"] == "KB:MGNREGA,PMAY-G,Focus Plus,Focus Legacy,NRLM"
+    assert r["answer"] == "KB:MGNREGA,PMAY-G,Focus Plus,CM Elevate,NRLM"

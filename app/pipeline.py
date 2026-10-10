@@ -663,6 +663,111 @@ def _swap_measure_gap(followup: str, rewritten: str, prev: "object",
     return None
 
 
+# ── A direct question that names a scheme AND a measure another scheme holds ─
+# Reported 2026-10-10 (UI screenshot): "So what is the total person days in
+# Meghalaya under CM Elevate?" CM Elevate records no person-days — that is an
+# MGNREGA measure. The generator wrote four queries, every one was rejected,
+# and the officer got "couldn't build a working query … Try rephrasing it",
+# which neither says WHY nor where the figure lives. _swap_measure_gap above
+# catches the same gap only when a scheme-SWAP follow-up ("give me for pmay")
+# carried the measure over; a question that types both the scheme and the
+# measure sailed past it into the generator.
+#
+# The honest answer is one sentence — person-days are recorded by MGNREGA
+# only, CM Elevate does not hold them — plus the same question under the
+# scheme that does hold it, and the named scheme's own headline measures for
+# the same scope, one tap each. Never a guess at the "closest" measure, and
+# never a model call: this runs in _answer_data once the scheme is settled.
+# Same measure registry as the swap check (_SCHEME_OWN_MEASURES), so what it
+# knows about is exactly the scheme-specific measures; money and plain counts
+# exist in every scheme and are left to the generator.
+_MEASURE_GAP_LEAD = re.compile(r"^\s*(?:so|ok(?:ay)?|and|then|also|now)\b[\s,]*", re.IGNORECASE)
+# "self-employment" is CM Elevate's own vocabulary (an entrepreneurship
+# scheme), not MGNREGA's employment measure: masked before the measure scan.
+_MEASURE_GAP_MASK = re.compile(r"\bself[\s-]?employ\w*", re.IGNORECASE)
+_MEASURE_GAP_STATEWIDE = re.compile(
+    r"\bmeghalaya\b|\bstate[\s-]?wide\b|\b(?:whole|entire|all of)\s+(?:the\s+)?state\b",
+    re.IGNORECASE)
+# Owner-scheme forms for when the user's own wording cannot be reused (a
+# fuzzy-spelled scheme name the exact pattern cannot swap out).
+_MEASURE_OWNER_OFFERS: "dict[str, str]" = {
+    "person-days": "Total MGNREGA person-days{scope}",
+    "job cards": "How many MGNREGA job cards are there{scope}?",
+    "wage expenditure": "Total MGNREGA wage expenditure{scope}",
+    "material expenditure": "Total MGNREGA material expenditure{scope}",
+    "employment": "How many households were employed under MGNREGA{scope}?",
+    "houses": "How many PMAY-G houses were sanctioned{scope}?",
+}
+
+
+def _measure_gap_scope_phrase(question: str, scheme: str) -> str:
+    """" in <place> in FY 2023-24" read deterministically from the question's
+    own words (catalogued district / block names, a typed year), for the
+    offers of _measure_gap_answer. Nothing is resolved by a model here: the
+    pause fires before resolve_entities, and a wrong scope on a chip would be
+    worse than none."""
+    parts: list[str] = []
+    places = named_places(question)
+    blocks = [n for n, dim in places.items() if dim == "block"]
+    districts = [n for n, dim in places.items() if dim == "district"]
+    if blocks:
+        parts.append(f" in {blocks[0].title()} block")
+    elif districts:
+        parts.append(f" in {districts[0].title()}")
+    elif _MEASURE_GAP_STATEWIDE.search(question or ""):
+        # "in Meghalaya" is a settled statewide scope: the chip says so in the
+        # words the area pause's own chip uses, so it is not asked again.
+        parts.append(" for all of Meghalaya")
+    if scheme not in _SCHEMES_WITHOUT_YEAR:
+        year = _parse_year_key(question or "")
+        if year is not None:
+            parts.append(f" in FY {year}-{(year + 1) % 100:02d}")
+    return "".join(parts)
+
+
+def _measure_gap_answer(question: str, schemes: "list[str] | None"
+                        ) -> "ClarificationNeeded | None":
+    """The not-held explanation for a question that names ONE scheme and asks
+    it for a measure only another scheme records ("total person-days under CM
+    Elevate"), else None. Only when the scheme is named in the question (a
+    classifier guess must not be told "you asked for X"), only for one
+    scheme (a comparison has its own path), and only for a measure whose
+    owner is not that scheme."""
+    if not schemes or len(schemes) != 1:
+        return None
+    target = schemes[0]
+    if _named_schemes(question or "") != [target]:
+        return None
+    scan = _MEASURE_GAP_MASK.sub(" ", question or "")
+    for owner, measures in _SCHEME_OWN_MEASURES.items():
+        if owner == target:
+            continue
+        for label, rx in measures:
+            if not rx.search(scan):
+                continue
+            scope = _measure_gap_scope_phrase(question, target)
+            # The same question under the scheme that holds the measure: the
+            # user's own words with the scheme swapped, else the owner's form.
+            pattern = _SCHEME_NAME_PATTERN.get(target)
+            swapped = pattern.sub(owner, question) if pattern is not None else question
+            swapped = _MEASURE_GAP_LEAD.sub("", swapped).strip()
+            if swapped == question.strip() or not swapped:
+                swapped = _MEASURE_OWNER_OFFERS.get(label, f"Total {owner} {label}{{scope}}") \
+                    .format(scope=_measure_gap_scope_phrase(question, owner))
+            swapped = swapped[0].upper() + swapped[1:]
+            options = [{"label": f"{label.capitalize()} under {owner}", "question": swapped}]
+            options += [{"label": lab, "question": tmpl.format(scope=scope)}
+                        for lab, tmpl in _SCHEME_HEADLINE_OFFERS.get(target, [])]
+            logger.info("measure gap: %s asked for %s (%s only): %r", target, label, owner, question)
+            return ClarificationNeeded(
+                f"{target} doesn't record {label} — only {owner} does, so there is no "
+                f"{label} figure for {target}{scope}. I can answer the same question "
+                f"for {owner}, or give you what {target} does hold{scope}. Tap one, or "
+                f"ask it in full, for example “{swapped.rstrip('?')}”.",
+                options=options, rule="measure-unavailable")
+    return None
+
+
 def _rest_of_schemes_rewrite(prev: "object", followup: str) -> "str | None":
     """Deterministic rewrite for "same for the remaining / other / all schemes":
     the previous question with its scheme replaced by the list of schemes it
@@ -1341,6 +1446,19 @@ _CMELEVATE_APPLICATIONS_ONLY = re.compile(
     r"\bseed\b|\bgreen taxi\b|\bcinema\b|\bagro tourism villa\b",
     re.IGNORECASE,
 )
+# "across all financial years" / "all financial years combined" is a SCOPE that
+# names no year, so it says nothing about which CM Elevate dataset is meant — the
+# applications data has no year at all, so "all years" is simply all of it. Read
+# as a year word it moved "Compare Focus+ and CM-ELEVATE … across all financial
+# years" onto CM Elevate Legacy (2,823 sanction records instead of 8,627
+# applications), and the year pause's own "All financial years combined" chip did
+# the same to every CM Elevate question it resumed (cross-scheme retest
+# 2026-10-10, KI-225). A specific year ("FY 2024-25") and a per-year breakdown
+# ("each financial year", "year-wise") still pin — only Legacy has years.
+_ALL_FINANCIAL_YEARS_SCOPE = re.compile(
+    r"\ball\s+(?:the\s+)?(?:financial|fiscal)\s+years?(?:\s+combined)?\b",
+    re.IGNORECASE,
+)
 
 
 def _prefers_cm_elevate_legacy(question: str) -> bool:
@@ -1349,6 +1467,7 @@ def _prefers_cm_elevate_legacy(question: str) -> bool:
     q = question or ""
     if _CMELEVATE_APPLICATIONS_ONLY.search(q):
         return False
+    q = _ALL_FINANCIAL_YEARS_SCOPE.sub(" ", q)
     return bool(_CMELEVATELEGACY_FORCING.search(q) or _CMELEVATELEGACY_ONLY_TERMS.search(q))
 
 
@@ -1372,6 +1491,34 @@ def _pin_cm_elevate_dataset(question: str) -> str:
     out = _SCHEME_NAME_PATTERN["CM Elevate"].sub("CM Elevate Legacy", q)
     logger.info("CM Elevate dataset pinned to Legacy: %r -> %r", q, out)
     return out
+
+
+# A bare "Focus" is Focus Legacy (product owner, 2026-10-10, D-033). This replaces
+# the which-Focus question (CLAUDE.md §4 used to say "never guessed"): officers
+# typing "focus" mean the original FOCUS producer-group scheme. Like the CM
+# Elevate pin it rewrites the question ONCE, before routing, so every later check
+# (scheme shortcut, gates, follow-ups, chips, KB scoping) sees "Focus Legacy".
+# Untouched: "Focus Plus" / "Focus+" / "Focus Legacy" mentions, "focus" as an
+# English word ("the main focus of", "focuses on") and "Focus" inside a producer
+# group's name ("Focus Bibari"). A bare "FOCUS" BESIDE "Focus+" in a cross-scheme
+# question is pinned too — before this it was dropped silently (2026-10-10).
+def _pin_bare_focus(question: str) -> str:
+    q = question or ""
+    if not q or not _BARE_FOCUS_WORD.search(q) or _pg_focus_group_name(q):
+        return q
+    taken = [m.span() for s in ("Focus Plus", "Focus Legacy") for m in _SCHEME_NAME_PATTERN[s].finditer(q)]
+    taken += [m.span() for m in _FOCUS_AS_NOUN.finditer(q)]
+    out, last = [], 0
+    for m in _BARE_FOCUS_WORD.finditer(q):
+        if any(a <= m.start() < b for a, b in taken):
+            continue
+        out.append(q[last:m.start()] + "Focus Legacy")
+        last = m.end()
+    if not out:
+        return q
+    pinned = "".join(out) + q[last:]
+    logger.info("bare Focus pinned to Focus Legacy: %r -> %r", q, pinned)
+    return pinned
 
 
 def _unpin_cm_elevate(question: str) -> str:
@@ -2503,6 +2650,37 @@ async def _focus_legacy_list_total(sql: str, rows: list[dict]) -> "tuple[int, st
     if not isinstance(n, (int, float)) or n <= len(rows):
         return None
     return int(n), subject
+
+
+async def _nrlm_list_total(sql: str, rows: list[dict]) -> "int | None":
+    """The true number of matching SHGs when an NRLM list was cut off by its own LIMIT.
+
+    The composer otherwise reports the page it was given: "Here are the 40 results" for
+    Umling block, where 1,167 SHGs match (KI-188, NRLM use-case QA 2026-10-07). Counting
+    the model's own query — with its LIMIT stripped — gives the figure the answer must
+    lead with. Mirrors _focus_legacy_list_total, which does the same for that scheme."""
+    m = _FINAL_LIMIT_RE.search(sql or "")
+    if m:
+        if len(rows or []) != int(m.group(1)) or len(rows) < 2:
+            return None
+        inner = (sql or "")[: m.start()].rstrip().rstrip(";")
+    else:
+        # No LIMIT of its own: db.run_readonly appended the safety cap, so a result
+        # sitting exactly on it is truncated too. Without this, a query whose
+        # unrequested LIMIT was just dropped (_nrlm_unrequested_limit) loses its
+        # true-total note and the page size is reported again (KI-188).
+        if len(rows or []) != settings.SQL_MAX_RESULT_ROWS:
+            return None
+        inner = (sql or "").rstrip().rstrip(";")
+    try:
+        got = await run_readonly(f"SELECT COUNT(*) AS n FROM ({inner}) q")
+    except Exception:  # noqa: BLE001 — without the total the plain list still stands
+        logger.warning("NRLM list-total query failed — no total note", exc_info=True)
+        return None
+    n = _as_number((got or [{}])[0].get("n"))
+    if not isinstance(n, (int, float)) or n <= len(rows):
+        return None
+    return int(n)
 
 
 # ── Focus Legacy: "Are there any duplicate Producer Groups?" (KI-187) ───────
@@ -3867,7 +4045,13 @@ _UNSUPPORTED_SCHEME = re.compile(
     r"ayushman(\s+bharat)?|pm[\s-]?jay|pmjay|"
     r"mhis\b|cmhis\b|megha\s+health|"
     r"nsap\b|ignoaps|old[\s-]?age\s+pension|widow\s+pension|disability\s+pension|"
-    r"nrlm\b|day[\s-]?nrlm|aajeevika|ajeevika|livelihoods?\s+mission|"
+    # NRLM / DAY-NRLM / Aajeevika / the Rural Livelihoods Mission were listed here
+    # until NRLM was onboarded as the seventh scheme (2026-10-06). Leaving them
+    # made the bot deny its own scheme AND loop: "List all SHGs ... for NRLM" was
+    # told NRLM is not covered, the "NRLM (Self Help Groups)" chip re-asked the
+    # same question with NRLM in it, and it was refused again, for ever
+    # (user report 2026-10-07). A supported scheme must never appear in this list
+    # — the same rule the CM Elevate note above records.
     r"swachh\s+bharat|sbm\b|nirmal\s+bharat|"
     r"mid[\s-]?day\s+meal|pm[\s-]?poshan|"
     r"icds\b|anganwadi|poshan\s+abhiyaan?|"
@@ -3942,8 +4126,8 @@ def _unsupported_scheme_clarification(question: str, name: str) -> "Clarificatio
         "about it — not its rules, eligibility or its data. I cover these Meghalaya "
         "schemes: MGNREGA (rural employment), PMAY-G (rural housing), Focus Plus "
         "(farmer cash benefit), CM Elevate (livelihood and enterprise applications), "
-        "Focus Legacy (producer group payments) and CM Elevate Legacy (CM-ELEVATE "
-        "sanctions and disbursements). "
+        "Focus Legacy (producer group payments), CM Elevate Legacy (CM-ELEVATE "
+        "sanctions and disbursements) and NRLM (Self Help Groups). "
         "If one of those is what you need, pick it below and I'll take the question "
         "from there.",
         options=options,
@@ -4396,6 +4580,14 @@ _CROSS_SCHEME_SET_QUESTION = re.compile(
 )
 
 
+# "SHG code 7194" / "SHG 7194" / "shg_code 7194" — one group named by its unique
+# identifier. Requires the SHG word so a bare number is never read as a code.
+_NRLM_SHG_CODE_RE = re.compile(
+    r"\bshgs?[\s_-]*(?:code|id|number|no\.?)?\s*[:#]?\s*(\d{1,6})\b"
+    r"|\bshg_code\s*=?\s*(\d{1,6})\b",
+    re.IGNORECASE)
+
+
 def _needs_scope_clarification(question: str, resolved: dict) -> bool:
     """True when an aggregate question — an explicit "how many / total …" or a
     bare metric noun on its own ("show MGNREGA spend") — pins no geography and no
@@ -4427,6 +4619,12 @@ def _needs_scope_clarification(question: str, resolved: dict) -> bool:
     # missing_geography), and asking "which area?" first only added a click
     # (Focus Plus use-case QA 2026-09-27, FOCUS-006/007, KI-064).
     if resolved.get("tranche_label") or _FOCUSPLUS_BATCH_WORD.search(q):
+        return False
+    # One named SHG IS the scope. shg_code is unique across all 40,629 groups
+    # (NRLM rule 12), so "How many members are in SHG code 7194?" needs no
+    # district and no year — asking for them leaves a question that is already
+    # fully pinned unanswerable in one turn (all-SHGs run 2026-10-07).
+    if _NRLM_SHG_CODE_RE.search(q):
         return False
     return True
 
@@ -4842,6 +5040,13 @@ def _needs_year_clarification(question: str, schemes: list[str], resolved: dict)
     if not _METRIC_OR_BREAKDOWN_CUE.search(q) and not (
             "MGNREGA" in (schemes or []) and (_RATIO_CUE.search(q) or _WOMEN_CUE.search(q))):
         return False
+    # One named SHG has exactly one row and exactly one formation year, so there
+    # is no year to choose: "How many members are in SHG code 7194?" is already
+    # a complete question. Asking anyway made it unanswerable in one turn, and
+    # picking a year would filter the single row to nothing (all-SHGs run
+    # 2026-10-07).
+    if "NRLM" in (schemes or []) and _NRLM_SHG_CODE_RE.search(q):
+        return False
     return True
 
 
@@ -4863,6 +5068,21 @@ def _year_clarification(question: str, schemes: list[str]) -> "ClarificationNeed
     else:
         scope_word = ", ".join(live[:-1]) + " and " + live[-1]
     year_list = ", ".join(f"FY {y}" for y in years[:-1]) + f" and FY {years[-1]}"
+    # Several schemes with DIFFERENT years: "MGNREGA, PMAY-G, Focus Plus and Focus
+    # Legacy data is available for FY 2017-18 … FY 2025-26" claimed all nine years
+    # for all four, when Focus Plus holds two of them — a single-year pick then
+    # silently compared only the schemes that have it (cross-scheme retest
+    # 2026-10-10, KI-219). Say each scheme's own years instead; the chips are the
+    # same.
+    if len(live) > 1 and len({tuple(_SCHEME_DATA_YEARS.get(s) or ()) for s in live}) > 1:
+        per_scheme = "; ".join(f"{s}: {_scheme_years_text(s)}" for s in live)
+        return ClarificationNeeded(
+            f"These schemes hold different years — {per_scheme}. Which financial year is "
+            "required, or all of them combined? A single year compares only the schemes "
+            "that have data for it.",
+            options=options,
+            rule="year-not-specified",
+        )
     return ClarificationNeeded(
         f"{scope_word} data is available for {year_list}. "
         "Which of these is required — a single financial year, or all of them "
@@ -5094,8 +5314,11 @@ LIMIT 1;
 # a ranking word rather than by an "all/each" quantifier.
 _CROSS_SCHEME_SUPERLATIVE = re.compile(
     r"\b(?:which|what)\s+scheme\b[^?.!]{0,60}\b"
+    # "higher … : A or B?" is the two-scheme form of the same ask ("Which scheme
+    # has a higher total financial disbursement: Focus+ or CM-ELEVATE?", officer
+    # cross-scheme case CROSS-5, 2026-10-10, KI-214).
     r"(?:highest|lowest|most|least|maximum|minimum|greatest|biggest|largest|"
-    r"smallest|top|best|worst|more|less)\b|"
+    r"smallest|top|best|worst|more|less|higher|lower|bigger|larger|greater|smaller)\b|"
     r"\b(?:highest|lowest|most|least|maximum|minimum|greatest|biggest|largest|"
     r"smallest|top)\b[^?.!]{0,40}\bscheme\b|"
     r"\bscheme\s+with\s+(?:the\s+)?(?:highest|lowest|most|least|maximum|minimum|"
@@ -5109,7 +5332,12 @@ _CROSS_SCHEME_SUPERLATIVE = re.compile(
 _MONEY_SUPERLATIVE = re.compile(
     r"\bmoney\b|\bamount\b|\bspend\w*\b|\bspent\b|\bexpenditure\b|\bpaid\b|"
     r"\bpayment\w*\b|\bdisburs\w*\b|\breleas\w*\b|\bfunds?\b|\bcrore\b|\blakh\b|"
-    r"\bcost\b|\bbudget\b|\boutlay\b",
+    r"\bcost\b|\bbudget\b|\boutlay\b|"
+    # "Which scheme provided the highest total financial assistance across
+    # Meghalaya?" missed this ranking and went to model SQL, which left out
+    # MGNREGA and PMAY-G and named Focus Plus as the highest (officer case
+    # CROSS-12, 2026-10-10, KI-214). MGNREGA is first, at 30x Focus Plus.
+    r"\bassistance\b|\bfinancial\s+(?:support|aid|help|performance|output)\b",
     re.IGNORECASE,
 )
 
@@ -5220,6 +5448,488 @@ async def _cross_scheme_money_answer(question: str) -> dict:
         "row_count": len(ranked), "rows": ranked, "data": ranked,
         "answer": "\n".join(lines),
     }
+
+
+# ── Cross-scheme comparisons, answered deterministically (2026-10-10) ────────
+# The officers' 20 cross-scheme use cases (Cross Scheme Test Cases.csv: "compare
+# the beneficiary count across MGNREGA, PMAY-G, Focus+ and FOCUS", "district-wise
+# summary", "performance in <district>", "which scheme has the widest coverage")
+# failed 11 of 20 live on model SQL (docs/Cross_Scheme_UseCase_Retest_Report_
+# 2026-10-10.md): a branch that lost its district filter and reported a statewide
+# figure as East Khasi Hills (KI-227), "0 crore" three times from scheme codes the
+# money view does not hold (KI-218), a total that added lakh-, rupee- and DBT-money
+# and said "all four schemes" when seven were asked (KI-220), Focus Legacy
+# "beneficiaries" reading 102,021 or 11,906 depending on the wording (KI-228), an
+# un-aggregated branch that returned 8,627 blank rows (KI-223), a "highest" that was
+# not the highest (KI-226), and verifier rejections of the prescribed shape (KI-221).
+# Several figures of different KINDS in one answer is exactly where the model fails
+# (see _cross_scheme_money_answer above), so these shapes get fixed SQL instead: one
+# parameter-bound query per scheme and measure, each the figure that scheme's own
+# question returns (schema_context.py per-scheme rules: Focus Plus beneficiaries =
+# COUNT(DISTINCT beneficiary_key); CM Elevate applicants = COUNT(DISTINCT
+# request_id); PMAY-G NOT is_placeholder; MGNREGA money in lakh; the Unresolved
+# placeholder only off VILLAGE counts), side by side and never added together.
+#
+# Deliberately narrow, so everything else keeps its current path: two or more
+# schemes named and not only MGNREGA + PMAY-G (those two have the sanctioned
+# cross-scheme views and a tested model path), or no scheme named with an explicit
+# "across the schemes" / "each scheme" / "which scheme"; a beneficiary / money /
+# coverage / performance / summary ask; no specific year; no measure that only one
+# scheme holds (person-days, tranche, status, gender, sub-scheme, ...); and, after
+# entity resolution, at most a district, a district list or one block
+# (_cross_scheme_compare_answer returns None for a village, constituency, year,
+# tranche or sub-scheme, and the normal path runs as before).
+_XS_COUNT_CUE = re.compile(
+    r"\bbeneficiar\w*|\bapplica(?:nts?|tions?)\b|"
+    r"\bhow many (?:people|persons|households|families)\b|\bconcentration\b",
+    re.IGNORECASE)
+_XS_MONEY_CUE = re.compile(
+    r"\bmoney\b|\bamounts?\b|\bspend\w*|\bspent\b|\bexpenditure\b|\bexpenses?\b|\bpaid\b|"
+    r"\bpayments?\b|\bdisburs\w*|\breleas\w*|\bfunds?\b|\bfunding\b|\bcrores?\b|\blakhs?\b|"
+    r"\bfinancial\b|\bassistance\b|\boutlay\b|\bbudget\b|\bcost\b|\brupees?\b",
+    re.IGNORECASE)
+_XS_COVERAGE_CUE = re.compile(
+    r"\bcoverage\b|\bcover(?:ed|s)?\b|\bgeographic\w*|\bfootprint\b|\bwidest\b|\bspread\b",
+    re.IGNORECASE)
+_XS_OVERVIEW_CUE = re.compile(
+    r"\bperformance\b|\bperforming\b|\bsummary\b|\bsummari[sz]e\b|\boverview\b|\bscale\b",
+    re.IGNORECASE)
+# "across the schemes" / "each scheme" / "which scheme" — the only way an UNNAMED
+# question becomes a cross-scheme one here. Not "both schemes": that is the older
+# MGNREGA-and-PMAY-G phrasing and keeps its own path.
+_XS_ACROSS_CUE = re.compile(
+    r"\b(?:across|among|between|under|for|in|of)\s+(?:all\s+)?(?:the\s+)?"
+    r"(?:(?:different|various)\s+)?(?:schemes|programmes)\b|"
+    r"\b(?:each|every)\s+scheme\b|\ball\s+(?:the\s+)?schemes\b|"
+    r"\bwhich\s+(?:scheme|programme)\b|\bscheme[\s-]?wise\b|\bby\s+scheme\b",
+    re.IGNORECASE)
+_XS_BY_DISTRICT_CUE = re.compile(
+    r"\b(?:each|every|per|by|all)\s+(?:the\s+)?districts?\b|\bdistrict[\s-]?wise\b|"
+    r"\bacross\s+(?:all\s+)?(?:the\s+)?districts\b|\bwhich\s+districts?\b",
+    re.IGNORECASE)
+_XS_RANK_CUE = re.compile(
+    r"\bwhich\s+(?:scheme|programme|one)\b|\bidentify\s+which\b|\bleading\s+scheme\b|"
+    r"\bscheme\s+(?:that\s+)?leads\b",
+    re.IGNORECASE)
+_XS_TOP_DISTRICT_CUE = re.compile(
+    r"\bwhich\s+districts?\b|\b(?:top|leading)\s+districts?\b|\bconcentration\b",
+    re.IGNORECASE)
+# A measure only one scheme holds, a sub-scheme, a status / share / trend, a
+# village/block/constituency breakdown or a set question: the single-scheme logic
+# owns it, so the deterministic comparison steps aside.
+_XS_NOT_COVERED = re.compile(
+    r"\bperson[\s-]?days?\b|\bman[\s-]?days?\b|\bjob[\s-]?cards?\b|\b100[\s-]?days?\b|"
+    r"\bwomen\b|\bfemale\b|\bmale\b|\bgender\b|\bcaste\b|\bsc\b|\bst\b|"
+    r"\btranch\w*|\bbatch\w*|\bstatus\b|\bpending\b|\bon[\s-]?hold\b|\bapproved\b|"
+    r"\brejected\b|\bverif\w*|\bsanction\w*|\bloans?\b|\bsubsid\w*|\bbanks?\b|\bifsc\b|"
+    r"\bproducts?\b|\bsector\b|\bcategor\w*|\bonline\b|\bshgs?\b|\bself[\s-]?help\b|"
+    r"\bmembers?\b|\brevolving\b|\bcif\b|\bwages?\b|\bmaterial\b|\badmin\w*|"
+    r"\bcomplet\w*|\bstages?\b|\bplinth\b|\broof\b|\binstal{1,2}ments?\b|\baverage\b|"
+    r"\bavg\b|\bmean\b|\bper\s+(?:beneficiary|household|person|house|group|applicant|head)\b|"
+    r"\bpercent\w*|%|\bshare\b|\brate\b|\bratio\b|\bgrowth\b|\btrend\w*|\bmonth\w*|"
+    r"\byear[\s-]?(?:wise|on[\s-]?year)\b|\bby\s+year\b|\beach\s+(?:financial\s+)?year\b|"
+    r"\bevery\s+(?:financial\s+)?year\b|\bannual\w*|\bvillage[\s-]?wise\b|"
+    r"\b(?:each|per|by|every)\s+village\b|\bblock[\s-]?wise\b|\b(?:each|per|by|every)\s+block\b|"
+    r"\bconstituenc\w*|\bpiggery\b|\bpoultry\b|\bdairy\b|\bgoat\b|\bwarehouse\b|"
+    r"\bsericulture\b|\bweaving\b|\btaxi\b|\bcinema\b|\btourism\b|\bmotorcaravan\b|"
+    r"\bvehicles?\b|\bprime\b|\bseed\b|\bcommon\b|\boverlap\w*",
+    re.IGNORECASE)
+# How a scheme works is a KNOWLEDGE question, whatever else it says.
+_XS_KNOWLEDGE_CUE = re.compile(
+    r"\beligib\w*|\bcriteria\b|\bdocuments?\b|\bhow\s+(?:to|do|does|can)\b|\bapply\b|"
+    r"\bobjectives?\b|\bpurpose\b|\bfeatures?\b|\bcomponents?\b|\bguidelines?\b|"
+    r"\brules?\b|\bwho\s+can\b|\bdifference\s+between\b|\brecommend\w*|\bsuitable\b|"
+    r"\bshould\s+i\b|\bbest\s+for\b",
+    re.IGNORECASE)
+_XS_SPECIFIC_YEAR = re.compile(
+    r"\b(?:19|20)\d\d\b|\bfy\s*'?\d|\b(?:this|last|current|previous|next|past)\s+"
+    r"(?:financial\s+|fiscal\s+)?years?\b",
+    re.IGNORECASE)
+_XS_YEAR_WORDS = re.compile(r"\b(?:financial|fiscal)\s+years?\b", re.IGNORECASE)
+
+# (view, value expression, extra expression, fixed filter) per scheme and measure.
+# Money is in crore: MGNREGA total_exp is LAKH (/100), every other scheme RUPEES
+# (/1e7). CM Elevate has no money of any kind, so it has no money entry.
+_XS_MEASURES: "dict[tuple[str, str], tuple[str, str, str | None, str | None]]" = {
+    ("MGNREGA", "count"): ("v_employment", "SUM(households_employed)", None,
+                           "year_key = (SELECT MAX(year_key) FROM curated.v_employment)"),
+    ("MGNREGA", "money"): ("v_expenditure", "SUM(total_exp) / 100.0", None, None),
+    ("PMAY-G", "count"): ("v_pmay", "COUNT(*)", None, "NOT is_placeholder"),
+    ("PMAY-G", "money"): ("v_pmay", "SUM(amount_released) / 1e7", None, "NOT is_placeholder"),
+    ("Focus Plus", "count"): ("v_focus_plus", "COUNT(DISTINCT beneficiary_key)", None, None),
+    ("Focus Plus", "money"): ("v_focus_plus", "SUM(amount_disbursed) / 1e7", None, None),
+    ("CM Elevate", "count"): ("v_cm_elevate", "COUNT(DISTINCT request_id)", None, None),
+    ("Focus Legacy", "count"): ("v_focus_legacy", "SUM(no_of_pg_members)",
+                                "COUNT(DISTINCT pg_id)", None),
+    ("Focus Legacy", "money"): ("v_focus_legacy", "SUM(amount_disbursed) / 1e7", None, None),
+    ("CM Elevate Legacy", "count"): ("v_cm_elevate_disbursement", "COUNT(*)", None, None),
+    ("CM Elevate Legacy", "money"): ("v_cm_elevate_disbursement",
+                                     "SUM(total_disbursement) / 1e7", None, None),
+    ("NRLM", "count"): ("v_nrlm", "SUM(total_members)", "COUNT(*)", None),
+    ("NRLM", "money"): ("v_nrlm", "SUM(revolving_fund_amount + cif_amount) / 1e7", None, None),
+}
+_XS_COVERAGE_VIEW = {
+    "MGNREGA": "v_employment", "PMAY-G": "v_pmay", "Focus Plus": "v_focus_plus",
+    "CM Elevate": "v_cm_elevate", "Focus Legacy": "v_focus_legacy",
+    "CM Elevate Legacy": "v_cm_elevate_disbursement", "NRLM": "v_nrlm",
+}
+# Table column per scheme for the count measure — each names its own unit, because
+# a household, a house, a farmer, an application and a membership are not the same.
+_XS_COUNT_COLUMN = {
+    "MGNREGA": "MGNREGA households", "PMAY-G": "PMAY-G houses",
+    "Focus Plus": "Focus Plus beneficiaries", "CM Elevate": "CM Elevate applicants",
+    "Focus Legacy": "Focus Legacy memberships", "CM Elevate Legacy": "CM Elevate Legacy applicants",
+    "NRLM": "NRLM SHG members",
+}
+_XS_EXTRA_COLUMN = {"Focus Legacy": "Focus Legacy producer groups", "NRLM": "NRLM SHGs"}
+
+
+def _scheme_years_text(scheme: str) -> str:
+    """The financial years a scheme's data covers, in words — for the
+    cross-scheme answer and the multi-scheme year pause (KI-219)."""
+    if scheme == "NRLM":
+        return "the SHG register to date (no reporting year)"
+    ys = sorted(_SCHEME_DATA_YEARS.get(scheme) or [], key=_fy_start)
+    if not ys:
+        return "no year recorded"
+    if len(ys) == 1:
+        return f"FY {ys[0]}"
+    starts = [_fy_start(y) for y in ys]
+    if starts == list(range(starts[0], starts[0] + len(starts))):
+        return f"FY {ys[0]} to FY {ys[-1]}"
+    return ", ".join(f"FY {y}" for y in ys[:-1]) + f" and FY {ys[-1]}"
+
+
+def _cross_scheme_compare_plan(question: str) -> "dict | None":
+    """The schemes, measures and grain of a cross-scheme comparison this module
+    answers deterministically, or None to leave the question on its normal path."""
+    q = question or ""
+    if not q or _CROSS_SCHEME_SET_QUESTION.search(q) or _XS_NOT_COVERED.search(q) \
+            or _XS_KNOWLEDGE_CUE.search(q):
+        return None
+    scrub = _XS_YEAR_WORDS.sub(" ", _ALL_YEARS_CUE.sub(" ", q))
+    if _XS_SPECIFIC_YEAR.search(scrub):
+        return None
+    named = _named_schemes(q)
+    if len(named) >= 2:
+        if set(named) <= {"MGNREGA", "PMAY-G"}:
+            return None
+        schemes = [s for s in SCHEME_CATALOG if s in named]
+    elif not named and _XS_ACROSS_CUE.search(q):
+        schemes = list(SCHEME_CATALOG)
+    else:
+        return None
+    families = [f for f, rx in (("count", _XS_COUNT_CUE), ("money", _XS_MONEY_CUE),
+                                ("coverage", _XS_COVERAGE_CUE)) if rx.search(scrub)]
+    if not families:
+        if not _XS_OVERVIEW_CUE.search(scrub):
+            return None
+        families = ["count", "money"]
+    return {
+        "schemes": schemes, "families": families,
+        "by_district": bool(_XS_BY_DISTRICT_CUE.search(q)),
+        "rank": bool(_CROSS_SCHEME_SUPERLATIVE.search(q) or _XS_RANK_CUE.search(q)),
+        "top_district": bool(_XS_TOP_DISTRICT_CUE.search(q)),
+    }
+
+
+def _xs_query(scheme: str, family: str, area: "tuple[str, list[str]] | None",
+              grouped: bool) -> "tuple[str, list] | None":
+    """One parameter-bound query: a scheme's figure for one measure, for the whole
+    State or an area, optionally per district. None when the scheme has no such
+    measure (CM Elevate money)."""
+    if family == "coverage":
+        view = _XS_COVERAGE_VIEW[scheme]
+        # The Unresolved placeholder is never a real village (schema_context.py,
+        # every scheme that has one) — off village counts only. PMAY-G has none.
+        value = ("COUNT(DISTINCT village_code)" if scheme == "PMAY-G" else
+                 "COUNT(DISTINCT village_code) FILTER (WHERE entity_type IS DISTINCT FROM 'Unresolved')")
+        extra, fixed = "COUNT(DISTINCT lgd_district)", ("NOT is_placeholder" if scheme == "PMAY-G" else None)
+    else:
+        spec = _XS_MEASURES.get((scheme, family))
+        if spec is None:
+            return None
+        view, value, extra, fixed = spec
+    conds = [fixed] if fixed else []
+    params: list = []
+    if area:
+        # Focus Plus maps blocks on block_name_raw (lgd_block is NULL on 15% of rows).
+        col = "UPPER(block_name_raw)" if area[0] == "block" and scheme == "Focus Plus" else f"lgd_{area[0]}"
+        params.append(area[1])
+        conds.append(f"{col} = ANY($1::text[])")
+    if grouped:
+        conds.append("lgd_district IS NOT NULL")
+    cols = (["lgd_district AS district"] if grouped else []) + [f"{value} AS value"] + \
+        ([f"{extra} AS extra"] if extra else [])
+    sql = f"SELECT {', '.join(cols)}\nFROM curated.{view}"
+    if conds:
+        sql += "\nWHERE " + "\n  AND ".join(conds)
+    if grouped:
+        sql += "\nGROUP BY lgd_district\nORDER BY lgd_district"
+    return sql, params
+
+
+def _xs_shown(sql: str, params: list) -> str:
+    """The query as shown to the user: the bound area list written in."""
+    if not params:
+        return sql
+    lits = ", ".join("'" + str(v).replace("'", "''") + "'" for v in params[0])
+    return sql.replace("$1::text[]", f"ARRAY[{lits}]")
+
+
+def _xs_number(family: str, v) -> "float | int":
+    if v is None:
+        return 0
+    return round(float(v), 2) if family == "money" else int(v)
+
+
+def _xs_count_text(scheme: str, v: int, x: "int | None", latest_fy: str) -> str:
+    return {
+        "MGNREGA": f"{v:,} households given work in {latest_fy}",
+        "PMAY-G": f"{v:,} houses sanctioned",
+        "Focus Plus": f"{v:,} beneficiaries (individual farmers paid)",
+        "CM Elevate": f"{v:,} applicants (applications received — a request, not proof of funding)",
+        "Focus Legacy": f"{v:,} memberships paid for, in {x or 0:,} producer groups "
+                        "(no individual person is recorded)",
+        "CM Elevate Legacy": f"{v:,} applicant records (sanctions and disbursements)",
+        "NRLM": f"{v:,} SHG members, in {x or 0:,} Self Help Groups",
+    }[scheme]
+
+
+def _xs_place(area: "tuple[str, list[str]] | None", display: dict) -> str:
+    if not area:
+        return "Meghalaya"
+    names = [str(n).title() for n in area[1]]
+    if area[0] == "block":
+        return f"{(display or {}).get('block') or names[0]} block"
+    if len(names) == 1:
+        return (display or {}).get("district") or names[0]
+    return ", ".join(names[:-1]) + " and " + names[-1]
+
+
+async def _cross_scheme_compare_answer(question: str, plan: dict, entity_result: dict,
+                                       scope: "auth.UserScope | None" = None) -> "dict | None":
+    """Answer a cross-scheme comparison from fixed queries (see the block comment
+    above). None when the resolved scope is one this module does not cover."""
+    resolved = dict(entity_result.get("resolved") or {})
+    if resolved.get("year_key") and _ALL_YEARS_CUE.search(question or ""):
+        resolved.pop("year_key")
+    allowed = {"district", "district_list", "district_list_region", "block"}
+    if any(v for k, v in resolved.items() if k not in allowed):
+        return None
+    display = entity_result.get("display") or {}
+    schemes, families = plan["schemes"], plan["families"]
+    block = resolved.get("block") if isinstance(resolved.get("block"), str) else None
+    dlist = [d for d in (resolved.get("district_list") or []) if isinstance(d, str)]
+    district = resolved.get("district") if isinstance(resolved.get("district"), str) else None
+    if block:
+        area = ("block", [block.upper()])
+    elif len(dlist) >= 2:
+        area = ("district", [d.upper() for d in dlist])
+    elif district or dlist:
+        area = ("district", [(district or dlist[0]).upper()])
+    else:
+        area = None
+    by_district = (plan["by_district"] and (area is None or (area[0] == "district" and len(area[1]) >= 2))) \
+        or (area is not None and area[0] == "district" and len(area[1]) >= 2)
+    place = _xs_place(area, display)
+    # MGNREGA households are counted afresh each year with no household id to
+    # dedupe across years, so the figure is the latest year's (schema_context.py
+    # FAMILY C: "a single latest year_key for MGNREGA households_employed").
+    _mg_years = sorted(_SCHEME_DATA_YEARS.get("MGNREGA") or [], key=_fy_start)
+    latest_fy = f"FY {_mg_years[-1]}" if _mg_years else "the latest year"
+
+    jobs = []
+    for fam in families:
+        for s in schemes:
+            for grouped in ((False, True) if by_district else (False,)):
+                q = _xs_query(s, fam, area, grouped)
+                if q is not None:
+                    jobs.append((s, fam, grouped, q[0], q[1]))
+    shown = ";\n\n".join(_xs_shown(sql, params) for _s, _f, g, sql, params in jobs if not g)
+    if by_district:
+        shown += ";\n\n-- per district\n" + ";\n\n".join(
+            _xs_shown(sql, params) for _s, _f, g, sql, params in jobs if g)
+    if scope is not None and settings.AUTH_ENABLED:
+        decision = auth.authorize(scope, schemes=schemes, resolved_entities=resolved, sql=shown)
+        if not decision.allow:
+            logger.info("auth deny (%s) user=%s: %s", decision.check, scope.user_id, decision.reason)
+            return _denied(decision, schemes, resolved)
+    _sem = asyncio.Semaphore(4)
+
+    async def _run(sql, params):
+        async with _sem:
+            return [dict(r) for r in await fetch_rows(sql, params)]
+    results = await asyncio.gather(*(_run(sql, params) for _s, _f, _g, sql, params in jobs))
+    total: dict = {}
+    per_d: dict = {}
+    for (s, fam, grouped, _sql, _p), rows in zip(jobs, results):
+        if grouped:
+            per_d[(s, fam)] = {r["district"]: (_xs_number(fam, r.get("value")),
+                                              _xs_number("count", r.get("extra")) if "extra" in r else None)
+                               for r in rows}
+        else:
+            r = rows[0] if rows else {}
+            total[(s, fam)] = (_xs_number(fam, r.get("value")),
+                               _xs_number("count", r.get("extra")) if "extra" in r else None)
+    logger.info("cross-scheme deterministic answer: schemes=%s families=%s area=%s by_district=%s",
+                schemes, families, area, by_district)
+
+    heading = {"count": "Beneficiaries / applications", "money": "Money", "coverage": "Coverage"}
+    lines = [f"{'Across' if area is None or by_district else 'In'} {place}, each scheme's own figure:"]
+    for fam in families:
+        if len(families) > 1:
+            lines.append(f"\n**{heading[fam]}**")
+        for s in schemes:
+            if fam == "money" and s == "CM Elevate":
+                lines.append("- **CM Elevate** — no money recorded: the applications data holds no "
+                             "payment of any kind")
+                continue
+            v, x = total.get((s, fam), (0, None))
+            if fam == "count":
+                txt = _xs_count_text(s, v, x, latest_fy)
+            elif fam == "money":
+                txt = f"₹{v:,.2f} crore — {_MEASURE_PLAIN.get(s, 'amount')}"
+            else:
+                txt = f"{v:,} villages" + ("" if area else f" in {x or 0} districts")
+            if not v and area:
+                txt += f" (none recorded in {place})"
+            lines.append(f"- **{s}** — {txt}")
+
+    def _lead(fam: str, vals: "dict[str, tuple]") -> "list[str]":
+        pool = {s: t for s, t in vals.items() if not (fam == "money" and s == "CM Elevate")}
+        if not pool:
+            return []
+        key = (lambda s: (pool[s][1] or 0, pool[s][0])) if fam == "coverage" and area is None \
+            else (lambda s: pool[s][0])
+        best = max(key(s) for s in pool)
+        return [s for s in pool if key(s) == best and pool[s][0]]
+
+    rank_fam = "money" if "money" in families else ("coverage" if "coverage" in families else "count")
+    if plan["rank"] and len(schemes) > 1:
+        top = _lead(rank_fam, {s: total.get((s, rank_fam), (0, None)) for s in schemes})
+        if top:
+            v, x = total[(top[0], rank_fam)]
+            who = " and ".join(f"**{s}**" for s in top)
+            if rank_fam == "money":
+                lines.append(f"\nHighest amount: {who}, ₹{v:,.2f} crore.")
+            elif rank_fam == "coverage":
+                lines.append(f"\nWidest coverage: {who} — {v:,} villages"
+                             + ("" if area else f" across {x or 0} districts") + ".")
+            else:
+                lines.append(f"\nLargest figure: {who} ({_xs_count_text(top[0], v, x, latest_fy)}).")
+
+    rows_out: list[dict] = []
+    if by_district:
+        dists = area[1] if area and area[0] == "district" else sorted(
+            {d for t in per_d.values() for d in t if d})
+        lead_fam = rank_fam if rank_fam in families else families[0]
+        if plan["rank"] and len(schemes) > 1:
+            leaders: dict = {}
+            for d in dists:
+                top = _lead(lead_fam, {s: per_d.get((s, lead_fam), {}).get(d, (0, None)) for s in schemes})
+                leaders.setdefault(" and ".join(top) or "none", []).append(str(d).title())
+            if len(leaders) == 1:
+                who = next(iter(leaders))
+                lines.append(f"\nIn every one of the {len(dists)} districts the largest "
+                             f"{'amount' if lead_fam == 'money' else 'figure'} is **{who}**'s.")
+            else:
+                lines.append("\nLargest figure by district:")
+                for who, ds in sorted(leaders.items(), key=lambda kv: -len(kv[1])):
+                    lines.append(f"- **{who}** — {len(ds)} district{'s' if len(ds) != 1 else ''} "
+                                 f"({', '.join(ds)})")
+        else:
+            lines.append("\nWhere each scheme is highest" +
+                         (" and lowest" if not plan["top_district"] else "") + ":")
+            for s in schemes:
+                d_vals = {d: per_d.get((s, lead_fam), {}).get(d, (0, None))[0] for d in dists}
+                if not d_vals or (lead_fam == "money" and s == "CM Elevate"):
+                    continue
+                hi = max(d_vals, key=lambda d: d_vals[d])
+                fmt = (lambda n: f"₹{n:,.2f} cr") if lead_fam == "money" else (lambda n: f"{n:,}")
+                txt = f"highest in {str(hi).title()} ({fmt(d_vals[hi])})"
+                if not plan["top_district"] and len(d_vals) > 1:
+                    lo = min(d_vals, key=lambda d: d_vals[d])
+                    txt += f", lowest in {str(lo).title()} ({fmt(d_vals[lo])})"
+                lines.append(f"- **{s}** — {txt}")
+        for d in dists:
+            row: dict = {"District": str(d).title()}
+            for fam in families:
+                for s in schemes:
+                    if fam == "money" and s == "CM Elevate":
+                        continue
+                    v, x = per_d.get((s, fam), {}).get(d, (0, None))
+                    if fam == "count":
+                        row[_XS_COUNT_COLUMN[s]] = v
+                        if s in _XS_EXTRA_COLUMN:
+                            row[_XS_EXTRA_COLUMN[s]] = x or 0
+                    elif fam == "money":
+                        row[f"{s} (₹ crore)"] = v
+                    else:
+                        row[f"{s} villages"] = v
+            rows_out.append(row)
+    else:
+        for fam in families:
+            for s in schemes:
+                if fam == "money" and s == "CM Elevate":
+                    continue
+                v, x = total.get((s, fam), (0, None))
+                measure = (_XS_COUNT_COLUMN[s][len(s) + 1:] if fam == "count"
+                           else "₹ crore" if fam == "money" else "villages")
+                rows_out.append({"Scheme": s, "Measure": measure, "Value": v})
+
+    if len(schemes) > 1:
+        notes = []
+        if "count" in families:
+            units = {"MGNREGA": "households", "PMAY-G": "houses", "Focus Plus": "farmers",
+                     "CM Elevate": "applications", "Focus Legacy": "memberships",
+                     "CM Elevate Legacy": "applicant records", "NRLM": "SHG members"}
+            named = [units[s] for s in schemes if s in units]
+            notes.append("The counts measure different things — " + ", ".join(named[:-1]) +
+                         f" and {named[-1]} — so they are shown side by side and never added together.")
+        if "money" in families:
+            notes.append("The amounts are different kinds of money (expenditure incurred, money "
+                         "released, cash disbursed, remittances to groups), so they compare only "
+                         "indicatively and are not added together.")
+        win = []
+        for s in schemes:
+            yrs = _scheme_years_text(s)
+            if s == "MGNREGA" and "count" in families:
+                yrs += f" (households: {latest_fy} only — they cannot be added across years)"
+            win.append(f"{s} {yrs}")
+        notes.append("Years covered: " + "; ".join(win) + ".")
+        lines.append("\n" + " ".join(notes))
+    return {
+        "route": "data", "intent": "DATA", "confidence": "high", "schemes": schemes,
+        "resolved_entities": resolved, "sql": shown, "sql_query": shown,
+        "row_count": len(rows_out), "rows": rows_out[:20], "data": rows_out,
+        "answer": "\n".join(lines),
+    }
+
+
+async def _cross_scheme_compare_data(question: str, plan: dict,
+                                     scope: "auth.UserScope | None" = None,
+                                     prior_resolved: "dict | None" = None,
+                                     village_hint: "str | None" = None) -> "dict | None":
+    """Resolve the place, then answer deterministically — or None to fall back."""
+    schemes = plan["schemes"]
+    _near = acronym_near_misses(question)
+    if _near:
+        raise _acronym_near_miss_clarification(question, _near)
+    entity_result = await resolve_entities(question, schemes, prior_resolved=prior_resolved,
+                                            village_hint=village_hint)
+    if entity_result.get("question"):          # a year-gap rewrite: the normal path owns it
+        return None
+    res = entity_result.get("resolved") or {}
+    if not res.get("district") and not res.get("district_list"):
+        # "all of Garo Hills" / "Khasi Hills": a hill range is its districts, compared
+        # one by one — never a pause, the comparison already says "by district".
+        region = detect_region(question, schemes[0])
+        if region:
+            res["district_list"] = [d.upper() for d in region["districts"]]
+            res["district_list_region"] = region["canonical"]
+            entity_result.setdefault("display", {})["district"] = region["canonical"]
+    return await _cross_scheme_compare_answer(question, plan, entity_result, scope)
 
 
 def _focusplus_wants_overall_summary(question: str, schemes: list[str]) -> bool:
@@ -5409,6 +6119,23 @@ _MALFORMED_YEAR_CUE_RE = re.compile(
 )
 
 
+def _year_tokens_in(text: str):
+    """The year-shaped tokens in `text`, skipping any that an identifier word
+    introduces.
+
+    NRLM's shg_code runs 1..46000, so ~200 codes land in the 1900-2199 band that
+    _YEAR_RANGE_TOKEN_RE treats as a bare year. "How many members are in SHG code
+    1900?" had its CODE read as a financial year, failed the range check, and the
+    question died — every SHG from code 1900 to 2199 (all-SHGs run 2026-10-08,
+    60 consecutive failures before the boundary was spotted). A number the
+    question itself calls a code / id / number is never a year."""
+    for m in _YEAR_RANGE_TOKEN_RE.finditer(text or ""):
+        before = (text or "")[: m.start()]
+        if re.search(r"\b(?:shgs?|group|code|id|no\.?|number)\s*[:#]?\s*$", before, re.IGNORECASE):
+            continue
+        yield m
+
+
 def _years_in_question(text: str, schemes: "list[str] | None" = None
                        ) -> "tuple[list[str], list[str]]":
     """(available, unavailable) raw year tokens named in `text`.
@@ -5421,7 +6148,7 @@ def _years_in_question(text: str, schemes: "list[str] | None" = None
     largely answer."""
     ok: list[str] = []
     bad: list[str] = []
-    for m in _YEAR_RANGE_TOKEN_RE.finditer(text or ""):
+    for m in _year_tokens_in(text):
         tok = m.group(1)
         yk = _parse_year_key(tok)
         if yk is not None:
@@ -5561,7 +6288,7 @@ def _out_of_range_year_in(text: str, schemes: "list[str] | None" = None) -> "str
     """Raw text of the first financial-year token in `text` that NONE of the
     given scheme(s) hold, or None if every year mentioned is available / none is
     mentioned. Runs on raw text only — no LLM, no DB."""
-    for m in _YEAR_RANGE_TOKEN_RE.finditer(text or ""):
+    for m in _year_tokens_in(text):
         tok = m.group(1)
         yk = _parse_year_key(tok)
         if yk is not None:
@@ -6114,9 +6841,22 @@ def _parse_year_key(text: str) -> "int | None":
     'FY23', or a bare two-digit range like '25-26' with no century at all —
     users type financial years this way constantly (2026-09-10 UAT: "25-26" was
     not understood as a year), and without this branch the mention never
-    resolves to a year_key at all. Returns None if no plausible year
-    (2010-2039) is present."""
-    m = re.search(r"\b(20[1-3]\d)\s*[-/]\s*(?:20)?\d{2}\b", text)   # 2023-24 / 2023-2024
+    resolves to a year_key at all.
+
+    An EXPLICIT range ('1984-85', '1998-99') is accepted from 1900 on, because
+    the pair itself is unambiguous. NRLM is the first scheme whose data starts
+    before 2010 — its formation years run 1984-85 … 2022-23 — and while this
+    parser only understood 2010-2039, every pre-2010 year the pipeline offered
+    as a chip came back unparseable, was then reported as "no data is held for
+    that year", and the user was shown the same year list again: an endless
+    loop on "How many SHGs are there?" and anything else that paused for a year
+    (user report 2026-10-07, found by the loop sweep).
+
+    A BARE four-digit number stays restricted to 2010-2039 on purpose: "top 2000
+    villages" and ordinary quantities must not be read as a financial year.
+    Returns None when no plausible year is present."""
+    # 2023-24 / 2023-2024 / 1984-85 — an explicit range, so the century is safe.
+    m = re.search(r"\b((?:19|20)\d\d)\s*[-/]\s*(?:19|20)?\d{2}\b", text)
     if m:
         return int(m.group(1))
     m = re.search(r"\bfy\s*'?(\d{2})\b", text, re.IGNORECASE)        # FY23
@@ -6640,17 +7380,30 @@ _FOCUSPLUS_VILLAGE_NAMES: "dict[str, list[dict]] | None" = None
 _VILLAGE_FACT_SCHEMES = ("MGNREGA", "Focus Plus", "PMAY-G", "CM Elevate")
 # the single-scheme members that share the Focus Plus narrowing / pinning guards
 _VILLAGE_NARROW_SCHEMES = ("Focus Plus", "PMAY-G", "CM Elevate")
+# Village-grained schemes for the generic guards in _resolve_village_for — the
+# "a village's OWN name beats a look-alike" rule above all. NRLM belongs here but
+# NOT in _VILLAGE_NARROW_SCHEMES, which carries Focus Plus's own ward/urban-body
+# narrowing that NRLM's data has no counterpart for.
+_VILLAGE_EXACT_NAME_SCHEMES = _VILLAGE_NARROW_SCHEMES + ("NRLM",)
 
 
 def _village_scheme(schemes: "list[str] | None") -> "str | None":
     """The village-grained scheme the guards run for, or None. MGNREGA keeps the
     exact old gate (`schemes[0] == "MGNREGA"`, any list length); Focus Plus,
-    PMAY-G and CM Elevate only when they are the one scheme asked about."""
+    PMAY-G, CM Elevate and NRLM only when they are the one scheme asked about.
+
+    NRLM joined 2026-10-07 (all-villages run). v_nrlm is village-grained with
+    village_code on every row, and without this the exact-name rule in
+    _resolve_village_for never ran for it: "Mawmluh II" (an EXACT name, 12 SHGs)
+    was offered as ambiguous against the merely similar "MAWMLUH A", and "WEST
+    RANGASORA" against "EAST RANGASORA" — the very incident that rule's comment
+    records for MGNREGA. Every chip then re-asked the same question, so the
+    thread never ended."""
     if not schemes:
         return None
     if schemes[0] == "MGNREGA":
         return "MGNREGA"
-    if len(schemes) == 1 and schemes[0] in _VILLAGE_NARROW_SCHEMES:
+    if len(schemes) == 1 and schemes[0] in _VILLAGE_EXACT_NAME_SCHEMES:
         return schemes[0]
     return None
 
@@ -7123,6 +7876,22 @@ def _ac_drilldown_clarification(question: str, ac_display: str,
     blocks = contents.get("blocks") or []
     if not districts and not blocks:
         return None
+    # A constituency that lies inside ONE block and ONE district has nothing to
+    # narrow to: "the whole constituency" and "that block" select the same rows,
+    # so the pause offers two identical answers and the question goes
+    # unanswered. "Show me active SHGs in Rongjeng constituency" (1 block,
+    # 144 villages) paused here and never resolved, though the answer — 921
+    # active SHGs — was available (KI-192, NRLM use-case QA 2026-10-07).
+    #
+    # The level-collision flow is deliberately exempt. There the user typed a
+    # bare name that is BOTH a block and a constituency ("Sohra") and picked the
+    # AC chip, which rewrites the question with the literal phrase "assembly
+    # constituency" (_DIM_CHIP_WORD). Confirming the whole constituency still
+    # matters in that flow, because the user never said which level they meant —
+    # test_admin_level_collision.py §5 pins exactly that.
+    if (len(blocks) <= 1 and len(districts) <= 1
+            and not re.search(r"\bassembly\s+constituenc(?:y|ies)\b", question, re.IGNORECASE)):
+        return None
     stem = question.strip().rstrip(" ?.")
     options = [{"label": f"The whole {ac_display} constituency",
                 "question": f"{stem}, the whole constituency"}]
@@ -7192,7 +7961,13 @@ def _ac_drilldown_clarification(question: str, ac_display: str,
 # lookup and nothing more.
 _PLACE_PREP_RE = re.compile(
     r"\b(?:in|for|of|at|from|within|under)\s+"
-    r"(?P<name>[A-Za-z][A-Za-z.'-]*(?:\s+[A-Za-z][A-Za-z.'-]*){0,3}"
+    # "&" is part of a stored village name, not a separator: 5 villages carry one
+    # ("MAWKOHMIT & MAWKYNSAH", "MAWBLEI A & B"). Without it the scan truncated
+    # at the ampersand, offered the unmatchable "Mawkohmit", resolved no village,
+    # and the generator then put the NAME in the integer village_code column —
+    # "invalid input syntax for type integer" on every repair, and the question
+    # died in the KB fallback (all-villages run 2026-10-07).
+    r"(?P<name>[A-Za-z][A-Za-z.'-]*(?:\s+(?:&\s+)?[A-Za-z][A-Za-z.'-]*){0,3}"
     # A hyphenated marker is at most TWO short tokens ("- A", "- Ward No.4") —
     # bounded so it cannot run on into the rest of the sentence ("- Ward No.4
     # for CM Elevate"), which would never match a stored name.
@@ -7354,6 +8129,66 @@ def _explicit_level_in(question: str, schemes: "list[str] | None" = None) -> "st
         if _EXPLICIT_LEVEL_RE[dim].search(q):
             return dim
     return None
+
+
+# "<name> block" / "block <name>" / "in the <name> C&RD block" — the block named
+# OUTRIGHT in the question, with the word "block" attached to it.
+_NAMED_BLOCK_RE = re.compile(
+    r"([A-Za-z][\w'&.-]*(?:\s+[A-Za-z][\w'&.-]*){0,4})\s+blocks?\b"
+    r"|\bblocks?\s+(?:of\s+|named\s+)?([A-Za-z][\w'&.-]*(?:\s+[A-Za-z][\w'&.-]*){0,3})",
+    re.IGNORECASE)
+# Words that can sit between the name and "block" without being part of it.
+_BLOCK_FILLER = {"in", "the", "a", "an", "of", "for", "under", "within", "at",
+                 "from", "c&rd", "crd", "cd", "community", "and", "rural",
+                 "development", "block", "blocks"}
+
+
+def _block_named_for_village(question: str, mentions: dict,
+                             schemes: "list[str] | None") -> "str | None":
+    """The block this question names, used ONLY to tell same-named villages apart.
+
+    A block named in the same question is what distinguishes two villages that
+    share a name, but the branch that resolves a block is an `elif` further up:
+    a question naming BOTH a village and its block takes the other arm, so
+    resolved["block"] is empty when the village is resolved. The village then
+    came back "ambiguous", the pause listed candidates in OTHER blocks, and every
+    chip re-asked the same question — an endless thread on "Bhangarpar village,
+    Demdema block, West Garo Hills" and 4 more of the first 60 villages
+    (all-villages run 2026-10-07).
+
+    The mention-extractor cannot be relied on here: it tagged the block on one
+    call and dropped it on the next for the same question. So the question text
+    is scanned deterministically, and ONLY where the word "block" is attached to
+    the name — scan_dimension deliberately refuses to scan bare block names,
+    because 26 of 56 are also constituency or village names, and a bare hit could
+    silently filter a village question to a same-named block. With "block"
+    written next to it, that ambiguity is gone.
+
+    Narrowing only: the block branch above still owns resolved["block"] and every
+    district-vs-block reconciliation."""
+    if not schemes:
+        return None
+    cand = mentions.get("block")
+    if not cand:
+        for m in _NAMED_BLOCK_RE.finditer(question or ""):
+            text = (m.group(1) or m.group(2) or "").strip()
+            if not text:
+                continue
+            words = [w for w in text.split() if w.lower() not in _BLOCK_FILLER]
+            # The name is whatever sits closest to the word "block", so try the
+            # longest trailing window first: "in the Demdema C&RD block" ->
+            # "Demdema" once the filler is dropped. A 4-word block name
+            # ("Mylliem Community & Rural Development") still matches whole.
+            for i in range(len(words)):
+                part = " ".join(words[i:])
+                if not part:
+                    continue
+                r = resolve_dimension(part, schemes[0], "block")
+                if r.status == "resolved":
+                    return r.canonical
+        return None
+    r = resolve_dimension(str(cand), schemes[0], "block")
+    return r.canonical if r.status == "resolved" else None
 
 
 async def resolve_entities(question: str, schemes: list[str],
@@ -8321,6 +9156,22 @@ async def resolve_entities(question: str, schemes: list[str],
     _village_text = mentions.get("village") or village_hint
     if _stated_level is not None and _stated_level != "village":
         _village_text = None
+    # A name the question itself calls a BLOCK is never the village, whatever
+    # landed in the village slot. "…in Songgitalgre village, Rongram block, West
+    # Garo Hills" returned village=None on 6 of 8 identical extractor calls; the
+    # BLOCK name then flowed into this slot, resolved to the village "Rongram
+    # Bazar" (code 273541), and the answer was a confident 9 SHGs for a village
+    # that holds 8 — a silent wrong number, not a visible failure (all-villages
+    # run 2026-10-07). Cleared here, BEFORE the scan backstop below, so the
+    # backstop can still find the real village name sitting in the question.
+    if _village_text and schemes:
+        _blk_named = _block_named_for_village(question, {}, schemes)
+        if _blk_named and str(_village_text).strip().upper() == str(_blk_named).upper() \
+                and not re.search(rf"\b{re.escape(str(_village_text))}\s+village\b",
+                                  question, re.IGNORECASE):
+            logger.info("village slot held %r, which this question calls a block — cleared",
+                        _village_text)
+            _village_text = None
     # Deterministic backstop for a village the extractor dropped (see
     # _scan_village_in_question). Only when NOTHING else already placed this
     # turn's geography at village grain, and only when the question names no
@@ -8330,8 +9181,18 @@ async def resolve_entities(question: str, schemes: list[str],
     # down the normal village path above) or they chose a NON-village level,
     # and filling a village in behind that choice would answer at a grain they
     # explicitly declined.
+    # `_stated_level == "village"` used to skip this too, on the reasoning that
+    # the extractor's own mention had already gone down the village path. It
+    # hadn't: for "…in Doldegre village, Gambegre block, West Garo Hills" the
+    # extractor returned NO village at all (confirmed on 6 of 8 identical calls
+    # for one of these), so the slot was empty, the backstop was skipped, and
+    # nothing was filtered at village grain — the answer came back for a
+    # different village or for none. A question that SAYS "village" is the
+    # strongest possible signal that a village is wanted, so the backstop must
+    # run for it as well (all-villages run 2026-10-07).
     if not _village_text and not resolved.get("village_code") \
-            and not resolved.get("village_code_list") and _stated_level is None:
+            and not resolved.get("village_code_list") \
+            and _stated_level in (None, "village"):
         _scanned = await _scan_village_in_question(_scan_q, schemes[0] if schemes else "")
         if _scanned:
             _vname, _vhits = _scanned
@@ -8349,7 +9210,7 @@ async def resolve_entities(question: str, schemes: list[str],
             # ("..., SELSELLA block, WEST GARO HILLS"). Without this the
             # district scope alone can still leave several same-named villages
             # and the chip resolves only to block grain, losing the village.
-            _blk = resolved.get("block")
+            _blk = resolved.get("block") or _block_named_for_village(question, mentions, schemes)
             if _blk:
                 _by_block = [c for c in _vhits
                              if str(c.get("block") or "").upper() == str(_blk).upper()]
@@ -8417,8 +9278,20 @@ async def resolve_entities(question: str, schemes: list[str],
                     ],
                     rule="entity-ambiguous", village_hint=_vname)
     if _village_text:
+        # A block named in the SAME question is the thing that tells two
+        # same-named villages apart, but the branch that resolves a block is an
+        # `elif` further up: when a village is also mentioned it never runs, so
+        # resolved["block"] is empty here and the village came back "ambiguous"
+        # even though the user had already said which block they meant.
+        # "How many SHGs are there in Bhangarpar village, Demdema block, West
+        # Garo Hills?" asked which Bhangarpar was intended and listed candidates
+        # in OTHER blocks; tapping a chip re-asked the same thing, so the thread
+        # never ended (all-villages run 2026-10-07; 5 of the first 60 villages).
+        # Resolve the mentioned block here, for narrowing only — the branch above
+        # still owns resolved["block"] and every district-vs-block reconciliation.
+        _vblock = resolved.get("block") or _block_named_for_village(question, mentions, schemes)
         r = await _resolve_village_for(schemes, _village_text, district=district_canon,
-                                   block=resolved.get("block"))
+                                   block=_vblock)
         if r.status == "ambiguous":
             # Two candidates can share the same (name, district) while being
             # genuinely different villages in different blocks with their own
@@ -9776,6 +10649,129 @@ def _pmay_crore_to_rupees(schemes: list[str], sql: str) -> str:
     return _PMAY_CRORE_ALIAS_RE.sub(lambda m: f"AS {m.group(1) or 'amount'}_rupees", sql)
 
 
+_NRLM_TRAILING_LIMIT = re.compile(r"\s+LIMIT\s+(\d+)\s*;?\s*$", re.IGNORECASE)
+# "each / every / all / -wise / per / compare across" asks for EVERY group —
+# _NRLM_RULES rule 13 says so outright ("return all 12 districts or all 56
+# blocks with NO LIMIT").
+_NRLM_EVERY_GROUP_Q = re.compile(
+    r"\beach\b|\bevery\b|\ball\b|\b\w+-wise\b|\bper\s+(?:district|block|village|year|"
+    r"constituency)\b|\bcompare\b|\bcomparison\b|\bbreakdown\b|\bby\s+(?:district|block|"
+    r"village|year|financial\s+year|constituency)\b",
+    re.IGNORECASE)
+
+
+def _nrlm_unrequested_limit(question: str, schemes: list[str], sql: str) -> str:
+    """Drop a LIMIT the question never asked for from a grouped NRLM result.
+
+    "Compare the number of active and inactive SHGs in each district" was generated
+    as GROUP BY district AND formation year — 360 groups — then capped at 100. The
+    answer summed the 100 rows it got and reported "13,509 active and 462 inactive
+    SHGs across all districts and financial years"; the true figures are 39,432 and
+    1,197 (KI-188, NRLM use-case QA 2026-10-07). A question asking for every group
+    must not be truncated. Mirrors _cm_legacy_unrequested_limit (KI-168)."""
+    if schemes != ["NRLM"] or not sql:
+        return sql
+    m = _NRLM_TRAILING_LIMIT.search(sql)
+    if not m or not re.search(r"\bGROUP\s+BY\b", _mask_sql_literals(sql), re.IGNORECASE):
+        return sql
+    q = question or ""
+    # An explicit "top 5" / "which district has the most" wants the cap kept.
+    if _EXPLICIT_COUNT.search(q) or re.search(r"\b(?:top|bottom|first|last)\s+\d+\b", q, re.IGNORECASE):
+        return sql
+    if not _NRLM_EVERY_GROUP_Q.search(q):
+        return sql
+    logger.info("NRLM: dropped an unrequested LIMIT %s from a grouped result (KI-188)", m.group(1))
+    return sql[:m.start()]
+
+
+# "How many SHGs …" / "the number of SHGs …" — the answer is ONE figure.
+# "List / show / which / give me a report of" ask for the rows themselves and are
+# deliberately NOT here: a capped list is the right shape for them.
+_NRLM_COUNT_ASK_RE = re.compile(
+    r"\bhow many\b|\bnumber of\b|\bcount of\b|\btotal (?:number|count)\b", re.IGNORECASE)
+# …but "WHICH SHGs have the highest NUMBER OF female members" is a RANKING of
+# SHGs that happens to contain "number of": the rows ARE the answer, and forcing
+# COUNT(*) on it loses the question (it stopped answering at all on the live
+# re-run, 2026-10-07). "Which/who/name/list/show … highest/lowest/most/top" is
+# the ranking shape, and it wins over the count cue.
+_NRLM_RANKING_ASK_RE = re.compile(
+    r"\b(?:which|who|what|name|list|show|identify|find)\b[^?]*"
+    r"\b(?:highest|lowest|most|least|largest|smallest|top|bottom|maximum|minimum|max|min)\b"
+    r"|\b(?:highest|lowest|most|least|top|bottom)\b[^?]*\b(?:shgs?|groups?|villages?|blocks?|"
+    r"districts?|constituenc\w+)\b",
+    re.IGNORECASE)
+# A SELECT that returns the rows rather than a figure: it names per-SHG columns
+# and carries no aggregate at all.
+_NRLM_PER_SHG_COL_RE = re.compile(
+    r"\b(?:shg_code|shg_name|lgd_village_name|village_code)\b", re.IGNORECASE)
+_NRLM_AGG_RE = re.compile(r"\b(?:COUNT|SUM|AVG|MIN|MAX)\s*\(", re.IGNORECASE)
+
+
+def _nrlm_count_question_listed_rows(question: str, schemes: list[str],
+                                     sql: str) -> "str | None":
+    """Repair instruction for a "how many SHGs" query that lists rows instead of counting.
+
+    "How many SHGs are registered under Umling block?" generated a per-SHG SELECT with
+    LIMIT 100. 40 rows came back, the composer wrote "Here are the 40 results", and the
+    officer was given 40 — the true figure is 1,167. The same shape made a district
+    comparison report "all five districts and twenty-seven financial years" when NRLM has
+    12 districts and 30 formation years (KI-188, NRLM use-case QA 2026-10-07). This is the
+    class the CM Elevate Legacy TC-25/TC-36 fix addressed for the renderer; here the fault
+    is upstream, in the query shape, so it is repaired before the rows are ever fetched.
+
+    Returns None unless the question asks HOW MANY and the SQL has no aggregate at all."""
+    if schemes != ["NRLM"] or not sql or not _NRLM_COUNT_ASK_RE.search(question or ""):
+        return None
+    if _NRLM_RANKING_ASK_RE.search(question or ""):
+        return None                       # a ranking: the rows are the answer
+    head = re.split(r"\bFROM\b", sql, 1, flags=re.IGNORECASE)[0]
+    if _NRLM_AGG_RE.search(head) or not _NRLM_PER_SHG_COL_RE.search(head):
+        return None
+    return ("this question asks HOW MANY, so the answer is a single figure, but the query "
+            "selects individual SHG rows and carries a LIMIT — the number of rows returned "
+            "is the page size, not the answer, and reporting it states a count that is wrong "
+            "by orders of magnitude. Return COUNT(*) AS shgs instead (add the grouping "
+            "column and GROUP BY it if the question asks per district/block/year, with no "
+            "LIMIT), and keep every filter exactly as it was.")
+
+
+# "find all SHGs with the name X", "SHGs called X", "search for X" — a question
+# that asks for every SHG whose name carries the text, not one exact string.
+_NRLM_NAME_SEARCH_Q_RE = re.compile(
+    r"\b(?:find|list|show|search|which|what|all)\b[^?]*\b(?:shgs?|groups?)\b[^?]*"
+    r"\b(?:named?|called|name\s+(?:is|of|like|contain\w*)|with\s+the\s+name)\b"
+    r"|\b(?:named?|called)\b[^?]*\b(?:shgs?|groups?)\b",
+    re.IGNORECASE)
+# shg_name = 'X'  /  shg_name LIKE 'X' with no wildcard of its own.
+_NRLM_NAME_EQ_RE = re.compile(
+    r"\bshg_name\s*(?:=|(?:I?LIKE))\s*'((?:[^']|'')*)'", re.IGNORECASE)
+
+
+def _nrlm_name_search_contains(question: str, schemes: list[str], sql: str) -> str:
+    """A "find all SHGs with the name X" search must match names CONTAINING X.
+
+    UC5 "Find all SHGs with the name Sun Flower" generated shg_name = 'Sun Flower'
+    and returned 2 rows; 20 SHG names contain "Sun Flower" ('Sun Flower Shg',
+    'Sun Flower Self Help Group', …), so 18 of the groups the officer asked for were
+    silently dropped (KI-195, NRLM use-case QA 2026-10-07).
+
+    _NRLM_RULES rule 12 already tells the model a name search uses ILIKE and that
+    shg_name is not an identity (295 SHGs share 'Iatreilang Shg'), but the prose rule
+    did not hold — hence this rewrite (CLAUDE.md §5). Only touched when the question
+    is a name SEARCH and the literal carries no wildcard of its own; an exact lookup
+    the user pinned, and a pattern the model already wrote, are left alone."""
+    if schemes != ["NRLM"] or not sql or not _NRLM_NAME_SEARCH_Q_RE.search(question or ""):
+        return sql
+
+    def widen(m: "re.Match") -> str:
+        lit = m.group(1)
+        if "%" in lit or "_" in lit:          # already a pattern — leave it
+            return m.group(0)
+        return f"shg_name ILIKE '%{lit}%'"
+
+    return _NRLM_NAME_EQ_RE.sub(widen, sql)
+
+
 def _pmay_comparison_limit(schemes: list[str], entity_result: dict, sql: str) -> str:
     """A comparison of N named areas must return N rows. "Which has more completed
     houses: Maweitnar or Rohonpara?" came back with LIMIT 1 and the answer named only
@@ -10102,6 +11098,241 @@ def _mgnrega_money_units(answer: str, sql: str, rows: list[dict]) -> str:
     for form in sorted(forms, key=len, reverse=True):
         answer = re.sub(rf"(?<![\d.,]){re.escape(form)}(?![\d])(?!\s*(?:lakh|lac|crore|cr\b|%))",
                         f"{form} lakh", answer)
+    return answer
+
+
+# An NRLM status/money filter is a condition on the row itself, not a lookup of
+# a name the user typed, so an empty result cannot be a misspelling — it is the
+# answer "none". Place and name filters are deliberately excluded: those CAN be
+# misspelt, and "no such village" must stay a no-records message (the same
+# reasoning as _cme_zero_programmes_answer).
+_NRLM_SELF_CONTAINED_FILTER_RE = re.compile(
+    r"^\s*(?:NOT\s+)?is_active\s*$"
+    r"|^\s*(?:revolving_fund_amount|cif_amount)\s*[<>=]+\s*\d+\s*$"
+    r"|^\s*shg_type\s*=\s*'[^']*'\s*$"
+    r"|^\s*(?:male_members|female_members|total_members)\s*[<>=]+\s*\d+\s*$",
+    re.IGNORECASE)
+_NRLM_WHERE_RE = re.compile(r"\bWHERE\b(.*?)(?:\bGROUP\s+BY\b|\bORDER\s+BY\b|\bLIMIT\b|$)",
+                            re.IGNORECASE | re.DOTALL)
+
+
+_NRLM_COUNTED_METRIC = {
+    "shgs": "SHGs", "shg_count": "SHGs", "n": "SHGs", "count": "SHGs",
+    "total_shgs": "SHGs", "active_shgs": "active SHGs",
+    "inactive_shgs": "inactive SHGs",
+    "members": "members", "total_members": "members",
+    "female_members": "female members", "male_members": "male members",
+}
+# Money, which the SQL scales and names in the alias. The unit is restored in the
+# sentence so "0" never reads as "0 lakh" or "0 crore" ambiguously.
+_NRLM_ZERO_MONEY = {
+    "cif": "CIF", "cif_cr": "CIF", "cif_lakh": "CIF", "cif_rupees": "CIF",
+    "cif_amount": "CIF", "total_cif": "CIF",
+    "rf": "revolving fund", "rf_cr": "revolving fund", "rf_lakh": "revolving fund",
+    "rf_rupees": "revolving fund", "revolving_fund_amount": "revolving fund",
+    "total_rf": "revolving fund",
+}
+
+
+def _nrlm_counted_zero_answer(sql: str, rows: list[dict],
+                              display: "dict | None") -> "str | None":
+    """A single NRLM row whose only metric is 0 — stated as the real zero it is.
+
+    `compose_response`'s guidance deliberately refuses to assert a real zero when a
+    value comes back 0 or NULL, because that shape is also how a metric the schema
+    does not carry arrives. For NRLM that produced "The data available doesn't cover
+    the count of SHGs for East Garo Hills in FY 1984-85" — when the count is simply
+    **0**: one SHG in the whole state was formed in 1984-85, and it is in West Garo
+    Hills. The officer cannot tell a measured zero from a missing metric (the same
+    complaint as KI-194, in the non-empty path; found by the loop sweep 2026-10-07).
+
+    Narrow on purpose: NRLM only, one row, one metric, that metric is a COUNT or a
+    member SUM the query really selected, and the SQL carries a WHERE (so a filter
+    genuinely matched nothing rather than the column being absent). Anything else
+    keeps the existing cautious wording."""
+    if not rows or len(rows) != 1 or not sql:
+        return None
+    metrics = _row_metrics(rows[0])
+    if len(metrics) == 1:
+        col, val = metrics[0]
+        if val not in (0, None):
+            return None
+    elif not metrics and len(rows[0]) == 1:
+        # An aggregate that matched nothing comes back as one NULL cell, and
+        # _row_metrics drops NULLs (they are not numbers) — so SUM(...) over no
+        # rows lands here, not above. Still a measured zero.
+        col, val = next(iter(rows[0].items()))
+        if val is not None:
+            return None
+    else:
+        return None
+    key = str(col).lower()
+    label = _NRLM_COUNTED_METRIC.get(key)
+    money = _NRLM_ZERO_MONEY.get(key) if label is None else None
+    if label is None and money is None:
+        return None
+    if not re.search(r"\bWHERE\b", _mask_sql_literals(sql), re.IGNORECASE):
+        return None
+    # It must really be a counted/summed metric, not a bare column read.
+    if not re.search(r"\b(?:COUNT|SUM)\s*\(", sql, re.IGNORECASE):
+        return None
+    d = display or {}
+    where = " ".join(p for p in (
+        d.get("village") and "%s village" % d["village"],
+        d.get("block") and "%s block" % d["block"],
+        d.get("district"),
+    ) if p) or "Meghalaya"
+    when = " in %s" % d["year"] if d.get("year") else ""
+    if money:
+        return ("%s has received ₹0 of %s%s — no SHG there holds any. That is a "
+                "real zero in the NRLM register, not missing data."
+                % (where, money, when))
+    return ("%s has 0 %s recorded%s. That is a real zero in the NRLM register, "
+            "not missing data." % (where, label, when))
+
+
+def _nrlm_zero_answer(sql: str) -> "str | None":
+    """An empty NRLM result that provably means "none", worded as such.
+
+    "Which inactive SHGs have received CIF or RF funds?" returned no rows, and the
+    officer was told "I couldn't find any matching records in the data available" —
+    which reads as the data being missing. The real answer is a meaningful zero: not
+    one of the 1,197 inactive SHGs holds any CIF or RF (the NR-15 finding the scheme
+    README records). An officer cannot act on "none exist" if we word it as "nothing
+    found" (KI-194, NRLM use-case QA 2026-10-07).
+
+    Only fires when every WHERE condition is a self-contained test on the row's own
+    status, money, type or member columns. A query naming a place or an SHG name is
+    left alone, because there an empty result may be a misspelling rather than a zero.
+    Mirrors _cme_zero_programmes_answer (KI-182)."""
+    m = _NRLM_WHERE_RE.search(sql or "")
+    if not m:
+        return None
+    where = m.group(1)
+    if re.search(r"\b(?:SELECT|JOIN|EXISTS)\b", where, re.IGNORECASE):
+        return None
+    # Split on the boolean operators only; a condition that is not self-contained
+    # (a place, a name, a year) makes the whole query ineligible.
+    # The model writes multi-line SQL, so strip whitespace as well as the
+    # parentheses — and strip them repeatedly, because a condition can end
+    # ")\n" ("... OR cif_amount > 0)\n").
+    parts = []
+    for p in re.split(r"\bAND\b|\bOR\b", where, flags=re.IGNORECASE):
+        prev = None
+        while p != prev:
+            prev = p
+            p = p.strip().strip("()").strip()
+        if p:
+            parts.append(p)
+    if not parts or not all(_NRLM_SELF_CONTAINED_FILTER_RE.match(p) for p in parts):
+        return None
+    inactive = bool(re.search(r"\bNOT\s+is_active\b", where, re.IGNORECASE))
+    money = bool(re.search(r"\b(?:revolving_fund_amount|cif_amount)\s*>\s*0", where, re.IGNORECASE))
+    if inactive and money:
+        return ("None — not one of the 1,197 inactive SHGs has received any CIF or revolving "
+                "fund. Every inactive SHG in the data holds ₹0 of both. This is a real zero in "
+                "the records, not missing data.")
+    return ("None — no SHG in the data meets those conditions. This is a real zero in the "
+            "records, not missing data.")
+
+
+# NRLM money columns, and the formation-year column that must never date them.
+_NRLM_MONEY_COL_RE = re.compile(
+    r"\b(?:revolving_fund_amount|cif_amount)\b|\b(?:rf|cif)_(?:cr|lakh|rupees|held_cr|held_lakh)\b",
+    re.IGNORECASE)
+_NRLM_YEAR_COL_RE = re.compile(
+    r"\bformation_(?:financial_year(?:_short)?|year_key)\b", re.IGNORECASE)
+# The caveat is already present if the answer says any of this.
+_NRLM_COHORT_SAID_RE = re.compile(
+    r"cumulat|undated|no release date|not a release|formed in|formation year|"
+    r"hold(?:s|ing)? to date|as at the extract|not money (?:released|disbursed|spent)",
+    re.IGNORECASE)
+_NRLM_COHORT_NOTE = (
+    " Please read this as a cohort figure, not as spending in those years: NRLM fund "
+    "amounts (RF and CIF) are cumulative totals each SHG has received to date, with no "
+    "release date in the data. Grouping them by the formation year shows what the SHGs "
+    "formed in each year hold today — not money released in that year, and a year-on-year "
+    "difference in it is not growth.")
+
+
+def _nrlm_money_year_caveat(answer: str, sql: str, schemes: "list[str] | None") -> str:
+    """Attach the cohort caveat when an NRLM money figure has been placed in a year.
+
+    RF and CIF are cumulative and undated — the only year in NRLM is the year the SHG was
+    FORMED — so filtering or grouping money by it returns what that cohort holds today, a
+    figure that looks exactly like the annual release the officer asked for.
+    `data/NRLM/README.md` calls this "the single highest-risk wrong-number path in the
+    scheme", and `nrlm_classification_rules.yaml` already marks `money_in_a_year_requested`
+    and `money_trend_or_growth_requested` as `critical` — but nothing read those rules, so
+    they never fired: UC37 answered "the highest single-year value was 25.08 crore in
+    2017-18" as a plain trend (KI-191, NRLM use-case QA 2026-10-07).
+
+    This is the deterministic third layer the project requires for a wrong-number bug
+    (CLAUDE.md §5): the prompt rule (schema_context _NRLM_RULES rule 3) and the few-shot
+    refusals are layers one and two. It never changes a number and never blocks an answer —
+    it states what the number means, and only when the SQL actually put money and the
+    formation year together."""
+    if not answer or schemes != ["NRLM"] or not sql:
+        return answer
+    if not (_NRLM_MONEY_COL_RE.search(sql) and _NRLM_YEAR_COL_RE.search(sql)):
+        return answer
+    if _NRLM_COHORT_SAID_RE.search(answer):
+        return answer
+    return answer.rstrip() + _NRLM_COHORT_NOTE
+
+
+# A result column whose SQL alias already declares the scale it was divided to.
+# These are the SQL-prompt conventions _metric_label renders ("_cr" -> "₹ crore").
+_SCALED_MONEY_SUFFIX = (("_cr", "crore"), ("_crore", "crore"),
+                        ("_lakh", "lakh"), ("_lac", "lakh"))
+# "98.48" is already followed by its unit, a percent sign, or is part of a
+# bigger number / a year — then it needs nothing added.
+_UNIT_ALREADY = r"(?!\s*(?:crore|cr\b|lakh|lac\b|%|per\s*cent))"
+
+
+def _scaled_money_units(answer: str, rows: list[dict]) -> str:
+    """Add the missing "crore"/"lakh" after a money value the answer states bare.
+
+    The SQL divides by 1e7 or 1e5 and says so in the column alias (cif_cr,
+    rf_lakh), but the composer writes prose and repeatedly dropped the word:
+    "The total CIF amount recorded across all SHGs ... is 98.48." for ₹98.48
+    crore. An officer reads that as ninety-eight rupees — the figure is wrong by
+    a factor of ten million (KI-190, NRLM use-case QA 2026-10-07; the same
+    rupee-unit risk data/NRLM/README.md records as NR-07).
+
+    Deterministic by design: a prompt rule alone has repeatedly failed under
+    sampling (CLAUDE.md §5). Only values that actually appear in the result are
+    touched, and only when the answer states them with no unit of their own, so
+    this can never invent or rescale a number. Mirrors _mgnrega_money_units,
+    which does the same for that scheme's un-suffixed lakh columns."""
+    if not answer or not rows:
+        return answer
+    # value -> unit word, for every scaled money cell in the result.
+    forms: dict[str, str] = {}
+    for r in rows[:60]:
+        for k, v in r.items():
+            unit = next((u for sfx, u in _SCALED_MONEY_SUFFIX
+                         if str(k).lower().endswith(sfx)), None)
+            if unit is None:
+                continue
+            n = _as_number(v)
+            if n is None:
+                continue
+            f = float(n)
+            # Both the plain and the thousands-separated rendering; the longest
+            # is substituted first so "1,234.50" wins over "234.50".
+            for form in (f"{f:,.2f}", f"{f:.2f}"):
+                forms.setdefault(form, unit)
+            if f == int(f):
+                for form in (f"{int(f):,}", str(int(f))):
+                    forms.setdefault(form, unit)
+    for form in sorted(forms, key=len, reverse=True):
+        # Not followed by another digit, nor by a '.'/',' that continues the
+        # number ("98.48" inside "98.489"). A sentence-ending "98.48." does NOT
+        # continue it, so the lookahead only rejects a separator with a digit
+        # after it.
+        answer = re.sub(rf"(?<![\d.,]){re.escape(form)}(?![\d])(?![.,]\d){_UNIT_ALREADY}",
+                        f"{form} {forms[form]}", answer)
     return answer
 
 
@@ -11493,8 +12724,13 @@ def _verifier_year_complaint_is_false(issue: str, resolved: dict, sql: str) -> b
     # A view that carries the FY label filters on it instead — financial_year_short
     # = '2024-25' IS year_key 2024 (Focus Legacy QA TC-23, 2026-09-25: rejected as
     # "the resolved entity value (2024) is not present in the WHERE clause").
-    filters |= set(re.findall(r"\bfinancial_year(?:_short)?\s*=\s*'(\d{4})-\d{2}'", sql or "",
-                              re.IGNORECASE))
+    # NRLM's column is formation_financial_year_short and is the ONLY year it has,
+    # so the same false positive killed "total CIF and RF for 2017-18": the
+    # verifier demanded year_key = 2017 on 4 of 4 repairs and the question died in
+    # the KB fallback (KI-191 follow-up, NRLM use-case QA 2026-10-07).
+    filters |= set(re.findall(
+        r"\b(?:formation_)?financial_year(?:_short)?\s*=\s*'(\d{4})-\d{2}'", sql or "",
+        re.IGNORECASE))
     return filters == {str(int(year))}
 
 
@@ -11567,8 +12803,24 @@ _VILLAGE_CODE_EQ_RE = re.compile(r"\bvillage_code\s*=\s*'?(\d+)'?", re.IGNORECAS
 # returned no expenditure for a village with 26.22 lakh (all-villages QA
 # 2026-09-26). Removed when one village was resolved and the SQL filters it.
 _GEO_BESIDE_VILLAGE_RE = re.compile(
+    # the NAME columns: AND lgd_block = 'X'
     r"\s+AND\s+(?:UPPER\s*\(\s*)?(?:[A-Za-z_]+\.)?lgd_(?:block|district)(?:\s*\))?\s*=\s*"
-    r"(?:UPPER\s*\(\s*)?'[^']*'(?:\s*\))?", re.IGNORECASE)
+    r"(?:UPPER\s*\(\s*)?'[^']*'(?:\s*\))?"
+    # the CODE columns: AND block_lgd_code = 656. The generator guesses these
+    # even more freely than the names — "Singsanggre village, Bajengdoba block,
+    # North Garo Hills" got `block_lgd_code = 656 AND district_lgd_code = 273`,
+    # where 656 is North Garo Hills' DISTRICT code used as a block code and 273
+    # is East Garo Hills entirely. The village holds 3 SHGs; the answer was a
+    # confident 0. 21 of the first 30 village failures were this exact shape
+    # (all-villages run 2026-10-07).
+    # …and the same columns given a NON-numeric literal. The generator wrote
+    # `block_lgd_code = 'RANIKOR'` — the block NAME in the integer code column —
+    # so Postgres raised "invalid input syntax for type integer", every repair
+    # wrote it again, and 5 Ranikor villages died in the KB fallback. The
+    # village_code beside it already identifies the place, so dropping the clause
+    # is both correct and the only thing that clears the type error.
+    r"|\s+AND\s+(?:[A-Za-z_]+\.)?(?:block|district)_lgd_code\s*=\s*(?:'[^']*'|\d+)",
+    re.IGNORECASE)
 
 
 # Focus Plus single-village queries (all-villages run 2026-09-27). With ONE
@@ -11668,9 +12920,20 @@ def _focusplus_pin_village_where(schemes: list[str], entity_result: dict, sql: s
     return new
 
 
+# Schemes whose curated view carries village_code as the village's identity, so a
+# block/district literal beside it can only narrow it wrongly. NRLM joined
+# 2026-10-07: "Pabomari village, Demdema block" resolved village_code 272748
+# correctly and the generator then wrote `AND lgd_block = 'DEMDHEMA'` — a block
+# spelling that exists nowhere in the data — producing a confident "0 SHGs" for a
+# village that holds 23 (all-villages run). Same failure as MGNREGA's MAWLIEH
+# above; the guard simply had not been widened past MGNREGA.
+_VILLAGE_CODE_SCHEMES = ("MGNREGA", "NRLM")
+
+
 def _mgnrega_drop_geo_beside_village(schemes: list[str], entity_result: dict, sql: str) -> str:
     code = (entity_result.get("resolved") or {}).get("village_code")
-    if "MGNREGA" not in schemes or not code or isinstance(code, (list, tuple)) or not sql:
+    if not any(s in schemes for s in _VILLAGE_CODE_SCHEMES) or not code \
+            or isinstance(code, (list, tuple)) or not sql:
         return sql
     if not re.search(rf"\bvillage_code\s*=\s*'?{int(code)}\b", sql):
         return sql
@@ -11773,19 +13036,30 @@ def _resolved_scope_missing(question: str, schemes: list[str], entity_result: di
 
 def _mgnrega_pin_village_code(schemes: list[str], entity_result: dict, sql: str) -> str:
     code = (entity_result.get("resolved") or {}).get("village_code")
-    if "MGNREGA" not in schemes or not code or isinstance(code, (list, tuple)) or not sql:
+    if not any(s in schemes for s in _VILLAGE_CODE_SCHEMES) or not code \
+            or isinstance(code, (list, tuple)) or not sql:
         return sql
+    # A NON-NUMERIC literal in the integer column: the generator wrote
+    # `village_code = 'RANIKOR'` — the BLOCK name — so Postgres raised "invalid
+    # input syntax for type integer", every repair wrote it again, and the
+    # question died in the KB fallback (all-villages run 2026-10-07, 5 Ranikor
+    # villages). The resolved code is known, so substitute it rather than let the
+    # repair budget burn on a type error.
+    _bad_text = re.compile(r"\bvillage_code\s*=\s*'([^']*[^\d'][^']*)'", re.IGNORECASE)
+    if _bad_text.search(sql):
+        logger.info("SQL put a non-numeric literal in village_code; resolved %s — substituted", code)
+        sql = _bad_text.sub(f"village_code = {int(code)}", sql)
     # An IN-list with extra codes: "MAWKOHMIT & MAWKYNSAH" (277073) came back as
     # village_code IN (277073, 277074) — a neighbour's 5,387 person-days added to
     # a village that recorded 0 (all-villages QA 2026-09-26).
     in_re = re.compile(r"\bvillage_code\s+IN\s*\(\s*[\d\s,']+\)", re.IGNORECASE)
     if in_re.search(sql):
-        logger.info("MGNREGA: SQL filtered a village_code IN-list, resolved one village %s — pinned", code)
+        logger.info("SQL filtered a village_code IN-list, resolved one village %s — pinned", code)
         return in_re.sub(f"village_code = {int(code)}", sql)
     found = {int(m.group(1)) for m in _VILLAGE_CODE_EQ_RE.finditer(sql)}
     if len(found) != 1 or int(code) in found:
         return sql
-    logger.info("MGNREGA: SQL filtered village_code %s, resolved %s — substituted", found, code)
+    logger.info("SQL filtered village_code %s, resolved %s — substituted", found, code)
     return _VILLAGE_CODE_EQ_RE.sub(f"village_code = {int(code)}", sql)
 
 
@@ -11947,6 +13221,43 @@ def _cme_resolved_places_in_sql(resolved: "dict | None", sql: str) -> bool:
     return bool(vals) and all(v.upper() in s for v in vals)
 
 
+# NRLM's grain false positive: v_nrlm is ONE ROW PER SHG, so an SHG's own RF or
+# CIF needs no SUM — the row IS the SHG's total. The verifier read it as a fact
+# table "with one row per SHG per year" and demanded an aggregate on all four
+# attempts, so "Which SHGs have received the highest RF amounts?" died in the KB
+# fallback (KI-193 follow-up, NRLM use-case QA 2026-10-07). NRLM has no year
+# dimension on money at all — formation year is the only year, and _NRLM_RULES
+# rule 3 forbids placing money in it — so the premise of the complaint is wrong.
+_NRLM_GRAIN_COMPLAINT_RE = re.compile(
+    r"without (?:any )?aggregation|without using SUM|should aggregate|"
+    r"one row per SHG per year|individual row values|raw fact|not the total across",
+    re.IGNORECASE)
+_NRLM_PER_SHG_SELECT_RE = re.compile(
+    r"\b(?:revolving_fund_amount|cif_amount|total_members|female_members|male_members)\b",
+    re.IGNORECASE)
+
+
+def _verifier_nrlm_grain_complaint_is_false(issue: str, schemes: list[str], sql: str) -> bool:
+    """True when the verifier demands an aggregate on a per-SHG NRLM column.
+
+    One v_nrlm row is one SHG, so selecting revolving_fund_amount to rank SHGs is
+    correct and SUM would be wrong (it would add unrelated groups together). Only
+    discarded when the query really is at SHG grain: the single source is v_nrlm and
+    it carries no GROUP BY, so a genuine missing-aggregate complaint still raises."""
+    if schemes != ["NRLM"] or not sql:
+        return False
+    if not re.search(r"\bcheck\s*3\b|\bgrain\b", issue or "", re.IGNORECASE):
+        return False
+    if not _NRLM_GRAIN_COMPLAINT_RE.search(issue or ""):
+        return False
+    tables = {t.lower() for t in re.findall(r"\b(?:FROM|JOIN)\s+([\w.]+)", sql, re.IGNORECASE)}
+    if tables != {"curated.v_nrlm"}:
+        return False
+    if re.search(r"\bGROUP\s+BY\b", _mask_sql_literals(sql), re.IGNORECASE):
+        return False          # it IS aggregating — the complaint is about something else
+    return bool(_NRLM_PER_SHG_SELECT_RE.search(sql))
+
+
 def _verifier_scheme_specific_complaint_is_false(issue: str, schemes: list[str], sql: str,
                                                  resolved: "dict | None" = None) -> bool:
     # 2026-09-28 (CM Elevate all-blocks run): "Check 2: … lists 'lgd_block = LASKEIN', but
@@ -12018,6 +13329,183 @@ def _verifier_scheme_specific_complaint_is_false(issue: str, schemes: list[str],
     return bool(keys) and all(k.lower() in _CME_LIVE_JSON_KEYS for k in keys)
 
 
+# ── Cross-scheme SQL guards (cross-scheme retest 2026-10-10) ─────────────────
+# _cross_scheme_compare_answer answers the officers' comparison shapes from fixed
+# queries; these catch the same model-SQL failures on every other wording that
+# still reaches the generator. Each fires only on a query that reads two or more
+# schemes, and only on a shape that is wrong whatever the question.
+_SQL_SCHEME_READ = re.compile(r"\bFROM\s+curated\.(v_\w+)\b", re.IGNORECASE)
+_SQL_AGGREGATE = re.compile(r"\b(?:COUNT|SUM|AVG|MIN|MAX)\s*\(", re.IGNORECASE)
+# The SELECT before a scheme read is a query in its own right (the outer query, a
+# UNION branch, a FROM / JOIN / CTE subquery) — not a scalar subquery inside a
+# condition, such as MGNREGA's "year_key = (SELECT MAX(year_key) FROM …)".
+_SQL_OWN_QUERY_LEAD = re.compile(
+    r"(?:^|(?:\bFROM|\bJOIN|\bAS|,)\s*\(|\bUNION(?:\s+ALL)?\s*\(?)\s*$", re.IGNORECASE)
+_CROSS_MONEY_VIEW_CODES = {"MGNREGA", "PMAY"}
+
+
+def _scheme_read_segments(sql: str) -> "list[tuple[str, str, str]]":
+    """(view, select list, whole SELECT text) for every SELECT that reads a
+    curated v_* view directly and is a query in its own right."""
+    masked = _mask_sql_literals(sql or "")
+    upper = masked.upper()
+    out = []
+    for m in _SQL_SCHEME_READ.finditer(masked):
+        sel = upper.rfind("SELECT", 0, m.start())
+        if sel < 0 or not _SQL_OWN_QUERY_LEAD.search(upper[:sel]):
+            continue
+        depth, end = 0, len(sql)
+        for t in re.compile(r"[()]|\bUNION\b|;").finditer(upper, sel):
+            tok = t.group(0)
+            if tok == "(":
+                depth += 1
+            elif tok == ")":
+                depth -= 1
+                if depth < 0:
+                    end = t.start()
+                    break
+            elif depth == 0:
+                end = t.start()
+                break
+        out.append((m.group(1), sql[sel + 6:m.start()], sql[sel:end]))
+    return out
+
+
+def _cross_scheme_sql_issue(question: str, schemes: list[str], entity_result: dict,
+                            sql: str) -> "str | None":
+    """A repair instruction when a multi-scheme query has a shape that is wrong
+    whatever was asked, else None."""
+    if len(schemes or []) < 2 or not sql:
+        return None
+    # KI-218: CROSS-2 filtered the money view on scheme_code 'FOCUS', CROSS-4 on
+    # 'Focus Plus' / 'Focus Legacy' / 'CM Elevate Legacy' — none exist there, so
+    # each read 0 and the answer said "0 crore" three times.
+    if "V_CROSS_SCHEME_MONEY_DISTRICT_YEAR" in sql.upper():
+        codes: set[str] = set()
+        for m in re.finditer(r"\bscheme_code\s*(?:=|<>|!=)\s*'([^']*)'|"
+                             r"\bscheme_code\s+(?:NOT\s+)?IN\s*\(([^)]*)\)", sql, re.IGNORECASE):
+            if m.group(1) is not None:
+                codes.add(m.group(1))
+            else:
+                codes |= set(re.findall(r"'([^']*)'", m.group(2)))
+        bad = sorted(c for c in codes if c.strip().upper() not in _CROSS_MONEY_VIEW_CODES)
+        if bad:
+            return (
+                "curated.v_cross_scheme_money_district_year holds only scheme_code 'MGNREGA' and "
+                f"'PMAY'. {', '.join(repr(c) for c in bad)} matches no row there, so its figure "
+                "reads as 0. Take every other scheme from its OWN view, each in its own subquery: "
+                "Focus Plus and Focus Legacy SUM(amount_disbursed) / 1e7, CM Elevate Legacy "
+                "SUM(total_disbursement) / 1e7, NRLM SUM(revolving_fund_amount + cif_amount) / 1e7 "
+                "(rupees to crore); a beneficiary count comes from the scheme's own view, never "
+                "from this money view. CM Elevate has no money column at all — leave it out of "
+                "a money figure. Keep every other clause as it was.")
+    # KI-220: "SELECT 'CM Elevate' AS scheme, 0.00 AS amount_crore FROM (SELECT 1)"
+    # — a made-up zero, answered as "CM Elevate recorded 0.00 crore". CM Elevate has
+    # no money column at all; a zero claims it paid nothing.
+    if re.search(r"'CM\s*Elevate'\s+AS\s+\w+\s*,\s*(?:0+(?:\.0+)?|NULL)(?:::\w+)?\s+AS\s+\w*"
+                 r"(?:amount|crore|money|disburs|expend|spend|lakh|rupee)", sql, re.IGNORECASE):
+        return (
+            "the query reports a constant 0 / NULL amount for CM Elevate. The CM Elevate "
+            "applications data has no money column of any kind, so a zero is a false figure — "
+            "leave CM Elevate out of the money query entirely (the answer says it records no "
+            "payment). Keep every other clause as it was.")
+    segs = _scheme_read_segments(sql)
+    # KI-213: COUNT(*) on v_focus_plus is PAYMENTS (385,671), not beneficiaries
+    # (105,813 = COUNT(DISTINCT beneficiary_key)). The single-district guard in
+    # generate_sql only covers a Focus-Plus-only question.
+    if re.search(r"\bbeneficiar\w*", question or "", re.IGNORECASE) and not re.search(
+            r"\bpayments?\b|\btransactions?\b|\bdisbursement\s+records?\b", question or "", re.IGNORECASE):
+        for view, sel_list, _text in segs:
+            if view.lower() == "v_focus_plus" and re.search(r"\bCOUNT\s*\(\s*\*\s*\)", sel_list, re.IGNORECASE) \
+                    and "beneficiary_key" not in sel_list.lower():
+                return (
+                    "the Focus Plus part counts COUNT(*) as beneficiaries, but one curated.v_focus_plus "
+                    "row is one PAYMENT (385,671 payments for 105,813 beneficiaries). Count Focus Plus "
+                    "beneficiaries with COUNT(DISTINCT beneficiary_key), and keep every other clause "
+                    "as it was.")
+    # KI-223: one branch with no aggregate beside aggregated ones returns one row
+    # per record (CROSS-10: 8,627 blank "CM Elevate" rows, cut at the 1,000-row cap;
+    # CROSS-11: "SELECT 'CM Elevate', 0.00 FROM curated.v_cm_elevate" — a made-up
+    # zero for a scheme with no money, once per application). A SELECT DISTINCT key
+    # list (the districts a FULL JOIN is built on) is not a figure and is exempt.
+    if len(segs) >= 2:
+        aggregated = [bool(_SQL_AGGREGATE.search(sel_list)) for _v, sel_list, _t in segs]
+        if any(aggregated):
+            for (view, sel_list, text), agg in zip(segs, aggregated):
+                if not agg and not re.search(r"\bGROUP\s+BY\b", text, re.IGNORECASE) \
+                        and not re.match(r"\s*DISTINCT\b", sel_list, re.IGNORECASE):
+                    return (
+                        f"the part that reads curated.{view} has no aggregate and no GROUP BY, so it "
+                        "returns one row per record beside the other schemes' single figures. Give it "
+                        "the same aggregate shape as the others (one figure for that scheme, e.g. "
+                        "COUNT(*) or SUM(...)); if that scheme has no such figure, leave it out of the "
+                        "query. Keep every other clause as it was.")
+    # KI-227: every scheme's part must carry the resolved place. CROSS-11 filtered
+    # every branch on East Khasi Hills except Focus Plus, and reported the
+    # statewide 119.74 crore as the district's (truth 15.62).
+    resolved = entity_result.get("resolved") or {}
+    if len(segs) >= 2 and len({v.lower() for v, _s, _t in segs}) >= 2 and not (
+            resolved.get("village_code") or resolved.get("village_code_list")):
+        for key in ("block", "district"):
+            place = resolved.get(key)
+            if isinstance(place, str) and place.strip():
+                missing = sorted({view for view, _s, text in segs
+                                  if not _geo_value_in_sql(place, text.upper().replace("''", "'"))})
+                if missing:
+                    fp_note = (f" (Focus Plus maps blocks on block_name_raw: UPPER(block_name_raw) = "
+                               f"'{place}')" if key == "block" else "")
+                    return (
+                        f"the question is about {key} {place}, but the part(s) reading "
+                        f"{', '.join('curated.' + v for v in missing)} do not filter on it, so they report "
+                        f"a wider area's figure as {place}'s. Add lgd_{key} = '{place}'{fp_note} to EVERY "
+                        "scheme's part, and keep every other clause as it was.")
+                break
+    return None
+
+
+# KI-221: the 4B verifier read an aggregate-then-join of per-scheme subqueries —
+# the FAMILY C shape schema_context.py PRESCRIBES for one figure per scheme — as
+# the prohibited row-level join of two facts, and burned every repair on it (6 of
+# 20 officer cross-scheme cases ended "couldn't build a working query", 2026-10-10).
+# A join is the prohibited kind only when a raw table or view is on one side; here
+# every operand of every outer FROM / JOIN is a subquery that already aggregates.
+def _verifier_join_complaint_on_aggregates(issue: str, sql: str) -> bool:
+    if not (_VERIFIER_PROHIBITED_JOIN.search(issue or "") and re.search(r"\bjoin", issue or "", re.IGNORECASE)):
+        return False
+    masked = _mask_sql_literals(sql or "").upper()
+    depth, operands, joined = 0, [], False
+    for t in re.finditer(r"[()]|\bFROM\b|\bJOIN\b", masked):
+        tok = t.group(0)
+        if tok == "(":
+            depth += 1
+        elif tok == ")":
+            depth -= 1
+        elif depth == 0:
+            joined = joined or tok == "JOIN"
+            operands.append(t.end())
+    if not joined or not operands:
+        return False
+    for at in operands:
+        rest = masked[at:].lstrip()
+        if not rest.startswith("("):
+            return False
+        start = len(masked) - len(rest)
+        d, end = 0, None
+        for i in range(start, len(masked)):
+            if masked[i] == "(":
+                d += 1
+            elif masked[i] == ")":
+                d -= 1
+                if d == 0:
+                    end = i
+                    break
+        body = masked[start + 1:end] if end else ""
+        if not body.lstrip().startswith(("SELECT", "WITH")) or not _SQL_AGGREGATE.search(body) \
+                or re.search(r"\bJOIN\b", body):
+            return False
+    return True
+
+
 async def _verify_sql(question: str, schemes: list[str], entity_result: dict, sql: str) -> "str | None":
     """One short issue sentence if the semantic verifier (SQL_VERIFY_MODEL,
     qwen4-deploy — see app/config.py) flags this SQL as not actually
@@ -12085,6 +13573,11 @@ async def _verify_sql(question: str, schemes: list[str], entity_result: dict, sq
             "SQL verifier reported a prohibited join the SQL does not make (no JOIN, or the "
             "named table is not in the query) — discarding: %s", issue)
         return None
+    if _verifier_join_complaint_on_aggregates(issue, sql):
+        logger.warning(
+            "SQL verifier reported a prohibited join, but every joined operand is a subquery "
+            "that already aggregates (the prescribed cross-scheme shape) — discarding: %s", issue)
+        return None
     if _verifier_scheme_specific_complaint_is_false(issue, schemes, sql, entity_result.get("resolved") or {}):
         logger.warning(
             "SQL verifier claimed v_cm_elevate has no scheme_specific column / key when the SQL "
@@ -12094,6 +13587,11 @@ async def _verify_sql(question: str, schemes: list[str], entity_result: dict, sq
         logger.warning(
             "SQL verifier raised a resolved-entity complaint although the SQL filters exactly the "
             "resolved village_code and year (MGNREGA) — discarding: %s", issue)
+        return None
+    if _verifier_nrlm_grain_complaint_is_false(issue, schemes, sql):
+        logger.warning(
+            "SQL verifier demanded an aggregate on a per-SHG NRLM column, but one v_nrlm row IS "
+            "one SHG — discarding: %s", issue)
         return None
     return issue
 
@@ -12134,6 +13632,8 @@ async def execute_with_repair(question: str, schemes: list[str], entity_result: 
         sql = _mgnrega_women_years_only(schemes, sql)
         sql = _pmay_comparison_limit(schemes, entity_result, sql)
         sql = _pmay_crore_to_rupees(schemes, sql)
+        sql = _nrlm_name_search_contains(question, schemes, sql)
+        sql = _nrlm_unrequested_limit(question, schemes, sql)
         try:
             _pm_issue = _pmay_sql_issue(question, schemes, sql)
             if _pm_issue:
@@ -12141,6 +13641,12 @@ async def execute_with_repair(question: str, schemes: list[str], entity_result: 
             _vlist = _mgnrega_village_list_issue(question, schemes, sql)
             if _vlist:
                 raise ValueError(_vlist)
+            # "How many SHGs" answered with a capped row list (KI-188).
+            _nrlm_cnt = _nrlm_count_question_listed_rows(question, schemes, sql)
+            if _nrlm_cnt:
+                context_budget.log_decision("sql_guard", guard="nrlm_count_shape",
+                                            verdict="reject")
+                raise ValueError(_nrlm_cnt)
             _vmiss = _mgnrega_village_filter_missing(schemes, entity_result, sql)
             if _vmiss is not None:
                 raise ValueError(
@@ -12161,6 +13667,11 @@ async def execute_with_repair(question: str, schemes: list[str], entity_result: 
                 context_budget.log_decision("sql_guard", guard="resolved_scope", verdict="reject",
                                             missing=_scope_issue[0])
                 raise ValueError(_scope_issue[1])
+            # Multi-scheme shapes that are wrong whatever was asked (KI-213/218/223/227).
+            _xs_issue = _cross_scheme_sql_issue(question, schemes, entity_result, sql)
+            if _xs_issue:
+                context_budget.log_decision("sql_guard", guard="cross_scheme_shape", verdict="reject")
+                raise ValueError(_xs_issue)
             if _focus_legacy_group_size_summed(question, schemes, sql):
                 raise ValueError(
                     "this question asks for a producer group's SIZE (its member count), but the "
@@ -12553,9 +14064,14 @@ def _result_digest(rows: list[dict], max_values: int = 40) -> "tuple[str, set[st
     return "\n".join(f"  - {ln}" for ln in lines), allowed
 
 
-def _deterministic_answer(rows: list[dict]) -> str:
+def _deterministic_answer(rows: list[dict], total: "int | None" = None) -> str:
     """A plain, exact sentence from the rows — used only when the LLM composer
-    keeps misquoting or dropping numbers."""
+    keeps misquoting or dropping numbers.
+
+    `total`: the true number of matching records when the query's own LIMIT cut the
+    list short. Without it the heading counts the rows it was handed, which states
+    the page size as the answer — "Here are the 40 results" for a block holding
+    1,167 SHGs (KI-188)."""
     if len(rows) == 1:
         row = rows[0]
         nums = _row_metrics(row)
@@ -12582,6 +14098,11 @@ def _deterministic_answer(rows: list[dict]) -> str:
         metrics = ", ".join(f"{_metric_label(k)}: {_fmt_num(v)}" for k, v in _row_metrics(r))
         head = " / ".join(labels) or "(no label)"
         lines.append(f"- {head} — {metrics}" if metrics else f"- {head}")
+    if total and total > len(rows):
+        # The list was cut short by the query's own LIMIT: lead with the real
+        # total and say plainly that these are examples (KI-188).
+        return (f"{total:,} records match. Here are the first {len(shown)}:\n"
+                + "\n".join(lines))
     more = len(rows) - len(shown)
     tail = f"\n…and {more} more row{'s' if more != 1 else ''} in the table." if more > 0 else ""
     return f"Here are the {len(rows)} results:\n" + "\n".join(lines) + tail
@@ -13504,8 +15025,156 @@ async def _cm_elevate_answer_guarantees(question: str, sql: str, rows: list[dict
     return _cme_comparison(question, rows, answer)
 
 
-# schemes whose one-figure answers must state THAT figure (see compose_response)
-_ONE_FIGURE_SCHEMES = (["Focus Plus"], ["CM Elevate"])
+# schemes whose one-figure answers must state THAT figure (see compose_response).
+# NRLM joined 2026-10-07 (all-villages run): "How many SHGs are there in Jaiaw
+# Pdeng village, Bhoirymbong block, Ri Bhoi?" generated the correct
+# `SELECT COUNT(*) AS shgs ... WHERE village_code = 277979`, which returns 12,
+# and the composer answered "There is 1 SHG" — it stated the number of ROWS, not
+# the counted value. Intermittent (3 of 5 repeats), which is the worst kind of
+# wrong number: it reads perfectly and is off by an order of magnitude.
+_ONE_FIGURE_SCHEMES = (["Focus Plus"], ["CM Elevate"], ["NRLM"])
+
+
+# KI-226: "MGNREGA has the highest count in every district, with values ranging
+# from 11,147 in EASTERN WEST KHASI HILLS to 56,936 in EAST KHASI HILLS" — the
+# 85-row result held West Garo Hills at 65,886, so the stated range was wrong.
+# Each number is in the rows, so the faithfulness check passed: it proves a
+# number exists, not that a range is the range. Checked here: a "from A to B" /
+# "between A and B" claim must be the min and max of the group of rows it is
+# about (the rows sharing a label, e.g. scheme = 'MGNREGA', that hold both
+# numbers in one column). A sentence about a subset ("the remaining districts",
+# "the others") is left alone — its range is over rows it does not name. Only
+# RANGE wording is read ("ranging from", "values between"): "rose from 5,000 in
+# 2022-23 to 7,000 in 2023-24" is a change between two named rows, not a range.
+_RANGE_CLAIM_RE = re.compile(
+    r"\b(?:rang\w*|var(?:y|ies|ied|ying)|values?|counts?|figures?|amounts?|totals?)\s+"
+    r"(?:from|between)\s+₹?\s*([\d,]+(?:\.\d+)?)\b[^.;:]{0,70}?\b(?:to|and)\s+₹?\s*"
+    r"([\d,]+(?:\.\d+)?)\b",
+    re.IGNORECASE)
+_RANGE_SUBSET_RE = re.compile(
+    r"\b(?:remaining|other|others|rest|excluding|except|apart\s+from|besides|beyond)\b", re.IGNORECASE)
+
+
+def _range_claim_misstated(answer: str, rows: "list[dict]") -> bool:
+    if not answer or not rows or len(rows) < 3:
+        return False
+    for sentence in re.split(r"(?<=[.!?])\s+", answer):
+        if _RANGE_SUBSET_RE.search(sentence):
+            continue
+        for m in _RANGE_CLAIM_RE.finditer(sentence):
+            try:
+                a, b = (float(g.replace(",", "")) for g in m.groups())
+            except ValueError:
+                continue
+            if a >= b or all(float(x).is_integer() and 1900 <= x <= 2100 for x in (a, b)):
+                continue
+            for col in {k for r in rows for k in r}:
+                vals = [(_as_number(r.get(col)), r) for r in rows]
+                vals = [(v, r) for v, r in vals if v is not None]
+                if not any(abs(v - a) < 0.005 for v, _r in vals) or \
+                        not any(abs(v - b) < 0.005 for v, _r in vals):
+                    continue
+                labels = [k for k in {k for r in rows for k in r}
+                          if k != col and all(_as_number(r.get(k)) is None for r in rows)]
+                groups = [[v for v, _r in vals]]
+                for lab in labels:
+                    for key in {r.get(lab) for _v, r in vals}:
+                        g = [v for v, r in vals if r.get(lab) == key]
+                        if any(abs(v - a) < 0.005 for v in g) and any(abs(v - b) < 0.005 for v in g):
+                            groups.append(g)
+                holds = [g for g in groups if any(abs(v - a) < 0.005 for v in g)
+                         and any(abs(v - b) < 0.005 for v in g)]
+                if holds and not any(abs(min(g) - a) < 0.005 and abs(max(g) - b) < 0.005 for g in holds):
+                    return True
+    return False
+
+
+# KI-220: "the other six schemes in East Khasi Hills totaled 888.11 crore" added
+# MGNREGA expenditure (from lakh), PMAY-G releases, DBT cash and remittances to
+# groups; "the total across both schemes is 117,719 beneficiaries" added Focus Plus
+# people to Focus Legacy producer GROUPS. Different measures are never one total
+# (docs/DATA_MODEL.md rule 6). Flagged: a sentence with a total word whose number
+# equals the sum of two or more of the result's figures for different schemes and
+# is not itself a result value. Only where a newer scheme is in the comparison —
+# MGNREGA + PMAY-G answers keep their own behaviour (both in crore on one view).
+_TOTAL_WORD_RE = re.compile(
+    r"\btotal\w*|\bcombined\b|\bsum(?:s|med)?\b|\baltogether\b|\btogether\b|\bin all\b",
+    re.IGNORECASE)
+_NUMBER_IN_TEXT_RE = re.compile(r"(?<![\w.])(\d{1,3}(?:,\d{2,3})+(?:\.\d+)?|\d+(?:\.\d+)?)(?![\w])")
+
+
+def _cross_unit_total_stated(answer: str, rows: "list[dict]", schemes: "list[str] | None") -> bool:
+    if not answer or not rows or len(schemes or []) < 2 or set(schemes) <= {"MGNREGA", "PMAY-G"}:
+        return False
+    present = {round(float(v), 2) for r in rows for v in (_as_number(x) for x in r.values()) if v is not None}
+    sums: set[float] = set()
+    labels = [k for k in {k for r in rows for k in r} if all(_as_number(r.get(k)) is None for r in rows)]
+    if len(rows) >= 2 and labels and len({tuple(r.get(k) for k in labels) for r in rows}) >= 2:
+        for col in {k for r in rows for k in r} - set(labels):
+            vals = [v for v in (_as_number(r.get(col)) for r in rows) if v is not None]
+            if len(vals) >= 2:
+                sums.add(round(float(sum(vals)), 2))
+    for r in rows:
+        vals = [v for v in (_as_number(x) for x in r.values()) if v is not None]
+        if len(vals) >= 2:
+            sums.add(round(float(sum(vals)), 2))
+    sums -= present
+    if not sums:
+        return False
+    for sentence in re.split(r"(?<=[.!?])\s+", answer):
+        if not _TOTAL_WORD_RE.search(sentence):
+            continue
+        for m in _NUMBER_IN_TEXT_RE.finditer(sentence):
+            n = round(float(m.group(1).replace(",", "")), 2)
+            if any(abs(n - s) < 0.011 for s in sums):
+                return True
+    return False
+
+
+# When a cross-scheme total is rejected (above), the generic row dump ("Here are
+# the 6 results: - MGNREGA — amount crore: 3,628.67 crore") loses what each figure
+# IS. For a one-figure-per-scheme result, write it the way the deterministic
+# comparison does: each scheme's own figure and measure, not added together
+# (user report 2026-10-10: "How much has been disbursed … across MGNREGA, PMAY-G,
+# Focus Plus, CM Elevate, Focus, NRLM and CM Elevate Legacy").
+def _cross_scheme_side_by_side(rows: "list[dict]") -> "str | None":
+    if len(rows) < 2:
+        return None
+    names = set(SCHEME_CATALOG) | set(_SCHEME_DISPLAY_NAME)
+    lines = []
+    for r in rows:
+        labels = [v for v in r.values() if isinstance(v, str)]
+        nums = [(k, v) for k, v in r.items() if _as_number(v) is not None]
+        if len(labels) != 1 or len(nums) != 1:
+            return None
+        scheme = _SCHEME_DISPLAY_NAME.get(labels[0].strip(), labels[0].strip())
+        if scheme not in names:
+            return None
+        col, val = nums[0]
+        if re.search(r"crore|_cr\b", col, re.IGNORECASE):
+            what = _MEASURE_PLAIN.get(scheme)
+            lines.append(f"- **{scheme}** — ₹{float(val):,.2f} crore" + (f" — {what}" if what else ""))
+        else:
+            lines.append(f"- **{scheme}** — {_fmt_num(_as_number(val))} {col.replace('_', ' ')}")
+    return ("Each scheme's own figure:\n" + "\n".join(lines) +
+            "\n\nThese are different kinds of figure, so they are shown side by side and not added together.")
+
+
+# A money question that names CM Elevate gets no CM Elevate row — correctly, its
+# applications data holds no payment — but the answer then simply never mentions it,
+# so the officer cannot tell whether it was forgotten (user report 2026-10-10).
+def _cm_elevate_no_money_note(question: str, schemes: "list[str] | None", rows: "list[dict]",
+                              answer: str) -> str:
+    if "CM Elevate" not in (schemes or []) or len(schemes or []) < 2:
+        return answer
+    if not _XS_MONEY_CUE.search(_XS_YEAR_WORDS.sub(" ", question or "")):
+        return answer
+    if any(isinstance(v, str) and v.strip() == "CM Elevate" for r in rows for v in r.values()):
+        return answer
+    if re.search(r"\bCM\s*Elevate\b(?!\s*Legacy)", answer or ""):
+        return answer
+    return (answer.rstrip() + "\n\nCM Elevate has no figure here: its applications data records no "
+            "payment of any kind (CM Elevate Legacy's sanctions and disbursements are shown separately).")
 
 
 async def compose_response(question: str, sql: str, rows: list[dict],
@@ -13513,10 +15182,14 @@ async def compose_response(question: str, sql: str, rows: list[dict],
                            entities: dict[str, str] | None = None,
                            schemes: list[str] | None = None,
                            style_examples: str = "",
-                           extra_numbers: "set[str] | None" = None) -> str:
+                           extra_numbers: "set[str] | None" = None,
+                           list_total: "int | None" = None) -> str:
     # extra_numbers: figures a caller re-queried and handed over in a note (a
     # list's true total), which the answer may quote although no row holds
     # them. None for every caller that doesn't pass it — unchanged behaviour.
+    # list_total: the true number of matching records when the query's own LIMIT
+    # cut the list short, so the deterministic fallback states that instead of
+    # the page size it was handed (KI-188).
     # style_examples: optional worked answers for the scheme (CM Elevate
     # Legacy's answer shots). Empty for every other scheme, which leaves the
     # prompt exactly as it was.
@@ -13526,7 +15199,21 @@ async def compose_response(question: str, sql: str, rows: list[dict],
             _zero = await _cme_zero_programmes_answer(sql)
             if _zero:
                 return _zero
+        if schemes == ["NRLM"]:
+            # a status/money filter that matches nothing is the answer "none",
+            # not a failed search (KI-194)
+            _zero = _nrlm_zero_answer(sql)
+            if _zero:
+                return _zero
         return _no_data_answer(schemes, entities)
+    if schemes == ["NRLM"]:
+        # One row, one counted metric, value 0: a measured zero, not a metric the
+        # data lacks. Said plainly here because the composer's guidance below
+        # deliberately refuses to assert a zero from a 0/NULL cell (KI-194, the
+        # non-empty path).
+        _czero = _nrlm_counted_zero_answer(sql, rows, entities)
+        if _czero:
+            return _czero
     preview = rows[:40]
     truncated = len(rows) > len(preview)
     # "No usable value" — every numeric cell is 0 or null (rows is non-empty
@@ -13700,7 +15387,18 @@ Answer:"""
             and not _answer_covers_metrics(answer, preview[0]))
         if still_bad:
             logger.warning("compose_response: retry still wrong — using deterministic answer")
-            answer = _deterministic_answer(preview)
+            answer = _deterministic_answer(preview, list_total)
+
+    # A stated range that is not the range of the rows it describes (KI-226), or
+    # one total added up across different schemes' measures (KI-220).
+    if _range_claim_misstated(answer, rows):
+        logger.warning("compose_response: stated range is not the result's min..max (%r) — "
+                       "deterministic answer", answer[:160])
+        answer = _deterministic_answer(preview, list_total)
+    elif _cross_unit_total_stated(answer, rows, schemes):
+        logger.warning("compose_response: a total added across different schemes' measures (%r) — "
+                       "deterministic answer", answer[:160])
+        answer = _cross_scheme_side_by_side(rows) or _deterministic_answer(preview, list_total)
 
     # Deterministic safety net for the opposite failure: the query DID return a
     # real, non-zero number, but the composer hedged with a "not covered / no
@@ -13721,7 +15419,7 @@ Answer:"""
         if metrics_now and all(v not in (0, None) for _k, v in metrics_now):
             logger.warning("compose_response: hedged over a real value %r — deterministic answer",
                            answer[:160])
-            answer = _deterministic_answer(preview)
+            answer = _deterministic_answer(preview, list_total)
         elif _is_plain_list_result(rows):
             logger.warning("compose_response: hedged over a %d-row list result %r — "
                            "deterministic list answer", len(rows), answer[:160])
@@ -13737,8 +15435,9 @@ Answer:"""
             # chart/table built from the same rows showed real data.
             logger.warning("compose_response: hedged over a %d-row breakdown %r — "
                            "deterministic answer", len(preview), answer[:160])
-            answer = _deterministic_answer(preview)
-    return answer
+            answer = _deterministic_answer(preview, list_total)
+    # Last, after the hedge check: the note names a scheme with no figure on purpose.
+    return _cm_elevate_no_money_note(question, schemes, rows, answer)
 
 
 async def classify_intent(question: str) -> str:
@@ -13749,6 +15448,13 @@ async def classify_intent(question: str) -> str:
     # data, never something in the reference docs. Force DATA before the keyword
     # fast-path so the "what are" knowledge cue can't win.
     if _CROSS_SCHEME_SET_QUESTION.search(question):
+        return "DATA"
+    # "What is the performance of MGNREGA, PMAY-G, Focus+, and CM-ELEVATE in East
+    # Khasi Hills?" opens with "what is" and was answered from the reference docs
+    # (audit findings, no figure at all); "which scheme has the widest coverage"
+    # went the same way (cross-scheme retest 2026-10-10, KI-222). A comparison of
+    # figures across schemes is computed from the data.
+    if _cross_scheme_compare_plan(question) is not None:
         return "DATA"
     # "How many members are there in Bak-15 Wachal Pg?" is a lookup in the data;
     # with no counting noun the classifier sometimes sent it to the reference
@@ -14027,8 +15733,25 @@ async def _answer_data(question: str, scope: "auth.UserScope | None" = None,
     # missing filter, so this must run before the "which scheme?" pause below
     # (which would otherwise ask the user to supply the very thing they asked
     # for). Answered deterministically across every scheme that records money.
-    if _wants_cross_scheme_money_ranking(question):
+    # A ranking between NAMED schemes ("higher: Focus+ or CM-ELEVATE?") is the
+    # cross-scheme comparison below instead, restricted to the schemes asked.
+    _xs_plan = _cross_scheme_compare_plan(question)
+    if _wants_cross_scheme_money_ranking(question) and (
+            _xs_plan is None or len(_named_schemes(question)) < 2):
         return await _cross_scheme_money_answer(question)
+
+    # A comparison across schemes (officer cross-scheme cases, 2026-10-10): fixed
+    # per-scheme queries instead of model SQL — see _cross_scheme_compare_answer.
+    # Before the "which scheme?" / scope / year pauses: the schemes are named (or
+    # "each scheme" asks for all of them), and with no year each scheme's whole
+    # data window is used and stated in the answer (KI-219, KI-224). Falls through
+    # unchanged when the resolved place or filters are not ones it covers.
+    if _xs_plan is not None:
+        _xs = await _cross_scheme_compare_data(question, _xs_plan, scope=scope,
+                                               prior_resolved=prior_resolved,
+                                               village_hint=village_hint)
+        if _xs is not None:
+            return _xs
 
     # "Focus" with nothing to say WHICH Focus — a two-way ask that keeps what the
     # user already told us, rather than the generic five-way pause below.
@@ -14057,7 +15780,14 @@ async def _answer_data(question: str, scope: "auth.UserScope | None" = None,
     # Piggery?" was classified CM Elevate (its Piggery sub-scheme) and answered
     # "3010 members" of the Piggery scheme. A group-name question that names no
     # scheme of its own is a Focus Legacy question.
-    if schemes != ["Focus Legacy"] and _pg_name_question(question) and not _mentions_scheme(question):
+    # …unless it is an NRLM question. This rule predates NRLM, which has groups of
+    # its own: "How many members are in SHG code 7194?" was pulled to Focus Legacy
+    # and answered "No producer group named 'SHG code 7194' was found", while
+    # v_nrlm holds the answer (9 members). _PG_STOP_WORDS even strips "shg" from
+    # the name, so the SHG wording cannot save it. Every NRLM-only term counts as
+    # naming the scheme here (all-SHGs run 2026-10-07).
+    if schemes != ["Focus Legacy"] and _pg_name_question(question) \
+            and not _mentions_scheme(question) and not _NRLM_ONLY_TERMS.search(question or ""):
         logger.info("group-name question %r -> Focus Legacy (was %s)", question, schemes)
         schemes = ["Focus Legacy"]
     # Focus Legacy group-name questions are answered deterministically (see
@@ -14067,6 +15797,12 @@ async def _answer_data(question: str, scope: "auth.UserScope | None" = None,
         _pg_answer = await _focus_legacy_pg_name_answer(question)
         if _pg_answer is not None:
             return _pg_answer
+    # A measure only another scheme records, asked under a named scheme ("total
+    # person-days under CM Elevate", UI report 2026-10-10): say which scheme
+    # holds it and offer that, before any model call (_measure_gap_answer).
+    _measure_gap = _measure_gap_answer(question, schemes)
+    if _measure_gap is not None:
+        raise _measure_gap
     # CM Elevate Legacy: a question its data cannot answer (a sanction rate,
     # applicant names, constituency, monthly figures, ...) gets the reviewed
     # not-held explanation now, before any model call.
@@ -14361,6 +16097,19 @@ async def _answer_data(question: str, scope: "auth.UserScope | None" = None,
             notes.append(f"{_fl_total[0]:,} {_fl_total[1]} match in total; the result lists only the "
                          f"first {len(rows)}. Say that {_fl_total[0]:,} {_fl_total[1]} match, then name "
                          "the top ones — never present the list as complete.")
+    _nrlm_total = None
+    if schemes == ["NRLM"]:
+        # A list the model's own LIMIT cut off: the composer must lead with the
+        # true number of matching SHGs, never with the page size (KI-188).
+        _nrlm_total = await _nrlm_list_total(sql, rows)
+        if _nrlm_total:
+            notes.append(
+                f"{_nrlm_total:,} SHGs match in total. Lead with that figure: say "
+                f"{_nrlm_total:,} SHGs match, then name a few of the ones listed as "
+                "examples. Never present the list as complete, and never state the "
+                "number of rows shown as the count of matching SHGs. Do NOT say how "
+                "many rows are displayed — no 'the first N listed' — because that count "
+                "is not part of the result.")
     if settings.PREMISE_CHECK_ENABLED:
         try:
             # an "(LGD 904712)" chip tag is an identifier, not an assumed figure
@@ -14377,7 +16126,9 @@ async def _answer_data(question: str, scope: "auth.UserScope | None" = None,
     answer = _fl_breakdown or await compose_response(question, sql, rows, notes=notes,
                                     entities=entity_result.get("display"),
                                     schemes=schemes, style_examples=_style,
-                                    extra_numbers=({str(_fl_total[0])} if _fl_total else set()) | {
+                                    list_total=_nrlm_total,
+                                    extra_numbers=({str(_fl_total[0])} if _fl_total else set()) | (
+                                        {str(_nrlm_total), f"{_nrlm_total:,}"} if _nrlm_total else set()) | {
                                         str(int(n)) for v in (_fl_unplaced[1] if _fl_unplaced else {}).values()
                                         for n in [_as_number(v)] if n is not None} or None)
     # A stated Focus Plus payment amount: the answer must say which payments it
@@ -14393,6 +16144,14 @@ async def _answer_data(question: str, scope: "auth.UserScope | None" = None,
         elif not re.search(rf"{_n}\s+payments|{int(_fp_amount.value):,}\s+payments", answer):
             answer = (answer.rstrip() + f" This covers only the {_n} payments — "
                       f"{_FOCUSPLUS_PAYMENT_AMOUNTS[int(_fp_amount.value)]}.")
+    # A money column the SQL already scaled (cif_cr, rf_lakh) must keep its unit
+    # in the prose. MGNREGA has its own, narrower backstop below for the columns
+    # that carry no suffix, so this runs for every scheme and is a no-op unless a
+    # scaled alias is actually in the result (KI-190).
+    answer = _scaled_money_units(answer, rows)
+    # NRLM money placed in a financial year is a cohort figure, never a release
+    # in that year — say so, deterministically (KI-191).
+    answer = _nrlm_money_year_caveat(answer, sql, schemes)
     if schemes == ["MGNREGA"]:
         answer = _mgnrega_top_one_wording(answer, sql, rows)
         answer = _mgnrega_money_units(answer, sql, rows)
@@ -14599,6 +16358,8 @@ async def _run_pipeline(question: str, session: "Session | None" = None,
     _pinned = _pin_cm_elevate_dataset(question)
     _cm_pinned = _pinned != question
     question = _pinned
+    # A bare "Focus" is Focus Legacy (D-033) — settled once, here, like the pin above.
+    question = _pin_bare_focus(question)
     scope_resumed = False
 
     # Computed early (moved ahead of the original follow-up step) so the step-0
@@ -14657,6 +16418,7 @@ async def _run_pipeline(question: str, session: "Session | None" = None,
             # The same CM Elevate dataset decision the chip's text gets at the top.
             question = _pin_cm_elevate_dataset(_picked)
             _cm_pinned = question != _picked
+            question = _pin_bare_focus(question)
             session.turn_context["resumed_question"] = question
         pending = None
     _paused_state = None
@@ -14677,6 +16439,7 @@ async def _run_pipeline(question: str, session: "Session | None" = None,
             session.turn_context["clarification_reply"] = question
             question = _pin_cm_elevate_dataset(_picked)
             _cm_pinned = question != _picked
+            question = _pin_bare_focus(question)
             session.turn_context["resumed_question"] = question
         else:
             _stand_in = _paused_thread_antecedent(question, pending, prev)
@@ -14920,7 +16683,7 @@ async def _run_pipeline(question: str, session: "Session | None" = None,
             # ("...and the amount disbursed?") — same dataset decision as above.
             _pinned = _pin_cm_elevate_dataset(question)
             _cm_pinned = _pinned != question
-            question = _pinned
+            question = _pin_bare_focus(_pinned)
             is_followup_rewrite = True
             # "give me for pmay" after MGNREGA person-days: PMAY-G has no
             # person-days. Offer PMAY-G's own measures for the same scope
@@ -15321,14 +17084,33 @@ def _knowledge_not_covered_answer(question: str, scheme: "str | None") -> str:
     )
 
 
+# A knowledge answer that is really a "not in my documents" refusal. On the DATA
+# fallback path this must never be handed back as the answer (KI-193).
+_KB_DISCLAIMS_RE = re.compile(
+    r"\b(?:reference material|reference document\w*|provided (?:context|material|document\w*)|"
+    r"knowledge base|available document\w*)\b[^.]{0,80}?"
+    r"\b(?:do(?:es)? not|doesn't|don't|no)\b[^.]{0,40}?"
+    r"\b(?:contain|include|mention|identif\w*|specify|list|provide|cover|have)\b"
+    r"|\b(?:not|no) (?:information|details?|data) (?:is )?(?:available )?(?:in|within) the "
+    r"(?:provided |available )?(?:reference|context|document)",
+    re.IGNORECASE)
+
+
 async def _data_path_kb_fallback(question: str) -> dict:
     """The DATA path genuinely couldn't produce a query (bad/uncoverable question,
     not an infra blip) — try the knowledge base once, then give the 'rephrase it'
     reply. Transient gateway errors are handled by the caller and never reach here."""
     kb = await rag.answer_from_kb(question)
-    if kb:
+    if kb and not _KB_DISCLAIMS_RE.search(kb.get("answer") or ""):
         return {"route": "knowledge", "intent": "RAG", "confidence": kb["confidence"],
                 "answer": kb["answer"], "sources": kb["sources"], **_empty_data_fields()}
+    # A KB answer whose content is "the reference material doesn't say" is worse
+    # than no answer here: the question was a DATA question the database can
+    # answer, so that wording tells the officer the figure does not exist when it
+    # does. "Which SHGs have received the highest RF amounts?" was answered with
+    # "The provided reference material does not contain information identifying
+    # which specific SHGs..." while the DB holds it (KI-193, NRLM use-case QA
+    # 2026-10-07; same reasoning as KI-025). Fall through to the honest message.
     # Name the scheme(s) actually in play, not a hardcoded pair — this message used
     # to always say "MGNREGA / PMAY-G data" even for a Focus Plus / CM Elevate
     # question, which reads as if the conversation's own context had been dropped

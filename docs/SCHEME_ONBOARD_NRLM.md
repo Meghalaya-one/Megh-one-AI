@@ -451,3 +451,78 @@ exists for:
 The +62 are the 51 new NRLM tests plus 11 cases added by parametrised roster tests that
 now cover a seventh scheme.
 
+
+---
+
+## Step 12 — live use-case QA (2026-10-07, a later session; no code changed)
+
+The live checks this log listed as REMAINING WORK were run. The VPN was up, so `megh_db`, Qdrant
+and the gateway were all reachable.
+
+**Result: 16 of 43 use cases passed, 27 failed.** Report with per-case proof images:
+`NRLM_UseCase_Test_Report_2026-10-07.xlsx` (repo root). Issues opened: **KI-188 to KI-196**.
+
+### What the run confirmed about the onboarding
+
+- The wiring works. NRLM is classified, routed, SQL is generated against `curated.v_nrlm`, and
+  the composer answers — the 16 passes include the statewide counts, the membership totals, the
+  per-year breakdown (30 of 30 years), the peak year, the top block, the top constituency and the
+  top CIF recipient, each exact against both the raw CSV and the DB.
+- **The §0 column facts were right.** Every value this log took from the SME YAMLs instead of the
+  live DB has now been read from `curated.v_nrlm` and matches: 40,629 rows, 12 districts,
+  56 blocks, 30 formation years, 2,032 unresolved villages, 1,197 inactive SHGs all at 0 CIF/RF
+  (NR-15). The `volumes_verified: false` caveat in `nrlm_schema_partitions.yaml` can be lifted.
+- **The raw file and the database agree exactly** on 34 scalar metrics and on the district, block,
+  year, constituency and village breakdowns. All 27 failures are pipeline behaviour.
+
+### What it found that the offline onboarding could not
+
+- **KI-189, the one to fix first.** The token `SHG` resolves to the district **South Garo Hills**
+  (alias `SGH`, `nrlm_entity_resolver.yaml:420`) and raises an entity-ambiguous pause. Step 2 of
+  this log added the entity-resolver entries and could not have caught this: it only appears in
+  the full pipeline, against the live district catalogue. Every NRLM question contains "SHG", so
+  it blocks 6 of the 43 use cases. Reproduced 10/10.
+- **KI-191.** The `critical` refusals this log describes in Step 2 —
+  `money_in_a_year_requested` and `money_trend_or_growth_requested` — **are not firing**. UC37
+  presented cumulative CIF as a year-on-year trend with no caveat, which §0 fact 3 names as the
+  scheme's single highest-risk wrong-number path. The rules exist in
+  `nrlm_classification_rules.yaml`; they need a deterministic guard behind them (CLAUDE.md §5).
+- **KI-190.** The NR-07 rupee-unit risk is real: money is emitted as a bare number with the unit
+  dropped ("…is 98.48" for ₹98.48 crore).
+- **KI-188, KI-192, KI-193, KI-194, KI-195** are shared pipeline behaviours rather than NRLM
+  wiring faults, though NRLM is where they were measured.
+
+### Still remaining
+
+- `tests/live_context_validation.py` — still **NOT RUN** for NRLM. It should be re-run once
+  KI-189 is fixed, since the pause it causes would distort any multi-turn result.
+- No code was changed in this session, so the 2026-10-07 baseline (pytest 1,498 passed over
+  27 files, scripts 14/14) still stands.
+
+## Step 13 — the fixes, and NRLM signed off (2026-10-07, same session as step 12)
+
+All eight defects step 12 found were fixed the same day and the use cases re-run live on the
+final code: **43 / 43**. Details and the symbol for each fix are in KNOWN_ISSUES.md
+(KI-188 … KI-195, "The fixes"); regression tests are `tests/test_nrlm_usecase_fixes.py` (71).
+
+What this closes from the earlier steps of this log:
+
+- **Step 2's entity-resolver work** had one gap it could not have seen offline: the token
+  `SHG` resolving to the district **South Garo Hills** (KI-189). Fixed in
+  `entity_resolver._ACRONYM_VOCABULARY`.
+- **Step 2's `critical` refusal conditions** (`money_in_a_year_requested`,
+  `money_trend_or_growth_requested`) were never read by any code. They now have the
+  deterministic guard the project requires: `_nrlm_money_year_caveat` (KI-191).
+- **§0 fact 3's "highest-risk wrong-number path"** is now guarded in code, not just in prose.
+- **§0 fact 1 (one row = one SHG)** turned out to be something the SQL *verifier* did not know:
+  it demanded an aggregate on a per-SHG money column. `_verifier_nrlm_grain_complaint_is_false`
+  teaches it the grain.
+- **`volumes_verified: false`** in `nrlm_schema_partitions.yaml` can now be lifted: every
+  volume in this log has been read from the live view and matches (40,629 SHGs, 12 districts,
+  56 blocks, 30 formation years, 2,032 unresolved villages, 1,197 inactive all at 0 CIF/RF).
+
+### Still remaining
+
+- `tests/live_context_validation.py` — still **NOT RUN**. KI-192 touched a clarification path
+  and KI-193 touched the DATA→KB fallback, so the multi-turn suite should be re-run to confirm
+  them (43/43 is the baseline). This is the single outstanding item for NRLM.

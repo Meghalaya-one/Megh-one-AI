@@ -443,12 +443,15 @@ def test_bare_focus_scheme_vs_noun(q, expected):
     assert p._names_bare_focus_scheme(q) is expected
 
 
-def test_what_is_focus_after_cm_elevate_asks_which_focus():
+def test_what_is_focus_after_cm_elevate_answers_focus_legacy():
+    # 2026-10-10 (D-033): a bare "Focus" is Focus Legacy, so this no longer asks
+    # which Focus. What the 2026-09-29 report needed still holds: the previous CM
+    # Elevate Legacy turn must not leak in (no model rewrite, KB scoped to Focus Legacy).
     prev = Turn(question=CMEL, raw_question=CMEL, route="data", schemes=["CM Elevate Legacy"],
                 resolved_entities={"year_key": 2024})
     seen = _run("what is focus", prev, ConversationState(scheme="CM Elevate Legacy", year=2024))
-    assert seen["route"] == "clarification" and seen["rule"] == "focus-scheme-ambiguous"
-    assert "rewrite" not in seen and "kb" not in seen
+    assert seen["route"] == "knowledge" and seen["kb"] == "Focus Legacy"
+    assert "rewrite" not in seen
 
 
 def test_knowledge_question_drops_an_inherited_year():

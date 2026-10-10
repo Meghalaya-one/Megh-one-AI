@@ -118,7 +118,8 @@ def test_why_after_a_recommendation_points_to_the_ranking(monkeypatch):
     ask("i am a farmer, then suggest a scheme")
     r = ask("why you have given mgnrega instead of focus")
     assert "number 4 of 4" in r["answer"]
-    assert "**Focus Plus** (number 1) and **Focus Legacy** (number 2)" in r["answer"]
+    # 2026-10-10 (D-033): "focus" is Focus Legacy, so only that alternative is compared
+    assert "**Focus Legacy** (number 2) was ranked above MGNREGA" in r["answer"]
 
 
 def test_why_after_an_ordinary_answer_compares_the_alternative(monkeypatch):
@@ -128,7 +129,8 @@ def test_why_after_an_ordinary_answer_compares_the_alternative(monkeypatch):
     r = ask("why you have given mgnrega instead of focus")
     a = r["answer"]
     assert "drew only on **MGNREGA**'s reference material" in a
-    assert "**Focus Plus** is for" in a and "**Focus Legacy** is for" in a
+    # 2026-10-10 (D-033): "focus" is Focus Legacy, so that is the alternative explained
+    assert "**Focus Legacy** is for" in a
     assert "the best match is **Focus Plus**" in a
 
 

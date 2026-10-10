@@ -45,9 +45,12 @@ Notes on the table:
 - They share the name and **no key**:
   - Focus Plus pays individual beneficiaries.
   - Focus Legacy pays producer groups.
-- `_SCHEME_NAME_PATTERN` requires a qualifier. A **bare "Focus"** matches neither pattern on
-  purpose, and triggers a two-way ask (`_is_ambiguous_focus` → `_focus_ambiguity_clarification`)
-  on both the DATA and the KNOWLEDGE paths.
+- `_SCHEME_NAME_PATTERN` requires a qualifier. A **bare "Focus" is Focus Legacy** (product owner,
+  2026-10-10, D-033): `_pin_bare_focus` rewrites it to "Focus Legacy" once, before routing (like
+  `_pin_cm_elevate_dataset`), on the DATA and the KNOWLEDGE paths. Left alone: "Focus Plus" / "Focus+",
+  "focus" as an English word (`_FOCUS_AS_NOUN`) and "Focus" inside a group name (`_pg_focus_group_name`).
+  The old two-way ask (`_focus_ambiguity_clarification`) stays in the code but no longer fires for a
+  pinned question.
 - "Producer group" / "PG" vocabulary belongs to Focus Legacy only.
 - Do not re-add a bare "focus" fuzzy alias.
 
@@ -302,9 +305,22 @@ Notes on the table:
 ## Cross-scheme behaviour (VERIFIED)
 - "Which scheme paid out the most?" → `_cross_scheme_money_answer`, deterministic SQL across
   every money-bearing scheme (`_CROSS_SCHEME_MONEY_SQL`). Test: `test_cross_scheme_money.py`.
+  Since 2026-10-10 it also catches "highest total financial assistance" (KI-214).
+- **Comparisons across schemes** (two or more named, not only MGNREGA + PMAY-G, or "each scheme" /
+  "across the schemes" / "which scheme") about beneficiaries, money, coverage, performance or a
+  summary → `_cross_scheme_compare_answer` (D-034, 2026-10-10): fixed per-scheme queries, each
+  scheme's own measure and unit, never a combined total. What each scheme's "beneficiaries" are in
+  such an answer: MGNREGA households given work (latest FY only), PMAY-G houses, Focus Plus
+  beneficiaries (`COUNT(DISTINCT beneficiary_key)` = 105,813 — not COUNT(*) = 385,671 payments, not
+  `member_id` = the 12.5K cohort only), CM Elevate applicants (requests, not awards), Focus Legacy
+  memberships in producer groups (no person record exists), CM Elevate Legacy applicant records,
+  NRLM SHG members. CM Elevate money: "no money recorded". Test: `test_cross_scheme_compare.py`.
+- A CM-ELEVATE comparison with "across all financial years" stays on the applications data
+  (KI-225); a money word or a specific FY still moves it to CM Elevate Legacy.
 - MGNREGA + PMAY: `v_cross_scheme_money_district_year` (crore) and
-  `v_cross_scheme_village_coverage`. Focus Plus's presence in the money view is unconfirmed;
-  CM Elevate is confirmed absent.
+  `v_cross_scheme_village_coverage`. **VERIFIED 2026-10-10: the money view holds only
+  `scheme_code` 'MGNREGA' and 'PMAY'** — Focus Plus is absent, so `_CROSS_SCHEME_MONEY_SQL`'s
+  separate Focus Plus branch does not double-count (KI-216, closed). CM Elevate is confirmed absent.
 - Otherwise, aggregate per scheme and combine at district level in CTEs. Never row-join.
 - Scheme listing, comparison, recommendation and "pick one" are answered deterministically
   (`_SCHEME_FIT`, copied from the reference FAQs).
@@ -359,6 +375,7 @@ builder, the edge starters and the UI chips (pinned by `tests/test_nrlm_onboardi
 | All 1,197 inactive SHGs show 0 RF and 0 CIF (NR-15) | a fund question filtered to inactive SHGs returns zero — report it with the caveat, never as a funding finding |
 | EASTERN WEST KHASI HILLS (740) | a real district, distinct from WEST KHASI HILLS (279) |
 | Unconfirmed values | the rupee unit itself (NR-07), 39 SHGs with CIF above ₹5 lakh (NR-25), 5 duplicate pairs (NR-24) |
+| **The token "SHG" must never be read as the district SOUTH GARO HILLS** (KI-189, found and FIXED 2026-10-07) | South Garo Hills lists the alias `SGH` (`nrlm_entity_resolver.yaml:420`) and the 3-letter token fuzzy-matches, so the pipeline pauses with *I don't recognise "SHG" as a district. Did you mean South Garo Hills?* **Every** NRLM question contains "SHG", so this blocks whole classes of question. Reproduced 10/10 through `pipeline.answer_question`; the bare `extract_entity_mentions` does not show it, so it enters at the resolver. **Fixed:** `entity_resolver._ACRONYM_VOCABULARY` lists SHG / SHGS / CIF / RF / GP / AC as scheme vocabulary that is never a near-miss candidate; the WHK->West Khasi Hills behaviour the check exists for is unchanged |
 
 ### Not held by NRLM
 
@@ -381,6 +398,36 @@ name the scheme. It is scheme-specific **vocabulary** instead (`_NRLM_ONLY_TERMS
 fires when no scheme is named — so *"How many CM Elevate applications came from SHGs?"* stays
 with CM Elevate.
 
+## Where a scheme's examples are shown to the officer
+
+Three hand-maintained lists in `web/ai_query.html` decide what an officer sees when browsing:
+
+- **`USE_CASES`** — the **Use cases** modal (sidebar → Use cases). One section per scheme, all
+  seven covered, 34 rows.
+- **`GLOSSARY`** — the **Glossary** modal. One section per scheme, 49 terms. Its definitions are
+  taken from `app/schema_context.py` `SCHEME_METRICS` and this file, so the glossary states what
+  the pipeline actually enforces — including the traps that yield a *plausible* wrong number
+  (Focus Legacy's payments / groups / memberships being three different figures; CM Elevate
+  having no money and no time dimension; NRLM's `COUNT(*)` counting groups while members are a
+  column, and RF/CIF being cumulative undated grants).
+- **`SAMPLE_CATEGORIES`** — the sidebar chips. **Dead code today:** the container
+  `queriesContainer` it looks up does not exist in the page, so `loadSampleQuestions()` returns
+  at its guard and nothing renders. Kept in step with the other two anyway.
+
+All three were stale until 2026-10-09 (KI-211): they listed only MGNREGA, PMAY-G and FOCUS+, so
+four of the seven schemes had no examples and no terms at all. **Adding a scheme means adding a
+section to all three** — `tests/test_ui_use_cases.py` fails if a scheme in `SCHEME_CATALOG` has
+no section of its own in `USE_CASES` or `GLOSSARY`, and if the two modals disagree about which
+scheme sections exist.
+
+The examples are drawn from the officers' use-case files, not invented, with `[district]` /
+`[block]` placeholders replaced by real places. They must obey the scheme's own rules, which the
+same test enforces: no bare "Focus" and no bare "CM Elevate" (the two collisions above), no
+money or year question for CM Elevate (it has neither), and no NRLM RF/CIF figure placed in a
+financial year (cumulative and undated). Every question is also routed through
+`pipeline._shortcut_scheme` and must resolve to the scheme of the section it sits under, so an
+example cannot quietly be filed under the wrong scheme.
+
 ## Adding a scheme
 
 Schemes are hand-registered. As of 2026-09-26, missing any one registry leaves the scheme
@@ -400,6 +447,7 @@ half-wired. The symbols below were VERIFIED to exist.
    `_SCHEME_BLOCKS`.
 5. `app/pipeline.py`:
    - `_SCHEME_NAME_PATTERN`, `_SCHEME_FUZZY_ALIASES`, the canonical spelling map;
+   - **`_UNSUPPORTED_SCHEME`: REMOVE the new scheme's aliases from it.** This is the one entry that is a *deletion*, not an addition, which is why it gets missed. NRLM stayed in the list after onboarding, so the bot told officers "NRLM isn't one of the schemes I cover" and the NRLM chip it offered looped for ever (KI-197, reported 2026-10-07). `tests/test_supported_scheme_not_refused.py` now fails if any alias of a loaded scheme is still in that pattern;
    - `_<X>_ONLY_TERMS` + `_infer_scheme_from_terms`;
    - `_SCHEME_DATA_YEARS` + `refresh_scheme_years`;
    - `_scheme_clarification`, the scheme blurbs, `_SCHEME_FIT`;

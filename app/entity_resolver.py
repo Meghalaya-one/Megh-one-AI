@@ -1225,6 +1225,21 @@ def named_places(text: str) -> dict[str, str]:
 
 _ACRONYM_TOKEN_RE = re.compile(r"\b[A-Za-z]{3,5}\b")
 
+# Domain vocabulary that happens to be an anagram of a district acronym. "SHG"
+# has exactly the letters of SGH (South Garo Hills), so the near-miss check below
+# asked 'I don't recognise "SHG" as a district. Did you mean South Garo Hills?'
+# for every NRLM question — every one of them contains the word SHG — and 6 of
+# the 43 NRLM use cases could never be answered (KI-189, NRLM use-case QA
+# 2026-10-07). These are words a user types to mean the thing, never a mistyped
+# district, so they are never near-miss candidates. Keep this list to words that
+# are real scheme vocabulary; a genuine typo must still be asked about.
+_ACRONYM_VOCABULARY = frozenset({
+    "SHG", "SHGS",          # NRLM: the unit the scheme counts
+    "CIF", "RF",            # NRLM: community investment fund / revolving fund
+    "GP", "GPS",            # gram panchayat
+    "AC", "ACS",            # assembly constituency
+})
+
 
 def acronym_near_misses(text: str) -> dict[str, list[str]]:
     """{typed token: [CANONICAL district, ...]} for a token that is not any
@@ -1235,7 +1250,9 @@ def acronym_near_misses(text: str) -> dict[str, list[str]]:
     one district. Nothing is guessed here: the caller asks, offering only the
     districts whose SME acronym (data/<scheme>/*_entity_resolver.yaml) has those
     letters. No district acronym's letters spell an English word (they are
-    consonant clusters plus at most one E), so ordinary words never match."""
+    consonant clusters plus at most one E), so ordinary words never match —
+    but scheme vocabulary can: "SHG" is an anagram of SGH (South Garo Hills),
+    which is why _ACRONYM_VOCABULARY is skipped (KI-189)."""
     acronyms: dict[str, set[str]] = {}
     for dims in _catalog.values():
         for v in dims.get("district") or []:
@@ -1248,7 +1265,7 @@ def acronym_near_misses(text: str) -> dict[str, list[str]]:
     out: dict[str, list[str]] = {}
     for m in _ACRONYM_TOKEN_RE.finditer(text or ""):
         tok = m.group(0).upper()
-        if tok in acronyms or named_places(tok):
+        if tok in acronyms or tok in _ACRONYM_VOCABULARY or named_places(tok):
             continue
         cands = sorted({c for acr, canons in acronyms.items()
                         if sorted(acr) == sorted(tok) for c in canons})

@@ -11,6 +11,26 @@ security exposure. Medium = bad UX or operability. Low = hygiene.*
 
 | ID | Title | Status | Severity | Component |
 |---|---|---|---|---|
+| KI-212 | Cross-scheme: a second bare "FOCUS" is dropped silently when Focus Plus is also named — `_is_ambiguous_focus` early-returns False on the Focus Plus match, so no which-Focus pause fires and Focus Legacy vanishes from the comparison (8 of the 20 officer cross-scheme cases) | **Fixed 2026-10-10** by D-033: `_pin_bare_focus` rewrites the bare "FOCUS" beside "Focus+" to "Focus Legacy", so both schemes are compared | High | pipeline `_is_ambiguous_focus` / `_named_schemes` |
+| KI-213 | Cross-scheme: the Focus Plus beneficiary guard is disabled on every multi-scheme question (`if schemes != ["Focus Plus"]: return sql`), so only the prose prompt rule prevents `COUNT(*)` (385,671 payments) being reported as beneficiaries (**105,813** = `COUNT(DISTINCT beneficiary_key)`) — a **3.64x** overstatement; `member_id` (12,527) is the opposite error, an 8.45x understatement (12.5K cohort only) | **Fixed 2026-10-10** — comparisons use `COUNT(DISTINCT beneficiary_key)` (D-034); model SQL guarded by `_cross_scheme_sql_issue` (live-verified 2026-10-10: 20/20 officer cases + 15 typed variants + the UI screenshot question, 36/36 vs independent DB queries) | High | pipeline `_focusplus_single_district_beneficiary_guard` |
+| KI-214 | `_cross_scheme_money_answer` does not fire on "highest total financial **assistance**" (`_MONEY_SUPERLATIVE` lacks assistance/support) nor on "which scheme has a **higher** … : A or B?" (`_CROSS_SCHEME_SUPERLATIVE` shape) — CROSS-12 and CROSS-5 fall through to LLM SQL. **Live-proven 2026-10-10 to produce a confidently WRONG answer:** CROSS-12 replied "Focus Plus provided the highest … 1197392500.00" (no unit) when **MGNREGA is highest at 3,628.67 crore, 30x larger** — the LLM SQL omitted the MGNREGA and PMAY-G branches and `ORDER BY..LIMIT 1` turned a partial list into a superlative | **Fixed 2026-10-10** — `_MONEY_SUPERLATIVE` + assistance / financial support, `_CROSS_SCHEME_SUPERLATIVE` + higher/lower; a named A-or-B goes to the comparison restricted to A and B. CROSS-12 now: MGNREGA highest, ₹3,628.68 cr (live-verified 2026-10-10: 20/20 officer cases + 15 typed variants + the UI screenshot question, 36/36 vs independent DB queries) | Medium | pipeline `_MONEY_SUPERLATIVE` / `_CROSS_SCHEME_SUPERLATIVE` |
+| KI-215 | A two-scheme comparison can route as single-scheme (consequence of KI-212): CROSS-2 resolved to `['Focus Plus']`, so `build_schema_context` omitted the whole `_CROSS_SCHEME` guidance block | **Fixed 2026-10-10** by D-033 (consequence of KI-212); live-verified: CROSS-2 now resolves `['Focus Plus','Focus Legacy']` with the cross-scheme block loaded | Medium | pipeline `_shortcut_scheme` / schema_context |
+| KI-216 | Unverified: whether `curated.v_cross_scheme_money_district_year` contains Focus Plus. `_CROSS_SCHEME_MONEY_SQL` adds Focus Plus in its own UNION branch | **CLOSED 2026-10-10 — NOT a defect** (live-VERIFIED): the view holds only `MGNREGA` and `PMAY`, so the separate Focus Plus branch is correct and nothing is double-counted. The view's totals also reconcile with raw (3,628.68 vs 3,628.67 cr; 2,185.24 vs 2,185.26 cr) | n/a | pipeline `_CROSS_SCHEME_MONEY_SQL` |
+| KI-218 | Cross-scheme: the LLM invents a non-existent scheme filter instead of querying the second scheme — CROSS-2 generated `SELECT 'FOCUS', 0 FROM curated.v_cross_scheme_money_district_year WHERE scheme_code='FOCUS'` (a MONEY view, for a BENEFICIARY count, on a scheme_code that does not exist) and the answer then claimed "the data available doesn't cover the FOCUS scheme" although Focus Legacy holds 11,906 groups / 102,021 memberships. Routing and the D-033 pin are correct; the generator and composer do not follow them. **Same pattern in CROSS-4 (typed):** filtered the MGNREGA+PMAY money view on 'Focus Plus' / 'Focus Legacy' / 'CM Elevate Legacy' and answered "0 crore" three times (truth 119.74 / 51.01 / 82.90 cr) | **Fixed 2026-10-10** — the comparison never touches the money view for other schemes (D-034); `_cross_scheme_sql_issue` rejects any scheme_code other than MGNREGA/PMAY there (live-verified 2026-10-10: 20/20 officer cases + 15 typed variants + the UI screenshot question, 36/36 vs independent DB queries) | High | pipeline generate_sql / compose_response |
+| KI-219 | The year clarification offers the UNION of all schemes' financial years as if jointly available: "MGNREGA, PMAY-G, Focus Plus and Focus Legacy data is available for FY 2017-18 … FY 2025-26" (9 options). No scheme has all 9 (Focus Plus has only 2022-23 and 2025-26), so picking FY 2019-20 silently yields a "comparison" containing PMAY-G alone. 13 of the 20 cross-scheme cases hit this pause | **Fixed 2026-10-10** — `_year_clarification` states each scheme's own years when they differ (chips unchanged); named comparisons no longer pause for a year at all (live-verified 2026-10-10: 20/20 officer cases + 15 typed variants + the UI screenshot question, 36/36 vs independent DB queries) | High | pipeline year clarification |
+| KI-220 | Cross-scheme composer states a total across schemes whose UNITS DIFFER and silently drops resolved schemes: CROSS-11 answered "total expenditure across all four schemes in East Khasi Hills sums to 737.68 crore" — mixing MGNREGA lakh-derived expenditure with PMAY-G rupee-derived releases and Focus Plus DBT cash (DATA_MODEL rule 6), saying "four" when 7 schemes were resolved (CM Elevate Legacy 22.60 cr, NRLM 18.29 cr, Focus Legacy 5.42 cr all present and dropped), and rendering CM Elevate as "0.00 crore" when it holds no money column at all | **Fixed 2026-10-10** — the comparison never totals across schemes and says CM Elevate has no money; model path guarded by `_cross_scheme_sql_issue` (constant CM Elevate amount) and `_cross_unit_total_stated` (live-verified 2026-10-10: 20/20 officer cases + 15 typed variants + the UI screenshot question, 36/36 vs independent DB queries) | Critical | pipeline compose_response |
+| KI-221 | The 4B semantic verifier rejects the prompt's OWN prescribed cross-scheme pattern as a "PROHIBITED JOIN": an aggregate-then-CROSS-JOIN of one-row per-scheme subqueries (the FAMILY C "WIDE" shape that `schema_context.py` mandates) is flagged under the rule banning ROW-LEVEL fact joins. 9 of 11 repair attempts in the live run came from this; it consumed every repair and returned "I couldn't build a working query" on 6 of 20 cases (CROSS-1/6/7/8/16/19). A KI-002 specialisation, fatal specifically on cross-scheme questions. **Narrowed by the typed-scope retest:** the same CROSS-JOIN shape passes when the scope is typed into the question (CROSS-1 typed = 4-way CROSS JOIN, correct); the rejections cluster on the chip-resume path, and only CROSS-9/10/16 still fail to build when typed | **Fixed 2026-10-10** — `_verifier_join_complaint_on_aggregates` discards the complaint when every joined operand is an aggregated subquery; the officer shapes no longer reach the verifier (D-034) (live-verified 2026-10-10: 20/20 officer cases + 15 typed variants + the UI screenshot question, 36/36 vs independent DB queries) | High | pipeline `_verify_sql` / execute_with_repair |
+| KI-222 | A cross-scheme DATA question with a superlative but no money word ("widest coverage across districts", "highest concentration of beneficiaries", "performance of … in <district>") leaves the DATA path and is answered from the knowledge base as an encyclopaedia paragraph, 0 rows, no SQL — CROSS-13, 14, 15. CROSS-13/15 additionally raise `scheme-not-specified` on a question whose ANSWER is the scheme | **Fixed 2026-10-10** — `classify_intent` returns DATA for a cross-scheme comparison (live-verified 2026-10-10: 20/20 officer cases + 15 typed variants + the UI screenshot question, 36/36 vs independent DB queries) | High | pipeline intent routing / `_CROSS_SCHEME_SUPERLATIVE` |
+| KI-223 | An un-aggregated UNION branch floods the result: CROSS-10 emitted `SELECT 'CM Elevate', NULL FROM curated.v_cm_elevate` with no aggregate and no GROUP BY — one row per application (8,627), truncated to the 1,000-row `run_readonly` cap. The three real figures were correct but the answer said "Here are the 40 results" followed by ~997 empty "CM Elevate" lines | **Fixed 2026-10-10** — deterministic rows (CROSS-10: 4 rows, was 1,000); `_cross_scheme_sql_issue` rejects an un-aggregated part (SELECT DISTINCT key lists exempt) (live-verified 2026-10-10: 20/20 officer cases + 15 typed variants + the UI screenshot question, 36/36 vs independent DB queries) | Medium | pipeline generate_sql / compose_response |
+| KI-224 | Three cross-scheme cases never reach an answer within 3 hops: CROSS-4/5 `scope` -> `year` -> `scheme`, CROSS-9 `entity-ambiguous` -> `year` -> `scheme`. The third pause asks "which scheme?" for questions that named their schemes outright ("Focus+, FOCUS, and CM-ELEVATE") and offers "MGNREGA" among the options — re-asking what the question already stated (KI-180/181 family) | **Fixed 2026-10-10 for cross-scheme comparisons** — they are answered before the scheme / scope / year pauses; CROSS-4/5 answer in one turn. Part of the observed triple pause was a harness artefact: the retest harness sent chip LABELS ('MGNREGA (rural employment)') where the UI sends the chip's full `question` (live-verified 2026-10-10: 20/20 officer cases + 15 typed variants + the UI screenshot question, 36/36 vs independent DB queries) | High | pipeline clarification chain |
+| KI-225 | Typing a year word flips CM-ELEVATE to the CM Elevate Legacy dataset: `_pin_cm_elevate_dataset` reads "across all financial years" as a Legacy cue (by design — CM Elevate has no year), so "Focus+ and CM-ELEVATE … across all financial years" silently answers for CM Elevate Legacy (2,823 sanction records) instead of CM Elevate (8,627 applications). An officer who types the year to skip the year pause changes which scheme they get. Cross-scheme cases 5, 6, 8, 19 | **Fixed 2026-10-10** — `_ALL_FINANCIAL_YEARS_SCOPE` is ignored by `_prefers_cm_elevate_legacy`; a specific FY, 'each financial year' and money words still pin (live-verified 2026-10-10: 20/20 officer cases + 15 typed variants + the UI screenshot question, 36/36 vs independent DB queries) | High | pipeline `_pin_cm_elevate_dataset` |
+| KI-226 | Composer misstates an extreme it was given: CROSS-7 (typed) reported the MGNREGA range as topping out at "56,936 in East Khasi Hills" although West Garo Hills 65,886 was in the 85-row result; PMAY-G max stated 32,346 vs real 33,143. Numeric-faithfulness passes because each number exists in the rows — it checks presence, not whether a highest/lowest claim is true | **Fixed 2026-10-10** — the officer shapes are written from the rows (D-034); `_range_claim_misstated` sends a misstated range on the model path to the deterministic answer (live-verified 2026-10-10: 20/20 officer cases + 15 typed variants + the UI screenshot question, 36/36 vs independent DB queries) | High | pipeline compose_response |
+| KI-227 | One UNION branch drops the place filter: CROSS-11 (typed) filtered every branch on `lgd_district='EAST KHASI HILLS'` except Focus Plus, so the statewide ₹119.74 cr was reported as East Khasi Hills (truth 15.62 cr) | **Fixed 2026-10-10** — every comparison query binds the place (D-034); `_cross_scheme_sql_issue` rejects a part missing the resolved district/block (live-verified 2026-10-10: 20/20 officer cases + 15 typed variants + the UI screenshot question, 36/36 vs independent DB queries) | High | pipeline generate_sql / verifier |
+| KI-228 | "Focus Legacy beneficiaries" has no stable meaning: two phrasings of one question returned 102,021 (memberships, CROSS-1) and 11,906 (producer groups, CROSS-2) under the same label; CROSS-2 then added groups to Focus Plus people (117,719). Focus Legacy has no person record — the answer must name the unit | **Fixed 2026-10-10** — Focus Legacy is always 'memberships paid for, in N producer groups (no individual person is recorded)' (live-verified 2026-10-10: 20/20 officer cases + 15 typed variants + the UI screenshot question, 36/36 vs independent DB queries) | Medium | pipeline generate_sql / compose_response |
+| KI-229 | A seven-scheme money question that says "status" ("How much has been disbursed to beneficiaries with status across MGNREGA, … CM Elevate, Focus, NRLM and CM Elevate Legacy …") stays on model SQL (a status ask is not the deterministic comparison's). The guards rejected a fake CM Elevate 0 and a "6,216.92 crore" cross-scheme total, but the fallback was the bare row dump ("amount crore: 82.90 crore") and CM Elevate was never mentioned (user report 2026-10-10) | **Fixed 2026-10-10** — a rejected cross-scheme total now falls back to `_cross_scheme_side_by_side` (each scheme's figure and measure, not added); `_cm_elevate_no_money_note` says CM Elevate has no figure when a money question names it and the result has none. Live re-run: correct | Medium | pipeline compose_response |
+| KI-230 | UI Sources line listed only "NRLM Self Help Groups, CM Elevate Legacy" for a six-scheme answer: it kept only `prettyName` labels on a hard-coded allow-list that held none of MGNREGA ("expenditure" / "employment"), PMAY-G, Focus Plus or Focus Legacy (user report 2026-10-10) | **Fixed 2026-10-10** — `web/ai_query.html` `sourceSchemes()` maps every curated view / fact / dim to its scheme; the line lists the schemes read, in catalogue order (aliases fall back to the old labels). Node-checked on the reported SQL: MGNREGA, PMAY-G, Focus Plus, Focus Legacy, CM Elevate Legacy, NRLM | Low | web/ai_query.html |
+| KI-231 | A question that names ONE scheme and asks it for a measure only another scheme records ("So what is the total person days in Meghalaya under CM Elevate?", UI report 2026-10-10) ended in "I understood the question but couldn't build a working query … Try rephrasing it": the generator wrote four queries for a column CM Elevate does not have, every one was rejected, and nothing told the officer WHY or where the figure lives. `_swap_measure_gap` (KI-180) catches the same gap only on a scheme-SWAP follow-up ("give me for pmay"), not when the scheme and the measure are typed together. | **Fixed 2026-10-10, live-verified** — app/pipeline.py `_measure_gap_answer` (+ `_measure_gap_scope_phrase`, `_MEASURE_OWNER_OFFERS`), called in `_answer_data` once the scheme is settled and before any model call: pause `measure-unavailable` — "CM Elevate doesn't record person-days — only MGNREGA does, so there is no person-days figure for CM Elevate for all of Meghalaya" — with the same question under the owner scheme (the user's own words, scheme swapped) as the first chip and the named scheme's own headline measures (`_SCHEME_HEADLINE_OFFERS`) for the same place / year / statewide scope read from the question. Same registry as the swap check (`_SCHEME_OWN_MEASURES`), so it covers MGNREGA person-days / job cards / wages / material / employment and PMAY-G houses; money and plain counts are left to the generator. Fires only when the scheme is named in the question (never on a classifier guess), for one scheme (comparisons keep D-034), and "self-employment" under CM Elevate is masked. Verified live: the reported question pauses as above; the MGNREGA chip goes to the normal year pause and answers 27,264,054 person-days for FY 2023-24; the Applications chip answers 8,627. Tests: new `tests/test_measure_gap_direct.py` (22). | Medium | pipeline (DATA path, not-held explanations) |
+| KI-217 | Product decision (2026-10-10): a question naming only "Focus" asked "Focus Legacy or Focus Plus?" instead of answering | **Changed 2026-10-10 (D-033)**: `_pin_bare_focus` rewrites a bare "Focus" to "Focus Legacy" before routing (DATA and KNOWLEDGE); Focus Plus / Focus+ / noun use / group names untouched. 4 older tests updated with the reason | Medium | pipeline |
 | KI-001 | Clarification resume state is per-worker, in-memory | Fixed 2026-09-26 (offline + live-verified) | High | session_store / router / session_sync |
 | KI-002 | SQL semantic verifier (4B) false positives drive repairs and hard failures | Open (mitigated by filters) | High | pipeline `_verify_sql` |
 | KI-003 | Repair loop: no convergence check, no request id, failing SQL not logged | Open | Medium | pipeline, logging |
@@ -1104,3 +1124,598 @@ the DATA path stubbed (the VPN was down: `10.48.242.4` answered neither 5432 nor
 - **Not fixed here:** KI-035 (summing per-year distinct counts), KI-040 (MGNREGA
   "beneficiaries"), KI-036/037 (block/village level memory).
 
+
+---
+
+### KI-188 to KI-195 — found by the NRLM use-case QA (2026-10-07); **ALL FIXED the same day**
+
+First live run of the 43 NRLM use cases (`NRLM_Use_Cases.xlsx`) against `curated.v_nrlm`, with
+every figure cross-checked against the raw file `NRLM to share to BLH.csv` **and** the database.
+Round 1: **16 passed, 27 failed**. After the fixes below, re-run live on the final code:
+**43 / 43 passed**. Report and per-case proof images: `NRLM_UseCase_Test_Report_2026-10-07.xlsx`
+(repo root).
+
+**The data itself reconciles exactly.** 34 scalar metrics plus the district, block, year,
+constituency and village breakdowns agree between the CSV and `curated.v_nrlm` (40,629 rows in
+both). Every failure below is in the pipeline, not in the data.
+
+- **KI-188 (Critical, 11 cases: UC2, 4, 9, 13, 14, 19, 20, 25, 26, 27, 28, 32).** A capped page of
+  rows is reported as the whole answer. The generated SQL carries `LIMIT 100`, 40 rows come back,
+  and `_deterministic_answer` renders "Here are the 40 results"; for "how many SHGs are in Umling
+  block?" the true answer is **1,167**. UC13 is the worst shape: it says "all five districts and
+  twenty-seven financial years" when NRLM has **12 districts and 30 formation years**, and UC32
+  reports the all-blocks CIF total as **760.03 lakh** against a true **9,847.55 lakh** — a 92%
+  understatement. This is the same class the CM Elevate Legacy fix addressed (TC-25/TC-36,
+  2026-09-25); the comment above `_DETERMINISTIC_MAX_ROWS` in `pipeline.py` describes it.
+  **Fix direction:** for a count question generate `COUNT(*)`; when a capped list is returned,
+  state the true total and label the rows as a sample.
+- **KI-189 (Critical, 6 cases: UC21, 22, 39, 40, 42, 43).** **The token "SHG" is resolved to the
+  district "South Garo Hills"**, raising `entity-ambiguous`: *I don't recognise "SHG" as a
+  district. Did you mean South Garo Hills?* The alias list for South Garo Hills holds `SGH`
+  (`data/NRLM/nrlm_entity_resolver.yaml:420`) and the 3-letter token fuzzy-matches. Because every
+  NRLM question contains "SHG", this blocks whole classes of question. **Reproduced 10/10** in
+  `pipeline.answer_question`; the bare `extract_entity_mentions` does not show it, so it enters at
+  the resolver, not the extractor. **Fix direction:** add `SHG` / `SHGs` / `S.H.G.` to the NRLM
+  stop-words so they are never read as a geography, and require a closer match before a 3-letter
+  token resolves to a district alias. The resolver already strips a *trailing* "SHG" (line 116);
+  it must also ignore the token mid-sentence.
+- **KI-190 (Critical, UC23, UC24, UC38).** A rupee total is stated **with no unit**. The SQL
+  divides by `1e7`, and the composer emits "The total CIF amount recorded across all SHGs … is
+  98.48." The true figure is ₹98.48 **crore** (₹98,47,55,178). An officer reads ninety-eight
+  rupees. This is the NR-07 rupee-unit risk named in `data/NRLM/README.md`. **Fix direction:**
+  carry the unit from the SQL alias (`_cr`, `_lakh`) into the sentence, and add a deterministic
+  check in `compose_response` that refuses a money figure from a scaled column unless the unit
+  word is present (CLAUDE.md §5: a prose rule alone is not enough).
+- **KI-191 (Critical, UC33, UC37).** Cumulative CIF/RF attributed to a financial year. CIF and RF
+  are cumulative, undated totals; the only year in NRLM is the year the SHG was **formed**. UC37
+  presents "the highest single-year value was 25.08 crore in 2017-18" as a trend with no caveat —
+  that is the CIF now held by SHGs *formed* in 2017-18, not CIF released that year.
+  `data/NRLM/README.md` calls this "the single highest-risk wrong-number path in the scheme", and
+  `nrlm_classification_rules.yaml` already marks `money_in_a_year_requested` and
+  `money_trend_or_growth_requested` **critical** — the rules are not firing. UC33 instead failed
+  closed ("couldn't build a working query"), which is safer but still not an answer.
+- **KI-192 (High, UC11).** A constituency question never resolves. "Show me active SHGs in
+  Rongjeng constituency" pauses asking whole-constituency vs block and the reply does not resume;
+  the true answer is **921** active SHGs.
+- **KI-193 (High, UC30).** A data question answered from the knowledge base. "Which SHGs have
+  received the highest RF amounts?" was routed to RAG, which replied that it holds no such
+  information. The DB answers it directly. Note the real answer is a tie: RF is capped at ₹30,000,
+  so thousands of SHGs share the maximum, and the composer should say so rather than name a few.
+- **KI-194 (High, UC10).** A true zero reported as missing data. **No** inactive SHG holds any CIF
+  or RF (a real zero, NR-15), but the reply was "I couldn't find any matching records in the data
+  available", which reads as "the data is missing". The empty-result zero wording was fixed for
+  CM Elevate (KI-182); NRLM needs the same.
+- **KI-195 (Medium, UC5).** "Find all SHGs with the name Sun Flower" generated
+  `shg_name = 'Sun Flower'` (2 rows). **20** SHG names contain "Sun Flower", so 18 groups the
+  officer asked for were dropped. A "find all … with the name X" question needs `ILIKE '%X%'`.
+
+### KI-196 — 12 NRLM source rows contradict their own district code (source-data defect, 2026-10-07)
+
+Found while reconciling the raw file against the DB. 12 rows in `NRLM to share to BLH.csv` carry
+`mapped_district_lgd_code = 657` (East Jaintia Hills) while `mapped_district_lgd_name` reads
+"Eastern West Khasi Hills" and the block reads "Mairang" (SHG codes 20868, 20977, 21602, 21609,
+21630, 21633, 21635, 29484, 37587, 38606, 44721, 45124). `curated.v_nrlm` follows the LGD code —
+which `data/NRLM/README.md` §7 states is authoritative — and places them in East Jaintia Hills /
+Saipung. **The database is right; the raw file is internally inconsistent.** Effect on district
+counts: East Jaintia Hills 2,732 (by CSV name) vs 2,744 (DB); Eastern West Khasi Hills 1,622 vs
+1,610. This is for the ingestion team (`megh-ingestion`), not a pipeline fix, and no use case
+above turns on it.
+
+#### The fixes (2026-10-07, same day; all live-verified, 43/43)
+
+Every one is a deterministic guard, not a prompt rule — the prose rules for KI-190 and
+KI-191 already existed in `schema_context._NRLM_RULES` and
+`data/NRLM/nrlm_classification_rules.yaml` and did not hold under sampling (CLAUDE.md §5).
+Regression tests: `tests/test_nrlm_usecase_fixes.py` (71 tests, every one calling the real
+function).
+
+| Issue | Fix | Symbol |
+|---|---|---|
+| **KI-188** | A "how many" question whose SQL lists rows is repaired to `COUNT(*)`; a question asking for **every** group ("each district", "-wise", "compare") keeps no LIMIT; a list that was still cut short leads with the true total, re-counted from the model's own query. A ranking question ("which SHGs have the **highest number of**…") is exempt — the rows are its answer. | `_nrlm_count_question_listed_rows`, `_nrlm_unrequested_limit`, `_nrlm_list_total`, `_deterministic_answer(total=…)` |
+| **KI-189** | `SHG`/`SHGS`/`CIF`/`RF`/`GP`/`AC` are scheme vocabulary and are never near-miss candidates for a district acronym. The WHK→West Khasi Hills behaviour the check exists for is unchanged. | `entity_resolver._ACRONYM_VOCABULARY` |
+| **KI-190** | A money value whose SQL alias declares its scale (`_cr`, `_lakh`) keeps that unit in the prose. Only values present in the result are touched, and only when stated with no unit, so no number can be invented or rescaled. | `_scaled_money_units` |
+| **KI-191** | When the SQL puts an NRLM money column and the formation year together, the cohort caveat is attached: the figure is what SHGs formed in that year hold today, not money released in it. | `_nrlm_money_year_caveat` |
+| **KI-192** | A constituency inside one block and one district no longer pauses to offer a narrowing that selects the same rows. The level-collision flow (a bare name that is both a block and a constituency, e.g. Sohra) still asks — `test_admin_level_collision.py` §5 pins it. | `_ac_drilldown_clarification` |
+| **KI-193** | A KB answer that is really "the reference material does not contain this" is never returned for a DATA question; the honest "couldn't build a query" message is used instead. | `_KB_DISCLAIMS_RE`, `_data_path_kb_fallback` |
+| **KI-194** | An empty NRLM result whose WHERE is only self-contained row tests (status, money, type, members) is reported as "None — …", with the NR-15 detail for the inactive+funded case. A place or name filter still gets the plain no-records message, because that CAN be a misspelling. | `_nrlm_zero_answer` |
+| **KI-195** | "Find all SHGs with the name X" is widened to `ILIKE '%X%'`. A pattern the model already wrote, and a non-search question, are left alone. | `_nrlm_name_search_contains` |
+
+**Two verifier false positives found while re-testing, both fixed:**
+
+- The verifier demanded `year_key = 2017` when NRLM correctly filtered
+  `formation_financial_year_short = '2017-18'` — NRLM's only year column. It rejected the
+  query on all four attempts and UC33 died in the KB fallback. `_verifier_year_complaint_is_false`
+  now recognises the `formation_` prefix; a genuine year mismatch still raises.
+- The verifier demanded an aggregate on `revolving_fund_amount` because it read `v_nrlm` as
+  "one row per SHG per year". One row **is** one SHG, so `SUM` would be wrong. UC30 died in the
+  KB fallback. New filter `_verifier_nrlm_grain_complaint_is_false`, scoped to NRLM, to a
+  single `curated.v_nrlm` source and to a query with no `GROUP BY`.
+
+### KI-197 — NRLM refused as "a scheme I don't cover", and the chip looped (user report 2026-10-07, FIXED)
+
+**Reported:** "List all SHGs registered under in Chokpot for NRLM" was answered with *"NRLM
+isn't one of the schemes I cover, so I can't answer questions about it"* — and the same reply
+offered an **NRLM (Self Help Groups)** chip. Tapping it re-asked the question with "NRLM" still
+in it, which was refused again, for ever. The real answer (**517** SHGs in Chokpot block,
+VERIFIED equal in `curated.v_nrlm` and the raw CSV) was available the whole time.
+
+**Cause.** `pipeline._UNSUPPORTED_SCHEME` still listed
+`nrlm|day-nrlm|aajeevika|ajeevika|livelihoods mission` from before NRLM was onboarded as the
+seventh scheme on 2026-10-06. The comment above that pattern already stated the rule it broke —
+*"CM Elevate is now a supported scheme … and must NOT appear here"* — but NRLM was never removed
+when it joined.
+
+The loop is what made it unrecoverable rather than merely wrong: `_unsupported_scheme_named`
+blanks only the **first** match before checking for a supported scheme, so a resumed chip
+carrying the scheme name twice ("… for NRLM, for NRLM") escaped, while the one-mention chip the
+UI actually offers matched again and regenerated the identical pause.
+
+**Fixed (2026-10-07), three parts:**
+
+1. The NRLM aliases are gone from `_UNSUPPORTED_SCHEME`, with the incident recorded inline.
+2. The refusal text named only six schemes while offering a seventh chip. It now names all
+   seven, as do the three `edge.py` replies that list coverage (`_OUT_OF_SCOPE_REPLY`, the
+   `greeting` and `identity` responses, and the out-of-area reply, which also said "these six
+   schemes").
+3. **A structural guard so this cannot recur for scheme eight:**
+   `tests/test_supported_scheme_not_refused.py` walks `SCHEME_CATALOG` and every alias in
+   `_SCHEME_NAME_PATTERN` and fails if any of them matches `_UNSUPPORTED_SCHEME`. It also
+   asserts that every chip the refusal offers resumes into a question that is **not** refused
+   again — i.e. that no refusal can loop — and that the refusal text and the edge replies name
+   every loaded scheme. 25 tests; verified to fail (8 of them) with the bug reintroduced, and to
+   pass with it fixed.
+
+**Lesson for the next scheme onboarding:** `_UNSUPPORTED_SCHEME` is a registry too. It is not in
+the 14 listed in `docs/SCHEMES.md §Adding a scheme` — it is a *removal*, not an addition, which
+is why it was missed. The new test now enforces it automatically.
+
+### KI-198 — a year chip the pipeline OFFERS was rejected as out of range, looping for ever (user report 2026-10-07, FIXED)
+
+**Reported:** "it is looping again and again" on several questions. Found by a loop sweep that
+drives the pipeline the way the UI does — follow a chip, keep going — and flags any thread that
+re-asks a question it already asked. **8 of 58 paths looped**, all NRLM:
+"How many SHGs are in Chokpot", "How many SHGs are there?", "total CIF in Chokpot" and
+"How many members are there in NRLM".
+
+**Cause.** Every one paused for a year, offered **FY 1984-85** (NRLM's earliest formation year),
+and then answered *"data is available only for the financial years 1984-85, …"* — refusing a
+year from its own list, and showing that list again. `_parse_year_key` only understood
+**2010-2039**; NRLM is the first scheme whose data starts before 2010 (1984-85 … 2022-23), so
+every pre-2010 chip parsed as `None`, was treated as an unparseable year, and re-raised
+`year-out-of-range`.
+
+**Fixed:** an **explicit** `NNNN-NN` range is now read from 1900 on, because the pair itself is
+unambiguous. A **bare** four-digit number stays restricted to 2010-2039 on purpose, so "top 2000
+villages" and "the 1984 census" are still not read as financial years.
+
+**Also fixed, found while verifying (same report):** following those chips reached a real but
+empty cell — e.g. Chokpot block in FY 1984-85 — and the answer read *"The data available doesn't
+cover the count of SHGs…"*. The count is simply **0** (one SHG statewide was formed in 1984-85,
+in West Garo Hills). `compose_response`'s guidance deliberately refuses to assert a zero from a
+`0`/`NULL` cell, because that is also how a metric the schema lacks arrives — correct in general,
+wrong here. `_nrlm_counted_zero_answer` now states the measured zero for NRLM when the result is
+one row with one counted metric (`COUNT`/`SUM`) and the query carried a `WHERE`; money columns
+keep their ₹ and name ("has received ₹0 of CIF"). This is KI-194's reasoning applied to the
+non-empty path.
+
+**Regression tests:** `tests/test_year_chip_no_loop.py` (36 tests, 2 skipped for CM Elevate which
+has no time dimension). The core test is the **invariant, not the symptom**: for every scheme in
+`SCHEME_CATALOG`, every year chip the pipeline offers must parse and be in range — so scheme
+eight gets the check for free. Verified to fail (11 tests) with the parser narrowed back, and to
+pass with the fix.
+
+**Sweep result after the fix: 258 chip paths, 0 loops, 0 dead ends** (4 transient VPN timeouts,
+each of which answers on retry).
+
+### KI-199 to KI-202 — found by the all-blocks / all-constituencies / all-villages / all-SHGs run (2026-10-07), all FIXED
+
+Exhaustive NRLM geography and SHG sweep: **12 districts + 56 blocks + 55 constituencies +
+4,976 villages + 40,629 SHGs = 45,728 questions**, each driven the way the UI drives it (follow
+a chip, keep going) and each expected answer read from `curated.v_nrlm` **and** cross-checked
+against the raw CSV. Districts **12/12**, blocks **56/56** and constituencies **55/55** passed
+on the first pass. Villages exposed four distinct defects, every one of them a **silent wrong
+number or an endless thread**, not a visible error.
+
+- **KI-199 (Critical) — a block literal beside a resolved `village_code` zeroed the answer.**
+  "Pabomari village, Demdema block" resolved `village_code = 272748` correctly, and the
+  generator then added `AND lgd_block = 'DEMDHEMA'` — a spelling that exists nowhere in the
+  data — so a village holding **23** SHGs answered **0**. The same shape appeared with the LGD
+  *code* columns: "Singsanggre village, Bajengdoba block, North Garo Hills" got
+  `block_lgd_code = 656 AND district_lgd_code = 273`, where 656 is North Garo Hills' **district**
+  code used as a block code and 273 is East Garo Hills entirely — 3 SHGs answered as 0.
+  **21 of the first 30 village failures were this one shape.**
+  `_mgnrega_drop_geo_beside_village` already removed exactly this for MGNREGA (the MAWLIEH
+  incident, 2026-09-26) but was scoped to that scheme and only matched the NAME columns.
+  **Fix:** `_VILLAGE_CODE_SCHEMES` now covers NRLM as well, and `_GEO_BESIDE_VILLAGE_RE` also
+  strips `block_lgd_code` / `district_lgd_code`.
+
+- **KI-200 (High) — a village question that NAMED its block still asked which village.**
+  "Bhangarpar village, Demdema block, West Garo Hills" replied *"'Bhangarpar' corresponds to
+  more than one village: Bhangarpar in DEMDEMA block, ANGARIPARA in TIKRIKILLA block"* —
+  ignoring the block the question had just named — and every chip re-asked the same thing, so
+  the thread never ended. **5 of the first 60 villages.** Cause: the branch that resolves a
+  block is an `elif`, so a question naming BOTH a village and a block takes the other arm and
+  `resolved["block"]` is empty when the village is resolved. **Fix:**
+  `_block_named_for_village` reads the block from the question text for narrowing only. It
+  scans deterministically and **only where the word "block" is attached to the name** —
+  `scan_dimension` refuses to scan bare block names because 26 of 56 are also constituency or
+  village names, and that caution still holds.
+
+- **KI-201 (Critical) — the BLOCK name was resolved as the village.**
+  "Songgitalgre village, Rongram block, West Garo Hills" returned **village=None on 6 of 8
+  identical extractor calls**. The block name then flowed into the village slot, resolved to
+  the *village* "Rongram Bazar" (code 273541), and the answer was a confident **9** SHGs for a
+  village that holds **8**. **Fix:** a name the question itself calls a block is cleared from
+  the village slot, before the scan backstop, so the backstop can still recover the real
+  village. A question that names both ("Rongram village, Rongram block") keeps the village.
+
+- **KI-202 (Critical) — the village scan backstop never ran for questions that say "village".**
+  The backstop was gated on `_stated_level is None`, on the reasoning that a question saying
+  "village" had already gone down the extractor's own village path. It had not: on exactly
+  these questions the extractor dropped the village, the slot was empty, the backstop was
+  skipped, and nothing filtered at village grain — Doldegre answered **6** against **4**, Dilma
+  Adap **8** against **10**, Aminda Simsanggre **6** against **8**. **Fix:** the gate is now
+  `_stated_level in (None, "village")`. Saying "village" is the strongest possible signal that
+  a village is wanted, so the backstop must run for it.
+
+**Regression tests:** `tests/test_village_block_narrowing.py` (24 tests). All four fixes are in
+the shared village path, so the whole suite was re-run: pytest **1,659 passed, 2 skipped**
+(31 files); plain scripts **14/14**.
+
+**Also seen, not a failure:** the SQL verifier demands MGNREGA's `assembly_constituency_name`
+for NRLM constituency questions (NRLM answers them from `constituency_name_raw`, no join). It
+self-corrects on the first repair, so all 55 constituencies pass, but it burns repair budget.
+Tracked here rather than fixed, because nothing fails because of it.
+
+### KI-203, KI-204 — found by the all-SHGs run (2026-10-07), both FIXED
+
+Testing all **40,629** SHGs individually, by their unique `shg_code`.
+
+- **KI-203 (Critical) — an NRLM SHG question was answered from Focus Legacy.**
+  "How many members are in SHG code 7194?" replied *"No producer group named 'SHG code 7194'
+  was found in the Focus Legacy data"*, while `curated.v_nrlm` holds the answer (**9** members).
+  Cause: the rule *"a group-name question that names no scheme of its own is a Focus Legacy
+  question"* in `_answer_data` predates NRLM, which has groups of its own. `_PG_STOP_WORDS` even
+  strips `shg` from the candidate name, so the SHG wording could not rescue it, and
+  `scope.schemes = ["NRLM"]` was overridden outright. Typing "under NRLM" was the only way
+  through. **Fix:** the Focus Legacy pull now also requires that the question carry no
+  NRLM-only vocabulary (`_NRLM_ONLY_TERMS`). A genuine producer-group question is unchanged.
+
+- **KI-204 (High) — a named SHG was then asked for a district and a financial year.**
+  `shg_code` is unique across all 40,629 groups (NRLM rule 12) and each group is one row with
+  one formation year, so the question is already fully pinned. Asking anyway left it
+  unanswerable in one turn, and picking a year would have filtered the single row to nothing.
+  **Fix:** `_NRLM_SHG_CODE_RE` (which requires the SHG word, so a bare number is never read as a
+  code) exempts a named SHG from both `_needs_scope_clarification` and
+  `_needs_year_clarification` — the same shape as the existing tranche and calendar-date
+  exemptions.
+
+Both verified live: SHG 7194 → **9 members**, SHG 67 → **10 members**, each equal to
+`curated.v_nrlm` and the raw CSV. Regression tests: `tests/test_nrlm_shg_lookup.py` (28).
+
+### KI-205, KI-206 — found later in the same exhaustive run (2026-10-07), both FIXED
+
+- **KI-205 (High) — an EXACT village name was offered as "ambiguous" against a look-alike.**
+  "Mawmluh II village, Rambrai block" (an exact name, village 276726, **12** SHGs) was answered
+  *"'Mawmluh II' corresponds to more than one village: Mawmluh II in RAMBRAI block, MAWMLUH A in
+  RAMBRAI block. Which of these is intended?"* — MAWMLUH A is a **different village**, not a
+  candidate. Same for "WEST RANGASORA" against "EAST RANGASORA". Every chip re-asked the same
+  question, so the thread never ended.
+  The rule that prevents this (*"a village's OWN name beats an alias hit"*) already existed in
+  `_resolve_village_for` and its comment records the identical WEST RANGASORA incident for
+  MGNREGA — but it is gated on `_village_scheme()`, and NRLM was not in that list.
+  **Fix:** new `_VILLAGE_EXACT_NAME_SCHEMES = _VILLAGE_NARROW_SCHEMES + ("NRLM",)` drives the
+  gate. NRLM is deliberately NOT added to `_VILLAGE_NARROW_SCHEMES`, which carries Focus Plus's
+  ward / urban-body narrowing that NRLM's data has no counterpart for.
+
+- **KI-206 (Critical) — a block NAME in an integer code column killed the query.**
+  The generator wrote `block_lgd_code = 'RANIKOR'` (and sometimes
+  `village_code = 'RANIKOR'`), so Postgres raised *invalid input syntax for type integer*. The
+  verifier then complained about something else entirely, every repair rewrote the same literal,
+  and the question died in the KB fallback — **5 Ranikor villages**, each with a real answer in
+  the data. **Fix:** `_GEO_BESIDE_VILLAGE_RE` now also strips a QUOTED value from
+  `block_lgd_code` / `district_lgd_code` (the clause is redundant beside a resolved
+  `village_code` anyway), and `_mgnrega_pin_village_code` — now scheme-agnostic via
+  `_VILLAGE_CODE_SCHEMES` — substitutes the resolved code for a non-numeric `village_code`
+  literal.
+
+  **Only reproducible under concurrency.** Re-running a failed case on its own passed every
+  time; at concurrency 10 it failed consistently. Worth remembering when a bulk failure looks
+  unreproducible.
+
+Regression tests: `tests/test_village_block_narrowing.py` (now 40). Full suite after both:
+pytest **1,690 passed, 2 skipped** (32 files).
+
+### KI-207, KI-208 — found deeper into the exhaustive run (2026-10-07), both FIXED
+
+- **KI-207 (High) — "&" in a village name truncated the scan.**
+  5 villages statewide carry an ampersand ("MAWKOHMIT & MAWKYNSAH", "MAWBLEI A & B").
+  `_PLACE_PREP_RE`'s name group allowed `[A-Za-z.'-]` but not `&`, so the scan offered only
+  the unmatchable "Mawkohmit", no village resolved, and the generator then put the village NAME
+  into the integer `village_code` column — *invalid input syntax for type integer* on every
+  repair, and the question died in the KB fallback with **17** SHGs sitting in the data.
+  **Fix:** the name group now admits `&` between words. Ordinary names are unaffected.
+
+- **KI-208 (Critical) — a one-figure answer stated the ROW COUNT, not the figure.**
+  "How many SHGs are there in Jaiaw Pdeng village, Bhoirymbong block, Ri Bhoi?" generated the
+  **correct** `SELECT COUNT(*) AS shgs FROM curated.v_nrlm WHERE village_code = 277979`, which
+  returns **12**, and the composer answered *"There is 1 SHG"* — the number of rows, not the
+  counted value. **Intermittent: 3 failures in 5 repeats of the identical question.** That is
+  the worst class of wrong number, because it reads perfectly and is off by 12x.
+  `_ONE_FIGURE_SCHEMES` already forced a retry for exactly this shape (the comment records
+  "There is 1 beneficiary" for a result of 11), but covered only Focus Plus and CM Elevate.
+  **Fix:** NRLM added to `_ONE_FIGURE_SCHEMES`.
+
+**Method note for the next bulk run.** Two things in this round were *harness* artifacts, not
+pipeline faults, and both cost time before being recognised:
+
+1. **Stale results.** Workers that started before a fix landed keep writing results with the old
+   code. Always re-run a non-PASS before diagnosing it — three "failures" here were already
+   fixed, and the `bulk_run.py --ids` flag exists for exactly that check.
+2. **A single year chip is a correct SUBTOTAL.** JAIAW PDENG holds 12 SHGs — 6 formed in
+   2018-19 and 6 in 2020-21 — so tapping the first year chip returns 6, which the grader scored
+   against the 12 total. A year pause must be answered "all years combined" when the expected
+   figure is a total. (The underlying KI-208 was real and separate; this only masked it.)
+
+Also: KI-206's integer-literal crash **only reproduced under concurrency**. A single-case re-run
+passed every time. A bulk failure that looks unreproducible should be retried at the same
+concurrency before being dismissed.
+
+### KI-209 — an SHG code in the 1900-2199 band was read as a financial year (2026-10-08, FIXED)
+
+Found by the all-SHGs run, after 1,645 consecutive SHG lookups had passed: **60 consecutive
+failures starting at exactly `shg_code = 1900`**, each *"I understood the question but couldn't
+build a working query"*. Code 1899 passed; 1900 did not.
+
+**Cause.** `shg_code` runs 1..46000, and `_YEAR_RANGE_TOKEN_RE` matches a bare `(19|21)\d\d` or
+`20[1-3]\d` as a financial year. So "How many members are in SHG code 1900?" had its **code**
+read as a year, which then failed the data-range check and killed the question. The band
+1900-2199 covers roughly **200 of the 40,629 SHGs**.
+
+**Fix.** New `_year_tokens_in()` wraps the scan and skips any token the question itself
+introduces as an identifier (`SHG`, `group`, `code`, `id`, `no.`, `number` immediately before
+the digits). Both callers — `_years_in_question` and `_out_of_range_year_in` — now go through
+it. A real year is untouched: FY 2050-51 is still refused, 1984-85 still accepted, and
+2023-24 is still out of range for NRLM (whose data ends at 2022-23).
+
+Verified: codes 1900, 1901, 1966, 2017, 2099, 2100, 2199 all answer; the 8 re-run bulk cases
+pass 8/8. Regression tests in `tests/test_nrlm_shg_lookup.py` (now 42), including the exact
+1899/1900 boundary.
+
+**Why it took 1,645 passing cases to surface:** the harness walks `shg_code` in order, so the
+whole band sits together. A random sample of SHGs would likely have missed it — the argument
+for testing the full set rather than a sample.
+
+### KI-210 — every "Use cases" row was dead: the inline onclick was cut in half (2026-10-09, FIXED)
+
+User report: the **Use cases** modal (sidebar → Use cases) listed the example questions, but
+clicking one did nothing — no query ran, the modal did not even close.
+
+**Cause.** `openUseCases()` built each row as
+
+```html
+<div class="modal-row" onclick="closeModal(); ask(${JSON.stringify(q)});">
+```
+
+`JSON.stringify` emits a **real double quote** around the question, and the attribute itself is
+delimited by double quotes. HTML ends an attribute value at the first `"`, so the browser read
+the handler as the truncated, syntactically invalid `closeModal(); ask(` — the rest of the tag
+became stray attributes. Nothing threw where anyone would see it; the click just did nothing.
+This hit **all 14 rows**, not an edge case, because every row goes through the same template.
+
+The file already carries the fix and the warning for exactly this bug, one screen up, above
+`bindRichActions()`: *"inline onclick= attributes injected through innerHTML are the classic
+source of 'the button does nothing'."* The use-case modal had never been moved onto that path.
+
+**Fix** (`web/ai_query.html`): the row now carries the question in `data-ask="${escapeHTML(q)}"`
+— `escapeHTML` turns `"` into `&quot;`, so the value survives the attribute intact — and the new
+`bindModalAsk()` attaches the handler with `addEventListener` after `openModal()` has put the
+rows in the DOM. The row is also `role="button" tabindex="0"` and answers Enter/Space, and a `→`
+appears on hover/focus so it reads as clickable.
+
+Verified: the question text of every row round-trips byte-exactly through the `data-ask`
+attribute, including the ones with `+` and `?` (`…under FOCUS+`, `…PMAY-G houses?`); the old
+form parses to invalid JS for every one of them. Both inline `<script>` blocks pass
+`node --check`. `grep` confirms no other `onclick="…JSON.stringify…"` remains in the file.
+End to end, the served page was driven in a real DOM (jsdom): the modal opens, **every row is
+clicked, reaches `ask()` with the exact question text and closes the modal**, and Enter on a
+focused row does the same. The same DOM parses the OLD markup to `onclick = "closeModal(); ask("`
+with no handler bound — the bug, reproduced.
+
+### KI-211 — the Use cases AND Glossary modals listed 3 of the 7 schemes (2026-10-09, FIXED)
+
+Found while fixing KI-210, and reported by the user in two steps ("include all schemes use
+cases", then "in glossary also add data for all schemes"). **All three** hand-maintained lists in
+`web/ai_query.html` — `USE_CASES` (the Use cases modal), `GLOSSARY` (the Glossary modal) and
+`SAMPLE_CATEGORIES` (the sidebar chips) — only ever covered **MGNREGA, PMAY-G and FOCUS+**, the
+three schemes that existed when they were written. Focus Legacy, CM Elevate, CM Elevate Legacy
+and NRLM had **no examples and no terms at all**, so four of the seven schemes were invisible to
+an officer browsing for what to ask or for what a measure means.
+
+**Fix.** Both lists now carry all seven, 34 rows in 8 sections. The questions are taken from the
+officers' own use-case files rather than invented — `CM Elevate.csv`, `Focus +_Use_Cases.csv`,
+`PMAY-G.csv`, `NRLM_Use_Cases.xlsx`, `Use_Cases_-_Focus.csv`,
+`Use_Cases_-_CM_Elevate_legacy.csv` — with the `[district]` / `[block]` placeholders replaced by
+real places so each row runs as written.
+
+Three scheme rules shaped the selection (CLAUDE.md, docs/SCHEMES.md):
+- **No bare "Focus" and no bare "CM Elevate".** A bare "Focus" is ambiguous and triggers a
+  clarification, which is a poor example; every row says Focus Plus or Focus Legacy, and the
+  Legacy dataset is always named in full.
+- **CM Elevate has no money and no time dimension**, so its four rows are COUNT questions only.
+  A money or year example would have been unanswerable by construction.
+- **NRLM's RF and CIF are cumulative and undated**, the scheme's highest-risk wrong-number path,
+  so no NRLM row puts a fund figure in a financial year.
+
+**Verified.** All 34 questions were routed through the pipeline's own deterministic
+`_shortcut_scheme`: **34/34 resolve to the scheme of the section they are filed under**, and the
+two cross-scheme rows resolve to two schemes. 0 bare-"Focus" rows. In the DOM, all 8 sections
+render and all 34 rows click.
+
+**Also fixed here:** the sidebar chips (`loadSampleQuestions`) used
+`onclick="useQuery('${safe}')"`, hand-escaping only the apostrophe — a question containing a
+double quote would have broken out of the attribute exactly as KI-210 did. They now use
+`data-chip-ask` + `addEventListener`. Note that this list is **dead code today**: its container
+`queriesContainer` does not exist anywhere in the page (true in `HEAD` as well), so
+`loadSampleQuestions()` returns at its own guard and no chip is rendered. It was updated for
+consistency, not because it displays — resurrecting that sidebar is a separate decision.
+
+**The Glossary, same fix (2026-10-09).** `GLOSSARY` now carries all seven schemes, **49 terms in
+7 sections** (was 15 terms in 3). The definitions are taken from `app/schema_context.py`
+`SCHEME_METRICS` and `docs/SCHEMES.md` rather than written fresh, so the glossary states exactly
+what the pipeline enforces — deliberately including the traps that yield a *plausible* wrong
+number:
+- **Focus Legacy** — the three counting subjects (payments / groups / memberships) are three
+  different numbers; `SUM(no_of_pg_members)` is memberships, not people; group size is
+  `MAX`, never `SUM`; "duplicate producer groups" (2,655 paid more than once) is a different
+  question from "duplicate payments" (zero); FY 2023-24 is absent, not zero.
+- **CM Elevate** — no money and no time dimension at all; a plain "pending" is On Hold, which
+  is not the same as pending *at a level*.
+- **CM Elevate Legacy** — records vs sanctioned cases; use the stored `total_disbursement`,
+  never a re-add of rounded parts; its 13 schemes are distinct from CM Elevate's 15.
+- **NRLM** — `COUNT(*)` is groups, not people (members are a COLUMN); RF and CIF are cumulative,
+  undated Mission grants that must never be placed in a financial year or called savings or
+  loans; the 2,032 village-less SHGs stay in district and block totals.
+
+Every figure quoted was checked against its source (410,847 / 409,249 members, 27,692 names,
+11,906 groups vs 10,678 names, 2,655 duplicates, 2,032 unresolved, 1,197 inactive, 73% without
+CIF, the ₹15,000 RF norm, 36 Piggery duplicate ids, three refused CM Legacy rows). Rendered in a
+real DOM: 7 sections, 49 terms, and the `\u2014`, `\'`, `÷`, `×` and `₹` escapes all resolve to
+real characters.
+
+**Regression test:** `tests/test_ui_use_cases.py` (52 tests). It reads the HTML and asserts the
+invariants rather than the wording, so editing a question is free: no inline `onclick`, the
+question in an escaped `data-ask`, rows focusable and keyboard-operable, **every scheme in
+`SCHEME_CATALOG` has its own section**, every question routes to the section it is filed under,
+no bare "Focus", no CM Elevate money/year, no NRLM money-in-a-year, and no unfilled `[placeholder]`.
+It also covers the Glossary: every scheme has its own section, every term has a non-empty
+definition, the Glossary and Use cases sections agree with each other, and the CM Elevate
+no-money/no-year and NRLM cumulative-grant rules are actually stated. Proven to bite by
+reintroducing each defect: the inline handler fails 3 tests, renaming the NRLM use-case section
+fails 8, renaming a Glossary section fails 3.
+
+### KI-212 … KI-216 — the cross-scheme use-case run (2026-10-10, OPEN)
+
+Found by testing the 20 officer cases in `Cross Scheme Test Cases.csv`. Full report with the
+raw baseline and per-case verdicts: `docs/Cross_Scheme_UseCase_Test_Report_2026-10-10.md`.
+
+**The DB and bot columns were NOT run — `10.48.242.4` was unreachable (VPN down), and that one
+host serves Postgres, Qdrant and every model endpoint.** All five findings below are
+nevertheless VERIFIED, because each was established by executing the real pipeline functions
+offline against the committed source; none needed a live answer. **11 of the 20 cases fail on
+code evidence alone, and not one of the 11 would surface as a visible error.**
+
+**KI-212 — a second bare "FOCUS" is dropped silently.** The officers write "Focus+ … and
+FOCUS" (CROSS-1, 2, 4, 6, 8, 17, 19, 20). `_is_ambiguous_focus` (pipeline.py ~1502)
+early-returns False as soon as `_SCHEME_NAME_PATTERN["Focus Plus"]` matches *anywhere*, so
+`\bfocus\s*\+` consumes "Focus+" and the standalone "FOCUS" is invisible: `_named_schemes`
+returns `['Focus Plus']`, no which-Focus pause fires, and Focus Legacy is dropped with nothing
+in the answer saying so. The guard was written for the one-mention case, where a Focus Plus
+match genuinely settles it; it never considered two *separate* Focus mentions, one qualified
+and one bare. Probe: `'…in FOCUS.'` → ambiguous=True (correct); `'…in Focus+ and FOCUS.'` →
+ambiguous=False (wrong). Fix direction: test the Focus mentions the qualified patterns did
+**not** consume — the residue technique already used at pipeline.py:419-420 — without
+re-breaking the bare-"Focus"-alone pause (docs/SCHEMES.md: a bare Focus is asked about, never
+guessed).
+
+**KI-213 — the Focus Plus beneficiary guard is off on every cross-scheme question.**
+`_focusplus_single_district_beneficiary_guard` opens `if schemes != ["Focus Plus"]: return sql`,
+so in all 8 multi-scheme beneficiary cases the deterministic protection is disabled by
+construction and only the prose prompt rule remains — the failure mode CLAUDE.md §5 exists to
+prevent. Raw magnitude: `COUNT(*)` = **385,671** payments vs
+`COUNT(DISTINCT beneficiary_key)` = **105,813** members, a **3.64x** overstatement. **[CORRECTED 2026-10-10 by the live retest: the true beneficiary measure is `COUNT(DISTINCT beneficiary_key)` = 105,813, so the overstatement is 3.64x, not 30.8x; `member_id` = 12,527 is the 12.5K cohort only. See docs/Cross_Scheme_UseCase_Retest_Report_2026-10-10.md §3 C-1.]** Worse, the
+fan-out is not uniform (20.0x North Garo Hills … 65.3x South Garo Hills), so the district
+ranking that CROSS-3/6/7/16/18 ask for **changes order** (East Khasi Hills 3rd by payments, 5th
+by unique members) and the payments reading shows 12 districts where the registration cohort
+covers 6. Fix direction: the invariant belongs in a deterministic post-SQL check that runs
+regardless of scheme count, not in widening this narrow single-district rewrite.
+
+**KI-214 — the deterministic money ranking misses two of its own cases.** CROSS-12 ("highest
+total financial **assistance**") is exactly what `_cross_scheme_money_answer` is for, but
+`_MONEY_SUPERLATIVE` has no `assistance`/`support` token (the word appears in pipeline.py only
+at line 3565, an unrelated eligibility regex), so `rank=False`; swapping in "expenditure"
+makes it fire. CROSS-5 ("which scheme has a **higher** total financial disbursement: Focus+ or
+CM-ELEVATE?") has the money words but no matching `_CROSS_SCHEME_SUPERLATIVE` shape. Both fall
+through to LLM SQL, which loses the deterministic answer's verbatim caveat and its statement
+that **CM Elevate holds no money at all** — removed precisely on the case that asks Focus+ vs
+CM Elevate. Both fixes are additive; `tests/test_cross_scheme_money.py` is the lock.
+
+**KI-215 — a comparison routed as single-scheme.** Via KI-212, CROSS-2 resolves to a one-scheme
+set, and `build_schema_context(['Focus Plus'])` omits the `_CROSS_SCHEME` block entirely
+(measured: `cross_block=False` for CROSS-2, True for CROSS-3). The model is handed a comparison
+question with none of the FAMILY A/B/C procedure, unit warnings or never-row-join invariants.
+Listed separately from KI-212 because it recurs for any wording that collapses to one scheme.
+
+**KI-216 — open DB question.** `docs/SCHEMES.md` calls Focus Plus's presence in
+`v_cross_scheme_money_district_year` unconfirmed, `schema_context.py` tells the model to probe
+it at runtime, and `_CROSS_SCHEME_MONEY_SQL` assumes **absent** (separate UNION branch). If the
+view does carry Focus Plus, that SQL double-counts it. One query settles it:
+`SELECT DISTINCT scheme_code FROM curated.v_cross_scheme_money_district_year`.
+
+**Note on the test set itself:** eight cases say "FOCUS" where the catalog holds two Focus
+schemes. That wording is what exposed KI-212, so it is worth keeping — but if "FOCUS" means
+Focus Legacy, then CROSS-1/2/6/17/19/20 ask a scheme with **no person record of any kind** for a
+beneficiary count, and the only correct answer says so and offers groups (11,906) or
+memberships (102,021). Worth settling with the officers before these become acceptance criteria.
+
+### KI-218 … KI-224 — the cross-scheme LIVE retest (2026-10-10, OPEN)
+
+The 20 officer cases re-run **with the VPN up**, against the live DB and the live gateway, on
+the post-D-033 code. Full report: `docs/Cross_Scheme_UseCase_Retest_Report_2026-10-10.md`.
+**Result: 4 PASS / 16 FAIL.** No application code was changed in that session.
+
+Method: real `pipeline.answer_question` with a real `Session`; clarification pauses answered the
+way an officer would (widest option) up to 3 hops, as `tests/live_context_validation.py` does;
+every stated figure then re-queried against the DB.
+
+**Resolved by this run:**
+- **KI-212 / KI-215 — FIXED and verified.** All 8 bare-FOCUS cases now pin to Focus Legacy;
+  CROSS-17/20 resolve all 5 schemes, CROSS-2 resolves 2 with the cross-scheme block loaded.
+- **KI-216 — CLOSED, not a defect.** `v_cross_scheme_money_district_year` holds only
+  `MGNREGA` and `PMAY`, so `_CROSS_SCHEME_MONEY_SQL`'s separate Focus Plus branch is right.
+- **KI-213 — magnitude corrected.** Focus Plus beneficiaries are **105,813**
+  (`COUNT(DISTINCT beneficiary_key)`), not 12,527. `member_id` exists only on the 12.5K cohort
+  (the 93K cohort has none), so there are **two** wrong readings: `COUNT(*)` overstates 3.64x,
+  `member_id` understates 8.45x. The guard being off on multi-scheme questions is still real.
+
+**The failure distribution matters more than the count:** 9 of 16 failures are *visible*
+(6 "couldn't build a working query", 3 endless pauses) and 7 are *silent* (4 confident wrong
+numbers, 3 encyclopaedia answers to data questions).
+
+**KI-218 — the generator ignores the D-033 pin.** Routing is correct but the SQL queries the
+money view for a beneficiary count on a fabricated `scheme_code='FOCUS'`, and the answer then
+tells the user the data "doesn't cover the FOCUS scheme" when Focus Legacy is fully present.
+Being told data is missing when it exists is worse than a refusal.
+
+**KI-219 — the year pause's union claim.** It asserts joint availability ("MGNREGA, PMAY-G,
+Focus Plus and Focus Legacy data is available for …") across 9 years, which is false for every
+one of the 9. Hit by 13 of 20 cases, so it gates most of the test set.
+
+**KI-220 — the cross-unit total.** "737.68 crore across all four schemes" is not a quantity:
+it adds lakh-derived, rupee-derived and DBT figures, says "four" when 7 were resolved, drops
+three schemes that do have money in that district, and renders CM Elevate's absent money column
+as 0.00. Per CLAUDE.md §5 the fix is a deterministic composer guard, not a prompt rule.
+
+**KI-221 — the verifier blocks the prescribed pattern.** This is the single highest-leverage
+fix: it alone accounts for all 6 no-answer cases. Every PASS in the run used the LONG
+(UNION ALL) shape; every no-answer attempted the WIDE (CROSS JOIN) shape the prompt mandates
+for one-figure-per-scheme questions, which is therefore effectively unusable today.
+
+**KI-222 — data questions answered from the KB.** "Which district has the widest coverage" is a
+DATA question; it returned a paragraph about MGNREGA being "the world's largest rights-based
+employment guarantee programme". CROSS-14 did this without even pausing.
+
+**KI-223 — the un-aggregated branch.** Data correct, presentation destroyed by ~997 junk rows.
+
+**KI-224 — the three-pause dead end.** The final pause discards what the question already said.
+
+**Priority (from the report):** KI-214 first (smallest change, fixes the worst wrong answer),
+then KI-221 (unblocks 6 cases), then KI-220, KI-219, KI-222, then KI-218/223/224/213.
+
+**Harness notes** (cost time; recorded so the next session doesn't repeat them):
+`answer_question` takes `session=`/`scope=`, **not** `session_id`. Startup must include
+`init_pool`, `init_client`, `init_qdrant`, `annotations.load_all`, `entity_resolver.load_all`,
+`schema_introspect.load`, `refresh_scheme_years` — without Qdrant every KNOWLEDGE-path case
+raises instead of answering. `ClarificationNeeded` is an exception, so a single-turn harness
+scores 18/20 as "paused" and tests nothing; resume via `router.remember_pause`. Use the
+configured `session_store` singleton. Never run two harness instances against one jsonl.

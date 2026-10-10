@@ -965,6 +965,12 @@
   }
   .modal-row:hover { background: var(--p-50); border-color: var(--p-200); }
   .modal-row-text  { flex: 1; font-size: 13px; color: var(--ink-1); }
+  /* A use-case row is a button: it has to look clickable before it is clicked. */
+  .modal-row-ask:hover .modal-row-text { color: var(--p-700); }
+  .modal-row-ask:focus-visible { outline: 2px solid var(--p-500); outline-offset: 1px; }
+  .modal-row-go { font-size: 14px; color: var(--p-500); opacity: 0; transition: opacity .12s; }
+  .modal-row-ask:hover .modal-row-go,
+  .modal-row-ask:focus-visible .modal-row-go { opacity: 1; }
   .modal-row-meta  { font-size: 11px; color: var(--ink-3); }
   .modal-pill {
     font-size: 10px; padding: 2px 6px; border-radius: 4px;
@@ -2483,6 +2489,22 @@ function buildAnalytics(question, data, hintType) {
 
 /* ============ FOLLOW-UP "NEXT STEP" + SOURCES ============ */
 // Pretty-print a curated object name: "curated.fact_mgnrega_employment" -> "MGNREGA employment"
+// Which scheme(s) a curated table or view belongs to — for the answer's Sources line.
+// CM Elevate Legacy is tested before CM Elevate (its names contain "cm_elevate").
+const SOURCE_SCHEME_ORDER = ['MGNREGA', 'PMAY-G', 'Focus Plus', 'CM Elevate', 'Focus Legacy',
+                             'CM Elevate Legacy', 'NRLM'];
+function sourceSchemes(table) {
+  const t = String(table || '').toLowerCase().replace(/^curated\./, '');
+  if (/^v_cross_scheme_/.test(t)) return ['MGNREGA', 'PMAY-G'];
+  if (/^(v_employment|v_expenditure|v_district_year_summary|fact_mgnrega_\w*)$/.test(t)) return ['MGNREGA'];
+  if (/^(v_pmay\w*|fact_pmay_\w*)$/.test(t)) return ['PMAY-G'];
+  if (/^(v_focus_plus|fact_focus_plus\w*)$/.test(t)) return ['Focus Plus'];
+  if (/^(v_cm_elevate_disbursement|fact_cm_elevate_disbursement|dim_cm_elevate_disb_scheme)$/.test(t)) return ['CM Elevate Legacy'];
+  if (/^(v_cm_elevate|fact_cm_elevate\w*|dim_cm_elevate_scheme)$/.test(t)) return ['CM Elevate'];
+  if (/^(v_focus_legacy|fact_focus_legacy\w*|dim_producer_group|dim_pg_entity_type)$/.test(t)) return ['Focus Legacy'];
+  if (/^(v_nrlm|fact_nrlm_shg)$/.test(t)) return ['NRLM'];
+  return [];
+}
 function prettyName(s) {
   return String(s || '')
     .replace(/^curated\./i, '')
@@ -2683,15 +2705,20 @@ function buildFollowUp(question, response) {
   const tableMatches = [...sql.matchAll(/(?:from|join)\s+["']?([a-z0-9_.]+)["']?/gi)];
   if (tableMatches.length) {
     const seen = [];
+    const found = new Set();
     for (const m of tableMatches) {
       // "IS DISTINCT FROM TRUE" is not a table (it showed "Sources: TRUE, PMAY-G", 2026-09-29)
       if (/^(true|false|null)$/i.test(m[1])) continue;
-      const pretty = prettyName(m[1].replace(/["']/g, '').split('.').pop());
+      const table = m[1].replace(/["']/g, '').split('.').pop();
+      sourceSchemes(table).forEach(s => found.add(s));
+      const pretty = prettyName(table);
       if (pretty && !seen.includes(pretty)) seen.push(pretty);
     }
-    // Keep only real scheme tables (drop subquery aliases that slipped through).
-    const schemes = seen.filter(n => ['FOCUS+', 'Focus', 'CM Elevate', 'CM Elevate Legacy',
-                                      'NRLM Self Help Groups', 'NRLM SHG register'].includes(n));
+    // The schemes whose data was read, in catalogue order. The old allow-list of prettyName
+    // labels held neither MGNREGA ("expenditure", "employment") nor PMAY-G, Focus Plus or Focus
+    // Legacy, so a seven-scheme money answer listed only "NRLM Self Help Groups, CM Elevate
+    // Legacy" (user report 2026-10-10). Non-scheme names (subquery aliases) are the fallback.
+    const schemes = SOURCE_SCHEME_ORDER.filter(s => found.has(s));
     tableChip = (schemes.length ? schemes : seen).join(', ');
   }
   const groupMatch = sql.match(/group\s+by\s+([a-z0-9_.,\s"]+?)(?:order\s+by|limit|having|$)/i);
@@ -2829,22 +2856,42 @@ function addBotRich(question, response) {
 // /api/query/suggestions. Keep this list short and representative of both
 // schemes and both routes (data + scheme-knowledge).
 const SAMPLE_CATEGORIES = {
-  'MGNREGA — employment & wages': [
+  'MGNREGA \u2014 employment & wages': [
     'Total MGNREGA person-days in 2023-24',
     'MGNREGA wage expenditure by district in 2024-25',
     'Households that completed 100 days in West Khasi Hills',
     'Job cards issued in 2025-26',
   ],
-  'PMAY-G — housing': [
+  'PMAY-G \u2014 housing': [
     'PMAY-G houses completed by district',
     'PMAY-G houses sanctioned vs completed in East Garo Hills',
     'Total PMAY-G amount released in 2024-25',
   ],
-  'FOCUS+ — farmer cash benefit': [
-    'How many FOCUS+ payments were made in each batch',
-    'FOCUS+ payments by district',
-    'How much has been disbursed under FOCUS+',
-    'Top 5 blocks by FOCUS+ payments',
+  'Focus Plus \u2014 farmer cash benefit': [
+    'How many Focus Plus payments were made in each batch',
+    'Focus Plus payments by district',
+    'How much has been disbursed under Focus Plus',
+    'Top 5 blocks by Focus Plus payments',
+  ],
+  'Focus Legacy \u2014 producer groups': [
+    'How many producer groups have been covered under Focus Legacy',
+    'Focus Legacy amount disbursed by district',
+    'How many producer groups were paid more than once under Focus Legacy',
+  ],
+  'CM Elevate \u2014 applications': [
+    'How many CM Elevate applicants are there in Ri Bhoi',
+    'How many applicants are there under each CM Elevate programme',
+    'How many CM Elevate applications are on hold in East Khasi Hills',
+  ],
+  'CM Elevate Legacy \u2014 sanctions': [
+    'Total amount disbursed under CM Elevate Legacy',
+    'CM Elevate Legacy sanctioned vs disbursed by district',
+    'CM Elevate Legacy disbursement by lender',
+  ],
+  'NRLM \u2014 Self Help Groups': [
+    'How many SHGs are recorded in the database for Meghalaya',
+    'How many SHGs are currently active',
+    'What is the total number of female members across all SHGs',
   ],
   'Cross-scheme': [
     'Compare MGNREGA vs PMAY-G spend in West Khasi Hills',
@@ -2852,9 +2899,11 @@ const SAMPLE_CATEGORIES = {
   ],
   'How the schemes work': [
     'Who is eligible for PMAY-G?',
-    'What documents are required to apply for PMAY-G?',
     'What is MGNREGA and what does it guarantee?',
-    'What is FOCUS+ and who is eligible?',
+    'What is Focus Plus and who is eligible?',
+    'What is the role of producer groups under Focus Legacy?',
+    'What is the CM Elevate programme in Meghalaya?',
+    'What is NRLM and who does it support?',
   ],
 };
 
@@ -2864,13 +2913,20 @@ function loadSampleQuestions() {
   let html = '';
   for (const [cat, questions] of Object.entries(SAMPLE_CATEGORIES)) {
     html += `<div class="query-cat"><div class="query-cat-hd">${escapeHTML(cat)}</div>`;
+    // data-chip-ask + addEventListener, not an inline onclick: the old form
+    // hand-escaped only the apostrophe, so a question holding a double quote
+    // would have broken out of the attribute exactly as the use-case rows did
+    // (KI-210). escapeHTML covers both quote characters.
     questions.forEach(q => {
-      const safe = String(q).replace(/'/g, "\\'");
-      html += `<button class="query-chip" onclick="useQuery('${safe}')">${escapeHTML(q)}</button>`;
+      html += `<button class="query-chip" data-chip-ask="${escapeHTML(q)}">${escapeHTML(q)}</button>`;
     });
     html += '</div>';
   }
   container.innerHTML = html;
+  container.querySelectorAll('[data-chip-ask]').forEach(el => {
+    const q = el.getAttribute('data-chip-ask');
+    if (q) el.addEventListener('click', () => useQuery(q));
+  });
 }
 
 /* ============ CONVERSATION HISTORY (server-backed, per user) ============
@@ -3283,25 +3339,74 @@ async function runUndo() {
 
 /* ============ GLOSSARY ============ */
 const GLOSSARY = {
+  // One section per scheme, all SEVEN. The definitions come from
+  // app/schema_context.py SCHEME_METRICS and docs/SCHEMES.md, so the glossary
+  // tells the officer exactly what the pipeline enforces \u2014 including the traps
+  // that produce a plausible wrong number (CM Elevate has no money and no year;
+  // NRLM's RF/CIF are cumulative and undated; Focus Legacy counts memberships,
+  // not people; a bare "Focus" or "CM Elevate" names two different datasets).
   'MGNREGA': [
-    { term: 'Person-days', def: 'The headline output measure — one person working one day. Additive; always SUM.' },
+    { term: 'Person-days', def: 'The headline output measure \u2014 one person working one day. Additive; always SUM.' },
     { term: 'Expenditure', def: 'Wage + material + tax spend, in LAKH rupees (divide by 100 for crore).' },
-    { term: 'Job cards (stock)', def: 'Cumulative count — never summed across years; reported one year at a time.' },
+    { term: 'Job cards (stock)', def: 'Cumulative count \u2014 never summed across years; reported one year at a time.' },
     { term: '100-day completion', def: 'Households that got the full 100 days of guaranteed work in a financial year.' },
-    { term: 'Wage-share (60:40)', def: 'unskilled_wage ÷ total_exp — the statutory Schedule-I ratio.' }
+    { term: 'Wage-share (60:40)', def: 'unskilled_wage \u00f7 total_exp \u2014 the statutory Schedule-I ratio.' }
   ],
   'PMAY-G': [
-    { term: 'Sanctioned amount', def: 'Assistance approved per house, in RUPEES — effectively a per-house constant.' },
-    { term: 'Amount released', def: 'Money actually disbursed against the sanction, in RUPEES — the figure that varies.' },
-    { term: 'Completed / in progress', def: 'Construction stage — read from the is_completed / is_in_progress flags.' },
-    { term: 'Placeholder row', def: 'Not a real house — excluded from every count and sum unless the question is about data completeness.' }
+    { term: 'Sanctioned amount', def: 'Assistance approved per house, in RUPEES \u2014 effectively a per-house constant.' },
+    { term: 'Amount released', def: 'Money actually disbursed against the sanction, in RUPEES \u2014 the figure that varies.' },
+    { term: 'Completed / in progress', def: 'Construction stage \u2014 read from the is_completed / is_in_progress flags.' },
+    { term: 'Construction stage', def: 'Proposed Site, Existing site (Old House), House Sanctioned, Plinth, Roof Cast, Completed.' },
+    { term: 'Placeholder row', def: 'Not a real house \u2014 excluded from every count and sum unless the question is about data completeness.' }
   ],
-  'FOCUS+': [
+  'Focus Plus': [
     { term: 'Disbursement', def: 'One row = one payment to one member in one tranche. COUNT(*) is a payment count, not a person count.' },
     { term: 'Batch (93K / 12.5K)', def: 'Two cohorts stacked in one table: 93K legacy paid (4 rows/person, no personal fields) and 12.5K newer registrations (1 row/person, gender/occupation/status populated).' },
-    { term: 'Beneficiaries', def: 'Three different numbers — payments, members with an id (12.5K only, ~12,527), and the legacy count (~93,286, not derivable from the database). Always shown side by side, labelled.' },
-    { term: 'Amount disbursed', def: 'The only money measure. Unit is UNVERIFIED — read from dim_scheme, never assumed. Only two values exist: 5,000 and 2,500.' },
-    { term: 'Tranche', def: 'A payment round label (Tranch 1..4) — categorical, never a time series. There is no date column.' }
+    { term: 'Beneficiaries', def: 'Three different numbers \u2014 payments, members with an id (12.5K cohort only, ~12,527), and the legacy count (~93,286, not derivable from the database). Always shown side by side, labelled.' },
+    { term: 'Amount disbursed', def: 'The only money measure. Unit is UNVERIFIED \u2014 read from dim_scheme, never assumed. Only two values exist: 5,000 and 2,500.' },
+    { term: 'Tranche', def: 'A payment round label (Tranch 1..4) \u2014 categorical, never a time series. There is no date column.' }
+  ],
+  'Focus Legacy': [
+    { term: 'Producer Group (PG)', def: 'The unit this scheme pays. Count groups on pg_id, never on the name: 11,906 groups carry only 10,678 distinct names.' },
+    { term: 'Three counting subjects', def: 'COUNT(*) = payments; COUNT(DISTINCT pg_id) = groups; SUM(no_of_pg_members) = memberships. All three are different numbers.' },
+    { term: 'Memberships (not people)', def: 'SUM(no_of_pg_members) counts memberships, not distinct persons \u2014 this partition holds no person record at all.' },
+    { term: 'Amount disbursed', def: 'Exactly memberships \u00d7 \u20b95,000 on every row, so money and member rankings are identical. Unit UNVERIFIED \u2014 read from dim_scheme.' },
+    { term: 'Group size', def: 'MAX(no_of_pg_members) per pg_id \u2014 never a SUM, which would multiply a group by how often it was paid.' },
+    { term: 'PG type', def: 'PG-FOCUS, PG-LAMP or PG-EXISTING.' },
+    { term: 'Duplicate producer groups', def: 'Groups PAID MORE THAN ONCE \u2014 2,655 of 11,906 statewide. Different from "duplicate payments" (the same group paid twice on one date: zero).' },
+    { term: 'Remittance date', def: 'A treasury BATCH date \u2014 only 30 distinct dates exist, so there are no monthly trends.' },
+    { term: 'FY 2023-24', def: 'Absent from this scheme, not zero. Shown as a gap; a comparison naming it uses the nearest year holding data.' }
+  ],
+  'CM Elevate (applications)': [
+    { term: 'Application', def: 'One row = one application \u2014 a request, not an award. COUNT is the only aggregate this dataset supports.' },
+    { term: 'Applicants', def: 'COUNT(DISTINCT request_id) \u2014 about 36 duplicate ids exist, all in Piggery.' },
+    { term: 'No money, no time', def: 'This dataset holds NO sanctioned amount, subsidy, loan or disbursement, and NO date, month or financial year. Those questions have no answer here \u2014 they belong to CM Elevate Legacy.' },
+    { term: 'Pending / On Hold', def: 'A plain "pending" means data_verified = On Hold. The onhold boolean is always FALSE and is never used.' },
+    { term: 'Pending at a level', def: 'Different question: current_level = levelN AND file_status = Pending.' },
+    { term: 'Status', def: 'current_file_status \u2014 Forward / Sent back / Resubmit. "Verified" is data_verified = Valid.' },
+    { term: '15 sub-schemes', def: 'One programme, 15 schemes inside it (PRIME SEED is the largest at 43%, then Piggery). Naming two or more gets each figure plus the combined total.' }
+  ],
+  'CM Elevate Legacy (sanctions & disbursements)': [
+    { term: 'Record', def: 'One row = one applicant in one scheme. COUNT(*) is records; "sanctioned" is COUNT(sanctioned_amount) \u2014 three refused rows carry no amount.' },
+    { term: 'Sanctioned amount', def: 'Approved assistance, stored in RUPEES and reported in crore.' },
+    { term: 'Total disbursement', def: 'The stored total = subsidy + loan. Use the stored column, never a re-add of rounded parts.' },
+    { term: 'Lender', def: 'loan_entity \u2014 Bank, LIFCOM, or not recorded.' },
+    { term: 'Desanctioned', def: 'Refused or Duplicate. The refusal fields disagree with one another, so they are reported as they stand.' },
+    { term: 'Instalments', def: 'Subsidy and loan tranches 1-3, with their dates.' },
+    { term: '13 schemes', def: 'Its own list of 13 \u2014 distinct from CM Elevate\'s 15, and never joined to them.' },
+    { term: 'Financial year', def: 'FY 2024-25 and FY 2025-26 only. The two Sericulture schemes carry no year at all.' }
+  ],
+  'NRLM \u2014 Self Help Groups': [
+    { term: 'SHG', def: 'One row = one Self Help Group. COUNT(*) counts GROUPS, never people \u2014 reading it as people understates members roughly tenfold.' },
+    { term: 'Members', def: 'A COLUMN, not a row count: SUM(total_members) = 410,847, of which SUM(female_members) = 409,249.' },
+    { term: 'shg_code vs shg_name', def: 'The code is the key. The name is display only \u2014 27,692 names for 40,629 groups, and "Iatreilang Shg" alone is 295 different SHGs.' },
+    { term: 'Revolving Fund (RF)', def: 'A Mission GRANT, cumulative per SHG as at the extract, in rupees (norm \u20b915,000). Never a saving or a loan.' },
+    { term: 'Community Investment Fund (CIF)', def: 'The other Mission grant, also cumulative per SHG. 73% of SHGs hold none, so averages are shown over all SHGs and over recipients separately.' },
+    { term: 'Funds have no year', def: 'RF and CIF are undated totals. They can never be placed in a financial year, trended or called "utilisation" \u2014 filtering them by formation year silently answers a different question.' },
+    { term: 'Formation year', def: 'The only year in the data (1984-85..2022-23) \u2014 the year the SHG was formed, not a reporting year.' },
+    { term: 'Pre-Nrlm', def: 'A stored SHG TYPE (New / Revived / Pre-Nrlm), not a year filter.' },
+    { term: 'Unresolved village', def: '2,032 SHGs (5%) have no village but a correct block and district \u2014 they stay in every district and block total, and are excluded only from village figures.' },
+    { term: 'Inactive SHGs', def: 'All 1,197 show zero RF and zero CIF, so a fund question filtered to them returns zero by construction.' }
   ]
 };
 function openGlossary() {
@@ -3319,6 +3424,17 @@ function openGlossary() {
 
 /* ============ USE CASES ============ */
 const USE_CASES = {
+  // All SEVEN schemes. The questions come from the officers' own use-case files
+  // (CM Elevate.csv, Focus +_Use_Cases.csv, PMAY-G.csv, NRLM_Use_Cases.xlsx,
+  // Use_Cases_-_Focus.csv, Use_Cases_-_CM_Elevate_legacy.csv), with the
+  // [district] / [block] placeholders replaced by real places so each row runs
+  // as written.
+  //
+  // The two name collisions are never left bare (CLAUDE.md, docs/SCHEMES.md):
+  // "Focus" is always qualified Focus Plus or Focus Legacy, and CM Elevate Legacy
+  // is always named in full. Per-scheme limits are respected too: CM Elevate has
+  // no money and no time dimension, and NRLM's RF/CIF are cumulative and undated,
+  // so neither scheme gets a money-by-year question here.
   'MGNREGA': [
     'Total MGNREGA person-days in 2023-24',
     'MGNREGA wage expenditure by district in 2024-25',
@@ -3329,29 +3445,86 @@ const USE_CASES = {
     'PMAY-G houses completed by district',
     'PMAY-G houses sanctioned vs completed in East Garo Hills',
     'Total PMAY-G amount released in 2024-25',
+    'Give me the house status breakdown for Ri Bhoi',
     'Who is eligible for PMAY-G?'
   ],
-  'FOCUS+': [
-    'How many FOCUS+ payments were made in each batch',
-    'FOCUS+ payments by district',
-    'How much has been disbursed under FOCUS+',
-    'What is FOCUS+ and who is eligible?'
+  'Focus Plus': [
+    'How many Focus Plus payments were made in each batch',
+    'Focus Plus payments by district',
+    'How much has been disbursed under Focus Plus',
+    'Give me the gender-wise breakdown of Focus Plus beneficiaries',
+    'What is Focus Plus and who is eligible?'
+  ],
+  'Focus Legacy': [
+    'How many producer groups have been covered under Focus Legacy',
+    'Focus Legacy amount disbursed by district',
+    'Top 5 blocks by Focus Legacy producer groups',
+    'How many producer groups were paid more than once under Focus Legacy',
+    'What is the role of producer groups under Focus Legacy?'
+  ],
+  'CM Elevate (applications)': [
+    'How many CM Elevate applicants are there in Ri Bhoi',
+    'How many applicants are there under each CM Elevate programme',
+    'How many CM Elevate applications are on hold in East Khasi Hills',
+    'How many applicants applied under the Meghalaya Piggery Development Scheme'
+  ],
+  'CM Elevate Legacy (sanctions & disbursements)': [
+    'Total amount disbursed under CM Elevate Legacy',
+    'CM Elevate Legacy sanctioned vs disbursed by district',
+    'How many CM Elevate Legacy applicants were sanctioned in 2024-25',
+    'CM Elevate Legacy disbursement by lender'
+  ],
+  'NRLM \u2014 Self Help Groups': [
+    'How many SHGs are recorded in the database for Meghalaya',
+    'How many SHGs are currently active',
+    'What is the total number of female members across all SHGs',
+    'Compare the number of active and inactive SHGs in each district',
+    'Which blocks have the highest number of inactive SHGs'
   ],
   'Cross-scheme': [
     'Compare MGNREGA vs PMAY-G spend in West Khasi Hills',
     'Which villages have both MGNREGA activity and PMAY-G houses?'
   ]
 };
+// Every use-case row is clickable: it closes the modal and asks the question.
+// The handler is attached with addEventListener AFTER the rows are in the DOM.
+// It used to be an inline onclick="... ask(${JSON.stringify(q)})": JSON.stringify
+// emits real double quotes, which close the onclick="" attribute at the first one,
+// so the browser parsed a truncated `closeModal(); ask(` and every click silently
+// did nothing. Same failure, and the same fix, as bindRichActions().
 function openUseCases() {
   let body = '';
   for (const [section, items] of Object.entries(USE_CASES)) {
     body += `<div class="modal-section">${escapeHTML(section)}</div>`;
     body += items.map(q =>
-      `<div class="modal-row" onclick="closeModal(); ask(${JSON.stringify(q)});">
+      `<div class="modal-row modal-row-ask" role="button" tabindex="0" data-ask="${escapeHTML(q)}">
          <span class="modal-row-text">${escapeHTML(q)}</span>
+         <span class="modal-row-go" aria-hidden="true">&#8594;</span>
        </div>`).join('');
   }
   openModal('Use cases', 'Example questions you can ask', body);
+  bindModalAsk();
+}
+
+// Wire the [data-ask] rows of the open modal. Keyboard too: the rows are
+// role="button", so Enter and Space must fire them like a click does.
+function bindModalAsk() {
+  const root = document.getElementById('modalBody');
+  if (!root) return;
+  root.querySelectorAll('[data-ask]').forEach(el => {
+    const q = el.getAttribute('data-ask');
+    if (!q) return;
+    const run = (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      closeModal();
+      ask(q);
+    };
+    el.addEventListener('click', run);
+    el.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === ' ' || e.key === 'Spacebar') run(e);
+    });
+  });
 }
 
 document.addEventListener('keydown', e => { if (e.key === 'Escape') closeModal(); });

@@ -536,8 +536,8 @@ _STARTER_KINDS = {"greeting", "identity", "capability", "money_advice", "profani
 # the edge layer (the pipeline's OutOfScope handler) reuse it via out_of_scope().
 _OUT_OF_SCOPE_REPLY = (
     "I'm Megh One AI, the assistant for Meghalaya's MGNREGA, PMAY-G, Focus Plus, "
-    "CM Elevate, Focus Legacy (producer groups) and CM Elevate Legacy (sanctions and "
-    "disbursements) schemes. I can only answer "
+    "CM Elevate, Focus Legacy (producer groups), CM Elevate Legacy (sanctions and "
+    "disbursements) and NRLM (Self Help Groups) schemes. I can only answer "
     "questions about those schemes and their data in Meghalaya — not other topics, "
     "other states, or places outside Meghalaya."
 )
@@ -545,18 +545,18 @@ _OUT_OF_SCOPE_REPLY = (
 _RESPONSES = {
     "greeting": (
         "Hello! I answer questions about Meghalaya's MGNREGA, PMAY-G, Focus Plus, "
-        "CM Elevate, Focus Legacy and CM Elevate Legacy data — person-days, expenditure, "
+        "CM Elevate, Focus Legacy, CM Elevate Legacy and NRLM data — person-days, expenditure, "
         "houses sanctioned and completed, Focus Plus disbursements, CM Elevate applications "
         "by scheme, Focus Legacy producer-group payments, CM Elevate Legacy subsidy and "
-        "loans disbursed, district and block "
+        "loans disbursed, NRLM Self Help Groups and their members, district and block "
         "breakdowns — and general questions about how the schemes work."
     ),
     "identity": (
         "I can help you with Meghalaya's MGNREGA, PMAY-G, Focus Plus, CM Elevate, "
-        "Focus Legacy and CM Elevate Legacy schemes — things like person-days and wage expenditure, houses "
+        "Focus Legacy, CM Elevate Legacy and NRLM schemes — things like person-days and wage expenditure, houses "
         "sanctioned and completed, Focus Plus disbursements, CM Elevate applications, "
         "Focus Legacy payments to producer groups, CM Elevate Legacy sanctions and "
-        "disbursements, district and block breakdowns, and "
+        "disbursements, NRLM Self Help Groups and their members, district and block breakdowns, and "
         "eligibility or how-to-apply questions for any of these schemes. Just ask in "
         "plain language."
     ),
@@ -830,10 +830,10 @@ def _out_of_area_reply(question: str, place: str) -> str:
         lead = f"I don't hold any data for {name}. "
     return (
         lead + "I'm Megh One AI, and I only cover Meghalaya's MGNREGA, PMAY-G, "
-        "Focus Plus, CM Elevate, Focus Legacy and CM Elevate Legacy schemes — the data is "
+        "Focus Plus, CM Elevate, Focus Legacy, CM Elevate Legacy and NRLM schemes — the data is "
         "Meghalaya's "
         "alone, so I have nothing for other states or countries. If there's something "
-        "you'd like to know about these six schemes in Meghalaya, I can help with that."
+        "you'd like to know about these seven schemes in Meghalaya, I can help with that."
     )
 
 

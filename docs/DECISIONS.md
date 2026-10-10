@@ -511,3 +511,50 @@ not recorded.*
 - **Unchanged:** "duplicate payments / records" (same pg_id, same date) is a separate question and keeps the model path.
 - **Alternatives offered and not chosen:** a year-of-repeat breakdown (8 / 22 / 37 / 2,592, overlapping); the same-year
   subset; same name + same village under different IDs (25 sets / 50 groups).
+
+### D-033 — A bare "Focus" means Focus Legacy
+- **Date:** 2026-10-10 (`app/pipeline.py` `_pin_bare_focus`, applied in `_run_pipeline` beside
+  `_pin_cm_elevate_dataset`; KI-217, closes KI-212).
+- **Decision (product owner):** when a question names only "Focus" (any case), it is Focus Legacy, on the DATA and the
+  KNOWLEDGE paths. The question is rewritten once, before routing, so every later check sees "Focus Legacy" and the
+  answer carries the visible `rewritten_question`. Focus Plus needs "Focus Plus" / "Focus+".
+- **Supersedes:** CLAUDE.md §4 "a bare Focus must never be guessed — ask which Focus" and the which-Focus pause
+  (`_focus_ambiguity_clarification`), which stays in the code but no longer fires for a pinned question.
+- **Untouched:** "Focus Plus" / "Focus+" / "Focus Legacy" mentions, "focus" as an English word (`_FOCUS_AS_NOUN`),
+  "Focus" inside a producer-group name (KI-157). A bare "FOCUS" beside "Focus+" in a cross-scheme question is pinned
+  too, so Focus Legacy is no longer dropped silently (KI-212).
+- **Risk accepted:** an officer who meant Focus Plus but typed only "Focus" now gets Focus Legacy figures; the
+  rewritten question shows "Focus Legacy", so the reading is visible.
+
+
+### D-034 — Cross-scheme comparisons are answered from fixed per-scheme queries
+- **Date:** 2026-10-10 (`app/pipeline.py` `_cross_scheme_compare_plan`, `_cross_scheme_compare_answer`,
+  `_cross_scheme_compare_data`; KI-213 … KI-228; report `docs/Cross_Scheme_UseCase_Retest_Report_2026-10-10.md`).
+- **Problem:** the officers' 20 cross-scheme use cases ("beneficiary count across MGNREGA, PMAY-G, Focus+
+  and FOCUS", "district-wise summary", "performance in <district>", "which scheme has the widest coverage")
+  failed 11 of 20 live on model SQL — a branch that lost its district filter, "0 crore" from scheme codes
+  the money view does not hold, a total added across lakh-, rupee- and DBT-money, Focus Legacy
+  "beneficiaries" reading 102,021 or 11,906 by wording, 8,627 blank rows, a "highest" that was not, and
+  verifier rejections of the prescribed shape. Prose rules for all of these were already in
+  `schema_context.py` `_CROSS_SCHEME`; sampling skipped them.
+- **Decision:** the same pattern as `_cross_scheme_money_answer` and the PMAY-G facts path. A comparison
+  across schemes is answered from one parameter-bound query per scheme and measure — each the figure that
+  scheme's own question returns — shown side by side with each unit named and never added together. With
+  no year, each scheme's whole data window is used and stated (MGNREGA households: the latest year only).
+  It runs in `_answer_data` before the which-scheme / scope / year pauses, and `classify_intent` keeps it
+  on DATA.
+- **Measures:** MGNREGA households employed (latest FY) / total_exp ÷ 100 (lakh → crore); PMAY-G houses and
+  amount_released, `NOT is_placeholder`; Focus Plus `COUNT(DISTINCT beneficiary_key)` / amount_disbursed;
+  CM Elevate `COUNT(DISTINCT request_id)`, **no money** ("no money recorded"); Focus Legacy memberships
+  (`SUM(no_of_pg_members)`) in producer groups (`COUNT(DISTINCT pg_id)`) — never "people"; CM Elevate
+  Legacy records / total_disbursement; NRLM members in SHGs / RF + CIF (cumulative). Coverage = villages
+  (Unresolved placeholder off village counts only) and districts.
+- **Scope, deliberately narrow:** two or more schemes named and not only MGNREGA + PMAY-G (those keep the
+  sanctioned cross-scheme views and their model path), or none named with "across the schemes" / "each
+  scheme" / "which scheme"; a beneficiary / money / coverage / performance / summary ask; no specific year;
+  no single-scheme measure (person-days, tranche, status, gender, sub-scheme, …); after resolution at most a
+  district, a district list or one block. Anything else returns None and runs the normal path unchanged.
+  An unnamed statewide money ranking still uses `_cross_scheme_money_answer`.
+- **Also:** the model path keeps working for every other wording, now with deterministic guards
+  (`_cross_scheme_sql_issue`, `_verifier_join_complaint_on_aggregates`, `_range_claim_misstated`,
+  `_cross_unit_total_stated`).
