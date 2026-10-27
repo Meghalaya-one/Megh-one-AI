@@ -1,6 +1,13 @@
 # Current State
 
-## Latest: Cross UAT fixes (2026-10-16, D-036, KI-233..242). Code changed, uncommitted. LIVE-VERIFIED.
+## Latest: PMAY-G "households" = every record, like "beneficiaries" (2026-10-27, KI-127 extended). Code changed, uncommitted. LIVE-VERIFIED.
+- User 2026-10-27: "how many households" answered 170,981 (houses with a non-zero sanction); households must include the zero-sanction records too. Change nothing else.
+- `app/pipeline.py` `_pmay_facts_query`: `_all_benef` now matches `beneficiar|household`; spec `word` = "households" for a household question (answer label and comparison label follow it). Houses sanctioned, money, stages and release counts are unchanged (still exclude zero-sanction records).
+- Test: `test_households_count_every_record_like_beneficiaries` in `tests/test_pmay_usecase_fixes.py` (real `_pmay_facts_query` / `_pmay_facts_answer`). pytest **1,935 passed, 2 skipped**; plain scripts **14/14**. Live (in-process, VPN up): households 171,107, beneficiaries 171,107, completed 129,941. Live context suite NOT re-run (no routing / rewrite / state change).
+- Resolves the "1,71,107 vs 1,70,981" conflict below: both words now give 171,107, matching the PMAY-G card.
+- Same day, UI only: CM Elevate home card "Valid applications 7,149" -> "Beneficiaries 7,128" (see the CM Elevate KPI card entry below); Focus Legacy home card Producer Groups 11,904 -> **11,906** (`COUNT(DISTINCT pg_id)` on `v_focus_legacy`, live DB 2026-10-27, = the bot's answer).
+
+## Cross UAT fixes (2026-10-16, D-036, KI-233..242). Code changed, uncommitted. LIVE-VERIFIED.
 - **User instructions:**
   - fix everything except Focus+;
   - PMAY-G = all 1,71,107 houses;
@@ -42,7 +49,7 @@
   - KI-235: "the FOCUS scheme" / "FOCUS on" (2);
   - KI-239: rounded money view (1).
 - Decisions needed:
-  - PMAY-G beneficiaries: 1,71,107 (KI-127) or 1,70,981 (the 2026-10-15 card)? DOCUMENTATION CONFLICT — NEEDS VERIFICATION.
+  - PMAY-G beneficiaries: 1,71,107 (KI-127) or 1,70,981 (the 2026-10-15 card)? **Resolved 2026-10-27: 1,71,107** — beneficiaries and households both count every record.
   - May the bot add schemes together?
 - Report: `docs/Cross_UAT_Failure_Analysis_2026-10-16.md`; per-case sheet: `docs/Cross_UAT_Retest_2026-10-16.xlsx`.
 
@@ -55,7 +62,10 @@
 - `web/ai_query.html`: Focus Legacy (was MGNREGA's purple) is now olive green `#4D7C0F` (`legacy-card`), CM Elevate Legacy (was CM Elevate's blue) is orange `#C2410C` (`cmlegacy-card`); NRLM's figures now use its rose `#BE123C`. MGNREGA purple, PMAY-G teal, Focus+ amber and CM Elevate blue are unchanged.
 - Answer charts (bar, line, donut, grouped, stacked, KPI summary) take the colour of the scheme the SQL read (`SCHEME_COLORS`, `chartTheme`, `answerScheme`; shades of that colour for multi-series). Cross-scheme charts whose every label (or series) is a scheme name colour each bar/slice/series by its own scheme (`schemeColorOf` / `schemeLabelColors`, user screenshot 2026-10-15: MGNREGA vs Focus Plus donut was all purple); otherwise the old purple palette. Keep `SCHEME_COLORS` in step with the card CSS. Not yet deployed to the VM. No pipeline or test changes.
 
-## Latest: Home-page KPI cards — Beneficiaries for PMAY-G and CM Elevate (2026-10-15). UI only, uncommitted.
+## Latest: CM Elevate KPI card "Valid applications 7,149" -> "Beneficiaries 7,128" (2026-10-27). UI only, uncommitted.
+- `web/ai_query.html`: CM Elevate first stat now reads **Beneficiaries 7,128** = `COUNT(DISTINCT request_id)` over `data_verified = 'Valid'`, matching the bot's live answer to "how many cm elevate beneficiaries for all of Meghalaya" (per the user, screenshot 2026-10-27). VERIFIED against the live DB 2026-10-27: Valid 7,149 rows / 7,128 distinct request_id of 8,867 rows; PMAY-G card stats also match (171,107 / 129,941 / ₹2,185.26 Cr). Note: no CM Elevate application is approved yet (Valid file_status: 7,039 Pending, 57 Send Back, 53 Rejected), so "beneficiaries" = valid applicants, not funded ones. Not yet on the deployed VM.
+
+## Home-page KPI cards — Beneficiaries for PMAY-G and CM Elevate (2026-10-15).
 - `web/ai_query.html` scheme cards: PMAY-G first stat relabelled "Houses sanctioned" -> **Beneficiaries 1,70,981** (households = houses with a non-zero sanction, matching the bot's "how many households" answer, per the user 2026-10-15; the every-record count is 1,71,107, KI-127); CM Elevate first stat "Applications 8,543" -> **Valid applications 7,149** (D-035; live DB 2026-10-14, SCHEMES.md). Other stats and cards unchanged.
 - Figures taken from the docs: the DB was unreachable this session (VPN). UNKNOWN — NEEDS VERIFICATION against the live DB if it has been reloaded since 2026-10-14. Not yet on the deployed VM (115.124.102.167): needs a redeploy of `web/ai_query.html`.
 

@@ -3,6 +3,13 @@
 *For the next Claude session or account. Keep this short and overwrite it at the end of every
 significant session.*
 
+**2026-10-27 (uncommitted; `ce670e7` = the 10-16 cross UAT work, pushed):**
+- PMAY-G "how many households" now counts every record incl. zero-sanction (171,107), like "beneficiaries" (KI-127 extended). `_pmay_facts_query` in `app/pipeline.py`; test in `tests/test_pmay_usecase_fixes.py`. pytest 1,935 / 2 skipped, scripts 14/14, live checked.
+- CM Elevate home card: "Valid applications 7,149" -> "Beneficiaries 7,128" (distinct request_id among Valid, = the bot's answer). `web/ai_query.html` only.
+- Focus Legacy home card: Producer Groups 11,904 -> 11,906 (COUNT(DISTINCT pg_id), live DB = the bot's answer). `web/ai_query.html` only.
+- Still pending a user decision: the 775 deleted evidence/report files in the working tree (not committed).
+- Next: commit + push when the user asks; redeploy `web/ai_query.html` and `app/pipeline.py` to the VM.
+
 **Commit note (2026-10-10): everything below through the KI-231 entry is now COMMITTED and pushed.**
 - The 2026-10-07 work went out as `36b7427`; the 2026-10-10 work (D-033, D-034, KI-212..231, the new runbook,
   the cross-scheme reports and the 7 new test files) was committed on top and pushed to `origin/main`.

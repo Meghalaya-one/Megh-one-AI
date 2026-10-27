@@ -523,3 +523,14 @@ def test_other_figures_keep_excluding_zero_sanction_records():
     spec = p._pmay_facts_query("How many PMAY beneficiaries are there in Laskein block?", PM, {"block": "LASKEIN"})
     assert "COUNT(*) FILTER (WHERE NOT is_placeholder AND " in spec["sql"]       # e.g. full_release, stages
 
+
+
+def test_households_count_every_record_like_beneficiaries():
+    # user 2026-10-27: "how many households" answered 170,981 (houses with a sanction);
+    # households must include the zero-sanction records too — 171,107 statewide.
+    spec = p._pmay_facts_query("how many households in pmay for all of Meghalaya" + ALL, PM, {})
+    assert spec["all_beneficiaries"] and spec["word"] == "households"
+    assert "NOT is_placeholder" not in spec["sql"].split("FROM curated.v_pmay")[-1]
+    r = row("MEGHALAYA", "Meghalaya", 170981, 1, 1, beneficiaries=171107)
+    ans = p._pmay_facts_answer(spec, [r])
+    assert ans.startswith("PMAY-G households in Meghalaya (statewide)") and ans.endswith(": 171,107.")

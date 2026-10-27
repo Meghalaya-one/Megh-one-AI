@@ -10494,8 +10494,9 @@ def _pmay_facts_query(question: str, schemes: list[str], resolved: dict,
     # count changes: for a beneficiary question the placeholder exclusion moves from WHERE
     # into every OTHER column, so houses, money, stages and release counts are unchanged
     # (a ₹0 / ₹0 record would otherwise count as "fully paid"). Other questions keep the
-    # exact same SQL.
-    _all_benef = bool(re.search(r"beneficiar", question or "", re.I)) and "houses" in metrics
+    # exact same SQL. "Households" counts the same way (user 2026-10-27: "how many
+    # households" answered 170,981, not every record's 171,107).
+    _all_benef = bool(re.search(r"beneficiar|household", question or "", re.I)) and "houses" in metrics
     _P = "NOT is_placeholder AND " if _all_benef else ""
     _PF = " FILTER (WHERE NOT is_placeholder)" if _all_benef else ""
     where = [] if _all_benef else ["NOT is_placeholder"]
@@ -10553,7 +10554,8 @@ def _pmay_facts_query(question: str, schemes: list[str], resolved: dict,
     return {"sql": sql, "params": params, "shown": shown, "metrics": metrics, "dim": dim,
             "entities": ents, "year_key": None if calendar_year is not None else yk, "date": day, "stages": stages,
             "calendar_year": calendar_year, "bare_year": bare_year, "all_beneficiaries": _all_benef,
-            "word": "beneficiaries" if re.search(r"beneficiar", question or "", re.I) else "houses",
+            "word": ("beneficiaries" if re.search(r"beneficiar", question or "", re.I)
+                     else "households" if re.search(r"household", question or "", re.I) else "houses"),
             "question": question}
 
 
@@ -10648,7 +10650,7 @@ def _pmay_lines(spec: dict, row: dict) -> list[str]:
     for m in spec["metrics"]:
         if m == "houses":
             L.append(f"PMAY-G {word}: {h:,}"
-                     if word == "beneficiaries" or (spec.get("date") is None and spec.get("year_key") is None
+                     if word in ("beneficiaries", "households") or (spec.get("date") is None and spec.get("year_key") is None
                                                     and spec.get("calendar_year") is None)
                      else f"PMAY-G houses sanctioned: {h:,}")
         elif m == "sanctioned":
@@ -10793,7 +10795,7 @@ def _pmay_facts_answer(spec: dict, rows: list[dict]) -> "str | None":
         fn, label, money = _PMAY_CMP[m]
         vals = [(_pmay_head(spec, r) if m == "houses" else fn(r)) for r in ordered]
         if m == "houses" and spec.get("all_beneficiaries"):
-            label = "beneficiaries"
+            label = "households" if spec.get("word") == "households" else "beneficiaries"
         if any(v is None for v in vals):
             continue
         if len(ordered) == 2:
