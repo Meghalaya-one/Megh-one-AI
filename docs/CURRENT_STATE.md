@@ -1,6 +1,6 @@
 # Current State
 
-## Latest: PMAY-G "households" = every record, like "beneficiaries" (2026-10-27, KI-127 extended). Code changed, uncommitted. LIVE-VERIFIED.
+## Latest: PMAY-G "households" = every record, like "beneficiaries" (2026-10-27, KI-127 extended). Committed `3292f94`, pushed. LIVE-VERIFIED.
 - User 2026-10-27: "how many households" answered 170,981 (houses with a non-zero sanction); households must include the zero-sanction records too. Change nothing else.
 - `app/pipeline.py` `_pmay_facts_query`: `_all_benef` now matches `beneficiar|household`; spec `word` = "households" for a household question (answer label and comparison label follow it). Houses sanctioned, money, stages and release counts are unchanged (still exclude zero-sanction records).
 - Test: `test_households_count_every_record_like_beneficiaries` in `tests/test_pmay_usecase_fixes.py` (real `_pmay_facts_query` / `_pmay_facts_answer`). pytest **1,935 passed, 2 skipped**; plain scripts **14/14**. Live (in-process, VPN up): households 171,107, beneficiaries 171,107, completed 129,941. Live context suite NOT re-run (no routing / rewrite / state change).
