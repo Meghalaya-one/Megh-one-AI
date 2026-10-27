@@ -132,10 +132,10 @@ whose line numbers are stale), `docs/*_DB_Issues.md`, `docs/*Fix_Verification*.m
 
 - Use the repo venv: `.venv/Scripts/python.exe` (Windows). System Python lacks `fastembed`, and
   RAG answers silently degrade under it.
-- Run pytest on the **pytest-style files only** (35 as of 2026-10-10; the glob in TESTING.md finds them), then the **14 plain-script suites**
+- Run pytest on the **pytest-style files only** (36 as of 2026-10-16; the glob in TESTING.md finds them), then the **14 plain-script suites**
   (`python tests/test_X.py`). The exact commands are in [docs/TESTING.md](docs/TESTING.md).
   Do **not** run bare `pytest tests`: it crashes with INTERNALERROR (KNOWN_ISSUES KI-018).
-- Baseline (2026-10-10 night, after KI-231 (measure-gap explanation) on top of D-034 (deterministic cross-scheme comparison, officer cross-scheme cases 20/20 live), D-033 and the earlier work): 1,879 pytest passed, 2 skipped (35 files), 14/14 scripts passed (2026-10-10 evening run), and the live context suite 43/43 on the D-034 code.
+- Baseline (2026-10-16, after D-036 / KI-233..242, the cross UAT fixes; live UAT 59/60, 1 Focus+-only case left as is): 1,934 pytest passed, 2 skipped (36 files), 14/14 scripts, live context suite 43/43. Previous: 2026-10-14, after KI-232 / D-035 (CM Elevate Valid-only counts, pending = Pending + Send Back; live 204/204): 1,900 pytest passed, 2 skipped, 14/14 scripts. Previous: 2026-10-10 night, after KI-231 (measure-gap explanation) on top of D-034 (deterministic cross-scheme comparison, officer cross-scheme cases 20/20 live), D-033 and the earlier work): 1,879 pytest passed, 2 skipped (35 files), 14/14 scripts passed (2026-10-10 evening run), and the live context suite 43/43 on the D-034 code.
   The live multi-turn suite `tests/live_context_validation.py` (needs the VPN) passed 43/43 on
   2026-09-26 and again on 2026-09-27 after the Focus Plus and the CM Elevate fixes. Re-run it after any routing, rewrite or state change.
 - Every bug fix gets a regression test that calls the **real function**, never a

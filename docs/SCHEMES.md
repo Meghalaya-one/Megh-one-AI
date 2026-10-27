@@ -194,7 +194,12 @@ Notes on the table:
 - **OFF-009 all ordered programme pairs (2026-10-05):** 2,520 questions (12 districts x 15P2). Before the KI-182 fix
   1,131 FAIL; after it and the empty-result zero answer, 2,520 / 2,520 PASS. Raw = DB and the SQL figures
   were correct in 2,520/2,520 both times.
-- **Pending AT a level (KI-186, decided 2026-10-05):** `current_level = 'levelN'` AND `file_status = 'Pending'` — level 1 = 8,307,
+- **Counting rules (KI-232, D-035, decided 2026-10-14) — these supersede the two bullets below:** every count
+  is of Valid applications (`data_verified = 'Valid'`) unless the question names a verification state or asks
+  for all applications (then total + verification split). "Pending" = `file_status` Pending or Send Back;
+  "pending at level N" adds `current_level`. Live DB 2026-10-14 (8,867 rows): Valid 7,149 applications /
+  7,128 applicants; pending 7,096; level 0 / 1 / 2 pending = 1 / 6,797 / 298; On Hold 908.
+- **Pending AT a level (KI-186, decided 2026-10-05; superseded by KI-232):** `current_level = 'levelN'` AND `file_status = 'Pending'` — level 1 = 8,307,
   level 2 = 165, level 0 = 0 (all 90 level-0 files are Send Back). Plain "pending" stays On Hold. "Unique applications" =
   COUNT(DISTINCT request_id).
 - **Status = `current_file_status`** (Forward / Sent back / Resubmit; decided 2026-09-28, KI-123). Pending stays `data_verified = 'On Hold'`; verified = 'Valid'.
@@ -310,7 +315,7 @@ Notes on the table:
   "across the schemes" / "which scheme") about beneficiaries, money, coverage, performance or a
   summary → `_cross_scheme_compare_answer` (D-034, 2026-10-10): fixed per-scheme queries, each
   scheme's own measure and unit, never a combined total. What each scheme's "beneficiaries" are in
-  such an answer: MGNREGA households given work (latest FY only), PMAY-G houses, Focus Plus
+  such an answer: MGNREGA households given work (all FYs summed since 2026-10-15; a household is counted once per year it worked), PMAY-G houses, Focus Plus
   beneficiaries (`COUNT(DISTINCT beneficiary_key)` = 105,813 — not COUNT(*) = 385,671 payments, not
   `member_id` = the 12.5K cohort only), CM Elevate applicants (requests, not awards), Focus Legacy
   memberships in producer groups (no person record exists), CM Elevate Legacy applicant records,

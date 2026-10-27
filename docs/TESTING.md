@@ -23,6 +23,12 @@
     `tests/test_cross_scheme_compare.py` (64). **Harness rule:** a clarification reply must be the
     chip's `question` (what web/ai_query.html sends), never its label — sending labels produced
     false failures in that retest.
+  - Cross-scheme UAT (testers' `Megh_One_AI_Cross_UAT_Test_Report.xlsx`, 60 cases, 2026-10-15: 21/60 on the
+    deployed build). After the D-036 fixes, all 60 live on 2026-10-16: **59/60 pass**, 1 Focus+-only case left as
+    is; 24 of the 59 still differ from the source file only through data (KI-065 / KI-084 / KI-240).
+    Sheet "After fixes (60)" in `docs/Cross_UAT_Retest_2026-10-16.xlsx`. Regression lock:
+    `tests/test_cross_uat_fixes.py`. **Harness rule:** cap the pool (`DB_POOL_MIN_SIZE=1 DB_POOL_MAX_SIZE=4`).
+    The shared megh_db refused a default-pool run with "too many clients".
   - CM Elevate Legacy: 36/36 on 2026-09-25; re-tested 2026-09-29: **33/36** vs DB and raw (2 full runs + 3 repeats of the failures;
     `docs/CM_Elevate_Legacy_UseCase_Test_Report_2026-09-29.xlsx` + `_Evidence_2026-09-29/`). TC-13/14/34 failed in the AI layer (KI-166..168);
     **after fixes 36/36** on 2 of 2 fresh runs (`…_2026-09-29_v2_after_fixes.xlsx` + `_Evidence_2026-09-29_after_fixes/`);
@@ -35,7 +41,7 @@ Always use the repo venv, and run from the repo root (`.env` is read relative to
 directory):
 
 ```bash
-# 1) pytest-style suites (35 files as of 2026-10-10 (night); the glob picks up new ones). Do NOT run `pytest tests` — see KI-018.
+# 1) pytest-style suites (36 files as of 2026-10-16; the glob picks up new ones). Do NOT run `pytest tests` — see KI-018.
 .venv/Scripts/python.exe -m pytest -q $(grep -lE "^\s*(async )?def test_" tests/test_*.py)
 
 # 2) plain-script suites (14 files) — each prints "ALL … PASSED" and exits 0/1
@@ -102,6 +108,7 @@ the report's Summary sheet.
 
 | Date | Suite | Result | Notes |
 |---|---|---|---|
+| 2026-10-14 (CM Elevate KI-232 / D-035: Valid-only counts, pending = Pending + Send Back) | pytest + live | pytest 1,900 passed, 2 skipped (+21 in test_cmelevate_usecase_fixes.py, now 163); scripts 14/14; live **204/204 (Valid counts 29, plain pending 28 — 28/28 again on a repeat run, level-wise 40, on hold 13, invalid 1, all-applications split 13, OFF-009 pairs 80) + 6/6 spot checks (rejected, level 2, verification breakdown, status distribution, top pending programmes, applicants by district)** (scratchpad `ki187/`: Valid counts statewide / 12 districts / 15 programmes, plain pending, pending at level 0/1/2 x statewide + districts, on hold, invalid, "all applications" with split, 80 OFF-009 pairs; expected figures from a fresh read-only DB extract, 8,867 rows) | The DB was reloaded since 2026-10-05 (8,627 -> 8,867 rows). Live context suite not re-run (no routing / rewrite / state change) |
 | 2026-10-10 (night; **KI-231, user-reported: "person days under CM Elevate" got "couldn't build a working query"**) | pytest 35 files + live | **1,879 passed, 2 skipped** (+22 in the new `tests/test_measure_gap_direct.py`, which calls the real `_measure_gap_answer`, the real `_answer_data` with only the DB-backed village masking stubbed and `resolve_entities` set to fail if reached, and the router's `remember_pause` / `_resume_option_pause`). Live, in-process with `init_pool` + `init_client`: the reported question pauses `measure-unavailable` with the MGNREGA chip first; that chip reaches the normal year pause and FY 2023-24 answers 27,264,054 person-days; the Applications chip answers 8,627; "houses completed under MGNREGA in West Garo Hills" names PMAY-G as the owner; the PMAY-G control answers 13,964 completed houses in West Garo Hills FY 2023-24. Plain scripts and the live context suite were NOT re-run (no routing, rewrite or state code changed; the new check sits inside `_answer_data`) | VPN up. In-process harness needs `await init_client()` or every DATA question ends "couldn't build a working query" |
 | 2026-10-09 (UI: KI-210 rows not clickable, KI-211 Use cases + Glossary listed only 3 of 7 schemes) | pytest 33 files + DOM | **1,777 passed, 2 skipped** (1,725 + the new `tests/test_ui_use_cases.py`, 52); plain scripts **14/14**; routing **34/34** (every use-case question through `pipeline._shortcut_scheme` lands on the scheme of its section); jsdom against the served page: Use cases 8 sections / **34/34 rows click through to `ask()` with the exact text and close the modal** / Enter works / the OLD markup parses to `onclick = "closeModal(); ask("` with no handler bound; Glossary **7 sections, 49 terms**, all escapes resolved | No Python changed, so the live context suite was NOT re-run. The new suite was proven to bite by reintroducing each defect: inline handler → 3 fail, NRLM use-case section renamed → 8 fail, a Glossary section renamed → 3 fail |
 | 2026-10-05 (CM Elevate KI-186: pending at level = file_status Pending, unique = distinct) | pytest 26 files + live | **1,433 passed** (+28 in `test_cmelevate_usecase_fixes.py`, now 142); scripts **14/14**; live pending set **871/871** (scratchpad `pend2/`: level 0/1/2 + On Hold x Meghalaya / 12 districts / 15 programmes / 180 pairs, + 39 "unique" variants), 4 hardest cases 12/12 repeats, "highest pending programmes" 6/6, OFF-009 sample 150/150, plain regression 6/6 | A/B against the previous prompt found and fixed a wording regression (plain "pending" -> current_file_status 4/6). Live context suite not re-run (no routing / rewrite / state change) |

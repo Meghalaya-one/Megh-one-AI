@@ -33,6 +33,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from app import pipeline as p  # noqa: E402
 
 ALL7 = ["MGNREGA", "PMAY-G", "Focus Plus", "CM Elevate", "Focus Legacy", "CM Elevate Legacy", "NRLM"]
+# A question that names no scheme compares these four (user decision 2026-10-16, cross UAT).
+DEFAULT4 = ["MGNREGA", "PMAY-G", "Focus Plus", "Focus Legacy"]
 
 
 def pinned(q: str) -> str:
@@ -53,16 +55,16 @@ OFFICER_CASES = {
     "CROSS-9": ("Compare the coverage of MGNREGA, PMAY-G, and CM-ELEVATE in Mawphlang.",
                 ["MGNREGA", "PMAY-G", "CM Elevate"], ["coverage"]),
     "CROSS-11": ("How much financial assistance or expenditure was recorded under each scheme in "
-                 "East Khasi Hills?", ALL7, ["money"]),
-    "CROSS-13": ("Which scheme has the widest coverage across districts of Meghalaya?", ALL7, ["coverage"]),
+                 "East Khasi Hills?", DEFAULT4, ["money"]),
+    "CROSS-13": ("Which scheme has the widest coverage across districts of Meghalaya?", DEFAULT4, ["coverage"]),
     "CROSS-14": ("What is the performance of MGNREGA, PMAY-G, Focus+, and CM-ELEVATE in East Khasi Hills?",
                  ["MGNREGA", "PMAY-G", "Focus Plus", "CM Elevate"], ["count", "money"]),
     "CROSS-15": ("Which districts have the highest concentration of beneficiaries or applications across "
-                 "the schemes?", ALL7, ["count"]),
+                 "the schemes?", DEFAULT4, ["count"]),
     "CROSS-17": ("Give me a district-wise summary comparing MGNREGA, PMAY-G, Focus+, FOCUS, and CM-ELEVATE.",
                  ["MGNREGA", "PMAY-G", "Focus Plus", "CM Elevate", "Focus Legacy"], ["count", "money"]),
     "CROSS-18": ("For each district, identify which scheme has the highest beneficiary/application count.",
-                 ALL7, ["count"]),
+                 DEFAULT4, ["count"]),
     "CROSS-20": ("Give me an overall performance comparison of MGNREGA, PMAY-G, Focus+, FOCUS, and "
                  "CM-ELEVATE based on coverage and financial performance.",
                  ["MGNREGA", "PMAY-G", "Focus Plus", "CM Elevate", "Focus Legacy"], ["money", "coverage"]),
@@ -95,7 +97,8 @@ def test_district_level_flags():
 @pytest.mark.parametrize("q", [
     "Compare MGNREGA and PMAY-G spending in Meghalaya",               # the two-view schemes: own path
     "How many MGNREGA person-days and PMAY-G houses in 2023-24?",
-    "Compare Focus Plus and Focus Legacy beneficiaries in FY 2022-23",  # a specific year
+    "Compare Focus Plus and Focus Legacy coverage in FY 2022-23",       # a specific year, coverage
+    "Compare Focus Plus and Focus Legacy beneficiaries this year",      # a relative year
     "Compare Focus Plus and CM Elevate eligibility criteria",           # KNOWLEDGE
     "Which villages have both MGNREGA and PMAY-G activity?",            # set question
     "How many common districts in both schemes?",
@@ -144,16 +147,21 @@ def test_financial_assistance_and_higher_a_or_b_are_money_rankings():
         assert not p._wants_cross_scheme_money_ranking(q), q
 
 
-def test_unnamed_money_ranking_still_uses_the_existing_answer(monkeypatch):
-    called = {}
-
+def test_unnamed_money_ranking_is_the_comparison_over_the_default_schemes(monkeypatch):
+    """User decision 2026-10-16: an unnamed ranking compares MGNREGA, PMAY-G, Focus+ and
+    FOCUS from the base views (cross UAT T12.2), not the older all-scheme ranking."""
     async def fake_rank(question):
-        called["q"] = question
-        return {"route": "data", "answer": "ranked"}
+        raise AssertionError("the older money ranking must not run")
+
+    async def fake_resolve(question, schemes, prior_resolved=None, village_hint=None):
+        return {"resolved": {}, "display": {}, "notes": []}
     monkeypatch.setattr(p, "_cross_scheme_money_answer", fake_rank)
+    monkeypatch.setattr(p, "resolve_entities", fake_resolve)
+    monkeypatch.setattr(p, "fetch_rows", _Recorder())
     out = asyncio.run(p._answer_data(
         "Which scheme provided the highest total financial assistance across Meghalaya?"))
-    assert out["answer"] == "ranked" and called
+    assert out["schemes"] == DEFAULT4
+    assert "Highest amount: **MGNREGA**, ₹3,628.67 crore." in out["answer"]
 
 
 # ── 4. KI-219: the multi-scheme year pause states each scheme's own years ────
@@ -245,8 +253,12 @@ def _answer(q, monkeypatch, resolved=None, display=None):
 def test_beneficiary_count_states_each_schemes_own_measure_and_no_total(monkeypatch):
     out, calls = _answer(OFFICER_CASES["CROSS-1"][0], monkeypatch)
     a = out["answer"]
-    assert "365,556 households given work in FY 2025-26" in a
-    assert "170,981 houses sanctioned" in a
+    # every MGNREGA year, not the latest only (user 2026-10-15), and says a household
+    # given work in several years is counted once per year
+    assert "365,556 households given work, FY 2022-23 to FY 2025-26 combined" in a
+    assert "counted once for each year" in a
+    assert "cannot be added across years" not in a
+    assert "170,981 houses (beneficiaries — every house record)" in a
     assert "105,813 beneficiaries" in a
     # KI-228: Focus Legacy names its unit — memberships in producer groups, no people
     assert "102,021 memberships paid for, in 11,906 producer groups" in a
@@ -254,7 +266,9 @@ def test_beneficiary_count_states_each_schemes_own_measure_and_no_total(monkeypa
     assert "never added together" in a
     sqls = " ".join(s for s, _ in calls)
     assert "COUNT(DISTINCT beneficiary_key)" in sqls                    # KI-213
-    assert re.search(r"FROM curated\.v_pmay\s+WHERE NOT is_placeholder", sqls)
+    assert "MAX(year_key)" not in sqls                                  # all MGNREGA years
+    # KI-233: every PMAY-G house record is a beneficiary (171,107, KI-127)
+    assert "FROM curated.v_pmay" in sqls and "is_placeholder" not in sqls
     assert "Unresolved" not in sqls                                     # totals keep the placeholder rows
     assert out["rows"] and {r["Scheme"] for r in out["rows"]} == set(OFFICER_CASES["CROSS-1"][1])
 
@@ -300,7 +314,8 @@ def test_out_of_scope_resolution_falls_back(monkeypatch):
 
 
 def test_each_district_leader_is_stated(monkeypatch):
-    out, _ = _answer(OFFICER_CASES["CROSS-18"][0], monkeypatch)
+    out, _ = _answer("For each district, identify which of MGNREGA, PMAY-G, Focus+, FOCUS and NRLM "
+                     "has the highest beneficiary count.", monkeypatch)
     a = out["answer"]
     assert "Largest figure by district:" in a
     assert re.search(r"\*\*MGNREGA\*\* — 2 districts \(East Khasi Hills, West Garo Hills\)", a)

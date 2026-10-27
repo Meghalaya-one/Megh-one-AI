@@ -1,3 +1,5 @@
+> **Counting rules changed 2026-10-14 (D-035, KI-232):** counts are of Valid applications (`data_verified = 'Valid'`) unless a verification state is named or all applications are asked for; "pending" = `file_status` Pending or Send Back (NOT On Hold — "on hold" stays `data_verified = 'On Hold'`). The `pending_term` default in `cmelevate_default_rules.yaml` and the On Hold aliases below are historical; the app does not load those YAMLs (see `app/annotations.py`).
+
 # CM Elevate Annotation Layer — How the YAMLs Are Built
 
 **Status: COMPLETE.** All seven YAMLs are written. This file records what was

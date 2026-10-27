@@ -114,6 +114,30 @@ In order:
    recorded", the leader when asked, each scheme's data years. **Returns**, before the scheme / scope / year
    pauses — or None (a village, constituency, year, tranche or sub-scheme resolved) and the path continues
    unchanged. `classify_intent` returns DATA for the same questions (KI-222).
+   **2026-10-16 (D-036, cross UAT, KI-233..242):**
+   - PMAY-G count and coverage read every house record (171,107 / 5,121), with no placeholder filter.
+   - Unnamed or exclusion-only questions compare `_XS_DEFAULT_SCHEMES`: MGNREGA, PMAY-G, Focus Plus and
+     Focus Legacy, minus any scheme in an "excluding / leaving out / except" clause (`_excluded_schemes`,
+     applied inside `_named_schemes`).
+   - More plan cues: "doing", "bigger", "which of / which reaches", "rank", "top N districts".
+   - New plan fields, each with its own answer shape:
+     - `pair`: "districts where A has more than B";
+     - `place` / `after`: "second after X" per district;
+     - `top_n`: districts ranked by the schemes' combined figure;
+     - `combined`: a labelled "Combined" line.
+   - An "Order by …" line for every measure when 3 or more schemes are ranked.
+   - One explicit FY for a count or money comparison (`year_key`, bound per scheme; a scheme without that
+     year reads "none"); coverage + a year, relative years and two years keep the old path.
+   - "How do/does … compare" is not a KNOWLEDGE cue there (T02.2); "reaches the most villages" is a
+     coverage ask (T13.2).
+   - Verifier: `_verifier_join_complaint_is_false` also discards a "prohibited join" complaint on a
+     JOIN-free query (a UNION of single-view selects) that reads no fact or bridge table and is accused of
+     joining a table it never reads (T19.2).
+   - The unnamed money ranking (`_cross_scheme_money_answer`) runs only when no plan applies. It now reads
+     `v_expenditure` / `v_pmay`, not the per-district-year-rounded money view (KI-239), and keeps the
+     named / default schemes.
+   - Model path: `_cross_scheme_sql_issue` rejects Focus Legacy `COUNT(...)` counted as beneficiaries;
+     `_pin_bare_focus` pins a FOCUS listed after another scheme, or followed by "scheme" (KI-235).
 3. `_is_ambiguous_focus` → the "which Focus?" two-way ask. Since 2026-10-10 (D-033) a bare "Focus" is
    rewritten to "Focus Legacy" by `_pin_bare_focus` at the top of `_run_pipeline` (and after a typed
    chip resume or a follow-up rewrite), so this ask no longer fires for it.
@@ -503,6 +527,28 @@ steps in order.
 
     Live, the first caused 3 "couldn't build a working query" answers (the verifier rejected
     every attempt), and the second caused a false 0 against 1,624.
+  - **KI-232 / D-035 (2026-10-14): Valid-only counts; pending = Pending + Send Back.**
+    - `_cm_elevate_valid_default`: any CM Elevate COUNT with no data_verified test of its own gets
+      `data_verified = 'Valid'` — in the query's own WHERE (a top-level OR is parenthesised first), or, for
+      a CTE / join / subquery, by reading the view through a Valid-only subquery. Skipped when the question
+      names a verification state (on hold, invalid, wrong, verified, verification …) or asks for all
+      applications; lists (no COUNT) are left alone.
+    - `_cm_elevate_all_applications`: "all applications" / "including invalid / on hold" / "irrespective
+      of verification" drops a Valid test and splits a single-figure count by
+      `COALESCE(data_verified, '(not recorded)') AS verification_state`; `_cme_all_applications_answer`
+      writes the total and the split (Valid, On Hold, Invalid, Wrong, not recorded).
+    - `_cm_elevate_plain_pending`: plain "pending" (no on hold / verification / file status word) turns
+      `data_verified = 'On Hold'` and a bare `file_status = 'Pending'` into
+      `scheme_specific ->> 'file_status' IN ('Pending', 'Send Back')`, in the WHERE or a COUNT FILTER.
+      `_cm_elevate_level_pending`, `_cm_elevate_pending_without_level` and
+      `_cm_elevate_plain_pending_file_status` now emit the same test (they emitted On Hold / Pending before).
+    - Composer: `_cme_valid_scope_note` adds "These figures count valid applications only" when a
+      default-scope answer does not say "valid"; the KI-182 breakdown and zero answers read "valid …
+      pending".
+    - Verifier: `_verifier_scheme_specific_complaint_is_false` also discards "->> on a column that is not
+      JSON / scheme_specific is a boolean / file_status is a string column" when every scheme_specific key
+      is a live key (`_VERIFIER_JSON_MISREAD`).
+    - Cross-scheme comparison: `_XS_MEASURES[("CM Elevate", "count")]` carries the Valid filter.
   - Verifier false positive (KI-186). With the new `file_status` test beside
     `LOWER(current_level)`, the 4B verifier claimed on every attempt that the SQL "uses
     LOWER(lgd_district)", although it held `lgd_district = 'NORTH GARO HILLS'` verbatim.

@@ -18,6 +18,29 @@ significant session.*
   `name_on_the_account`) remains tracked on `origin/main` from `7064ab6`. `.gitignore` now blocks *new* root-level
   `*.csv` / `*.xlsx`, but ignoring a tracked file does not untrack it.
 
+**Latest (2026-10-16, later): Cross UAT fixes made — D-036, code changed, uncommitted, live-verified.**
+- **Results:** live UAT 59/60 (T13.3 is Focus+-only and was left as is). pytest 1,934 passed, 2 skipped; 14/14 scripts; live context suite 43/43.
+- **Next:**
+  - commit;
+  - deploy to the VM (the testers' build is older than the 2026-10-15 MGNREGA change too);
+  - send KI-065 / KI-084 / KI-240 to megh-ingestion.
+- **Possible follow-up (not touched, already UAT passes via a clarification):** after the chip, the model-path answers to T05.3 (MGNREGA + PMAY-G, still the rounded money view), T08.3, T12.3 and T20.3 (1,70,981 / raw rupees).
+- **Harness:** run with `DB_POOL_MIN_SIZE=1 DB_POOL_MAX_SIZE=4`. The shared DB said "too many clients" otherwise.
+
+**Earlier (2026-10-16): Cross UAT failure analysis — no code changed.** The testers' `Megh_One_AI_Cross_UAT_Test_Report.xlsx` (39 of 60 failed, run on the deployed build) was re-run live on the current tree: 3 pass now, 36 fail. Opened KI-233..KI-242; see `docs/Cross_UAT_Failure_Analysis_2026-10-16.md` §4 for the ordered fix list (deploy first, then the PMAY-G rule once decided, exclusions, the FOCUS pin, cues and shapes, the Focus Legacy measure guard). Two decisions are pending with the user: the PMAY-G beneficiary rule, and combined totals. Harness: the session scratchpad `uat_run.py` (a fresh session per question, chip auto-click; must `init_pool` / `init_client` / `refresh_scheme_years`).
+
+**Latest (2026-10-15, evening): cross-scheme MGNREGA households = all years summed — code changed, uncommitted, live-verified.** `_XS_MEASURES` MGNREGA count drops the MAX(year_key) filter; answer text says households are counted once per year worked. Live 1,494,437 (was 365,556 FY 2025-26). pytest 1,900 passed, 2 skipped. Open question: the LLM prompt's FAMILY C rule (`schema_context.py`) still pins the latest year — left unchanged.
+
+**Latest (2026-10-15, later): distinct KPI-card colours + scheme-coloured charts — UI only, uncommitted.** `web/ai_query.html`: Focus Legacy card olive green, CM Elevate Legacy card orange (each card now unique); charts of a one-scheme answer are drawn in that scheme's card colour (`SCHEME_COLORS` / `chartTheme` / `answerScheme`), cross-scheme charts colour each scheme-named bar/slice/series by its own scheme (`schemeColorOf`); other multi-scheme charts keep purple. JS syntax-checked and the theme helpers exercised in node; not yet eyeballed in a browser or deployed.
+
+**Latest (2026-10-15): home-page KPI cards — UI only, uncommitted.** `web/ai_query.html`: PMAY-G card first stat = Beneficiaries 1,70,981 (households, user 2026-10-15; was "Houses sanctioned 1,71,107"); CM Elevate card first stat = Valid applications 7,149 (was "Applications 8,543"). Values from SCHEMES.md / KI-127 (DB unreachable this session); re-check live. Not yet deployed to the VM. No pipeline or test changes.
+
+**Latest (2026-10-14): KI-232 / D-035 — CM Elevate Valid-only counts; pending = Pending + Send Back. Code changed, uncommitted.**
+- User decisions (three questions asked in session): Valid only everywhere, including pending and level-wise; "all applications" -> total + verification split; questions naming a verification state answered as asked.
+- Code: `app/pipeline.py` `_cm_elevate_valid_default`, `_cm_elevate_all_applications`, `_cm_elevate_plain_pending` (+ level / plain-pending guards emit `file_status IN ('Pending', 'Send Back')`), `_cme_all_applications_answer`, `_cme_valid_scope_note`, `_VERIFIER_JSON_MISREAD`, `_XS_MEASURES` CM Elevate count. Prompt `_CMELEVATE_VOCAB`; 4 few-shots in `cmelevate_few_shot.yaml`. Tests in `tests/test_cmelevate_usecase_fixes.py`.
+- Live: 204/204 (Valid counts 29, plain pending 28 — 28/28 again on a repeat run, level-wise 40, on hold 13, invalid 1, all-applications split 13, OFF-009 pairs 80) + 6/6 spot checks (rejected, level 2, verification breakdown, status distribution, top pending programmes, applicants by district). Tests: pytest 1,900 passed, 2 skipped (+21 in test_cmelevate_usecase_fixes.py, now 163); scripts 14/14.
+- Note: KI-187 was already Focus Legacy's; this work is KI-232. The DB was reloaded (8,867 rows) — older CM Elevate reports quote the 8,627-row data.
+
 **Latest (2026-10-10, night): KI-231 — a measure another scheme owns, asked under a named scheme. Code changed, uncommitted.**
 - **User report (UI screenshot):** "So what is the total person days in Meghalaya under CM Elevate?" → "couldn't build a
   working query". Wanted: say the measure is MGNREGA's, not CM Elevate's, and offer it.

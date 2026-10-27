@@ -60,7 +60,9 @@ check("  and the ids that exist use the frozen one",
 
 # The KPI branch predates the bug and closes over its own cid — leave it be.
 check("the KPI branch still closes over its own cid",
-      "const init = () => { window._QD[cid] = { labels, values }; rQC(cid, 'bar'); };" in _ANALYTICS)
+      # 2026-10-15: the scheme-coloured charts added a `theme` field to the payload
+      bool(re.search(r"const init = \(\) => \{ window\._QD\[cid\] = \{ labels, values(?:, theme)? \}; "
+                     r"rQC\(cid, 'bar'\); \};", _ANALYTICS)))
 
 # ── 2. The html id and the init() id must be the same expression ───────────
 # This is the actual invariant: whatever names the canvas in the markup has to

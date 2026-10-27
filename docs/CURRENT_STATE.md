@@ -1,5 +1,68 @@
 # Current State
 
+## Latest: Cross UAT fixes (2026-10-16, D-036, KI-233..242). Code changed, uncommitted. LIVE-VERIFIED.
+- **User instructions:**
+  - fix everything except Focus+;
+  - PMAY-G = all 1,71,107 houses;
+  - unnamed or exclusion-only questions compare MGNREGA, PMAY-G, Focus+ and FOCUS;
+  - change nothing else.
+- **Code** (`app/pipeline.py`):
+  - PMAY-G count and coverage read every record;
+  - `_excluded_schemes` (in `_named_schemes`) and `_XS_DEFAULT_SCHEMES`;
+  - `_focus_listed_as_scheme`;
+  - new plan cues and fields (pair / place / after / top_n / combined / one FY for counts and money) with their answer shapes;
+  - money ranking from the base views;
+  - Focus Legacy guard in `_cross_scheme_sql_issue`;
+  - the verifier's false "prohibited join" on a JOIN-free UNION.
+- **Other files:**
+  - prompt FAMILY C in `app/schema_context.py`;
+  - home card 1,71,107 in `web/ai_query.html`;
+  - `tests/test_cross_uat_fixes.py` (new);
+  - 9 expectations updated in `tests/test_cross_scheme_compare.py`, 1 in `tests/test_cross_scheme_money.py`;
+  - `tests/test_history_charts.py` pinned string widened for the 2026-10-15 `theme` field (pre-existing failure).
+- **Tests:**
+  - pytest 1,934 passed, 2 skipped (36 files);
+  - scripts 14/14;
+  - live context suite 43/43;
+  - live UAT all 60: **59 pass**, 1 Focus+-only case (T13.3) left as is. 24 of the 59 still differ from the source file only through data (KI-065, KI-084, KI-240).
+- **Not deployed.** The VM still runs the pre-2026-10-15 build.
+
+## Earlier the same day: Cross UAT (15 Oct) failure analysis + live re-test (2026-10-16). No code changed.
+- Input: `Megh_One_AI_Cross_UAT_Test_Report.xlsx` (60 cases, 39 failed on the deployed app, which predates the 2026-10-15 MGNREGA change).
+- Re-test of the 39 on the current local code (in-process, live DB + gateway): **3 now pass** (T14.2, T14.3, T19.3), **36 still fail**. Of those, 18 are code-fixable if the two decisions below go the testers' way; the other 18 also carry a data-side difference.
+- Root causes:
+  - KI-233: PMAY-G `NOT is_placeholder` in the cross-scheme count and coverage (20 cases);
+  - KI-065: Focus+ WGH/SWGH data (13);
+  - KI-236: no combined totals or ranking (6);
+  - KI-237: missing answer shapes and rank cues (6);
+  - KI-084 / KI-241: Focus+ villages (5);
+  - KI-238: model-path wrong measure (4);
+  - KI-234: exclusions ignored (4);
+  - KI-240: MGNREGA WGH/SWGH data (4);
+  - KI-235: "the FOCUS scheme" / "FOCUS on" (2);
+  - KI-239: rounded money view (1).
+- Decisions needed:
+  - PMAY-G beneficiaries: 1,71,107 (KI-127) or 1,70,981 (the 2026-10-15 card)? DOCUMENTATION CONFLICT — NEEDS VERIFICATION.
+  - May the bot add schemes together?
+- Report: `docs/Cross_UAT_Failure_Analysis_2026-10-16.md`; per-case sheet: `docs/Cross_UAT_Retest_2026-10-16.xlsx`.
+
+## Latest: Cross-scheme beneficiary count — MGNREGA summed over all years (2026-10-15). Code changed, uncommitted. LIVE-VERIFIED.
+- User request: "What is the beneficiary count across MGNREGA, PMAY-G, Focus+, and FOCUS?" took MGNREGA's latest year only (365,556, FY 2025-26). `_XS_MEASURES[("MGNREGA","count")]` in `app/pipeline.py` no longer filters `year_key = MAX(year_key)`; `_xs_count_text` now says "N households given work, FY 2022-23 to FY 2025-26 combined (a household given work in more than one year is counted once for each year)" and the "(households: latest FY only…)" note is gone. Live: **1,494,437** (PMAY-G 170,981, Focus Plus 105,813, Focus Legacy 102,021 unchanged).
+- Only the D-034 deterministic comparison changed. The LLM SQL prompt (`schema_context.py` FAMILY C) still says "a single latest year_key for MGNREGA households_employed" for questions that reach the generator — not changed, ask the user if that should follow.
+- Tests: `tests/test_cross_scheme_compare.py` updated (67 passed); full pytest **1,900 passed, 2 skipped**. Plain scripts and live context suite not re-run (no routing / rewrite / state change).
+
+## Latest: Distinct KPI-card colour per scheme; one-scheme charts use it (2026-10-15). UI only, uncommitted.
+- `web/ai_query.html`: Focus Legacy (was MGNREGA's purple) is now olive green `#4D7C0F` (`legacy-card`), CM Elevate Legacy (was CM Elevate's blue) is orange `#C2410C` (`cmlegacy-card`); NRLM's figures now use its rose `#BE123C`. MGNREGA purple, PMAY-G teal, Focus+ amber and CM Elevate blue are unchanged.
+- Answer charts (bar, line, donut, grouped, stacked, KPI summary) take the colour of the scheme the SQL read (`SCHEME_COLORS`, `chartTheme`, `answerScheme`; shades of that colour for multi-series). Cross-scheme charts whose every label (or series) is a scheme name colour each bar/slice/series by its own scheme (`schemeColorOf` / `schemeLabelColors`, user screenshot 2026-10-15: MGNREGA vs Focus Plus donut was all purple); otherwise the old purple palette. Keep `SCHEME_COLORS` in step with the card CSS. Not yet deployed to the VM. No pipeline or test changes.
+
+## Latest: Home-page KPI cards — Beneficiaries for PMAY-G and CM Elevate (2026-10-15). UI only, uncommitted.
+- `web/ai_query.html` scheme cards: PMAY-G first stat relabelled "Houses sanctioned" -> **Beneficiaries 1,70,981** (households = houses with a non-zero sanction, matching the bot's "how many households" answer, per the user 2026-10-15; the every-record count is 1,71,107, KI-127); CM Elevate first stat "Applications 8,543" -> **Valid applications 7,149** (D-035; live DB 2026-10-14, SCHEMES.md). Other stats and cards unchanged.
+- Figures taken from the docs: the DB was unreachable this session (VPN). UNKNOWN — NEEDS VERIFICATION against the live DB if it has been reloaded since 2026-10-14. Not yet on the deployed VM (115.124.102.167): needs a redeploy of `web/ai_query.html`.
+
+## Latest: CM Elevate — Valid-only counts; pending = file_status Pending + Send Back (2026-10-14, KI-232, D-035). Code changed, uncommitted. LIVE-VERIFIED.
+- User decision (asked in session): every CM Elevate count is of VALID applications; "all" only when asked (total + verification split); a named verification state is answered as asked; pending = file_status Pending or Send Back; level-wise = current_level + that test. Supersedes KI-074 and the KI-186 level rule.
+- Live (DB reloaded: 8,867 rows): 204/204 (Valid counts 29, plain pending 28 — 28/28 again on a repeat run, level-wise 40, on hold 13, invalid 1, all-applications split 13, OFF-009 pairs 80) + 6/6 spot checks (rejected, level 2, verification breakdown, status distribution, top pending programmes, applicants by district). Tests: pytest 1,900 passed, 2 skipped (+21 in test_cmelevate_usecase_fixes.py, now 163); scripts 14/14.
+
 **Last updated:** 2026-10-10 (night), by the **measure-gap session** (KI-231: "person days under CM Elevate" now says the measure is MGNREGA's and offers it; `_measure_gap_answer` in `app/pipeline.py`, new `tests/test_measure_gap_direct.py`; code changed, uncommitted). Before that, the same evening: the **cross-scheme FIX session** — the 20 officer cross-scheme cases now **20/20 live (36/36 with typed variants and the UI screenshot question)**; D-034 deterministic cross-scheme comparison + KI-213/214/218..228 fixed; **code changed, uncommitted** (`app/pipeline.py`, new `tests/test_cross_scheme_compare.py`). Before that, the same day: the **cross-scheme LIVE retest session** (VPN up: the DB and bot columns finally run on the post-D-033 code; **4 PASS / 16 FAIL**; KI-212/215 verified fixed, KI-216 closed as not-a-defect, KI-213 magnitude corrected, KI-218..224 opened; **no code changed**; report `docs/Cross_Scheme_UseCase_Retest_Report_2026-10-10.md`). Before that: 2026-10-10, by the bare-Focus = Focus Legacy session (D-033; code changed, uncommitted). Before that: by the **cross-scheme use-case audit session** (the 20 cases in `Cross Scheme Test Cases.csv`; raw baseline for all six schemes computed, static pipeline audit done, **DB and bot columns NOT run — VPN down**; KI-212 to KI-216 opened; **no code changed**; report `docs/Cross_Scheme_UseCase_Test_Report_2026-10-10.md`). Before that: 2026-10-09, by the **use-cases-modal session** (KI-210 rows not clickable + KI-211 only 3 of 7 schemes listed; `web/ai_query.html` and the new `tests/test_ui_use_cases.py`; code changed, uncommitted). Before that: 2026-10-07, by the **NRLM use-case QA + fix session** (43 NRLM use cases: 16/43 → **43/43**; KI-188 to KI-195 opened AND fixed, plus two verifier false positives; code changed, uncommitted). Before that: 2026-10-06, by the Focus Legacy duplicate-groups session (KI-187, D-032 confirmed 2026-10-07 = paid more than once; code changed, uncommitted). Earlier the same day: by the CM Elevate OFF-009 all-pairs re-test and KI-182 fix session (code changed, uncommitted). Before that: 2026-10-03, by the Focus Legacy FY-comparison report session (KI-183; code changed, uncommitted). Before that: 2026-09-29 (early morning), by the conversational scheme-swap session (KI-180; code changed, uncommitted). Before that: 2026-09-29 (late night), by the CM Elevate Legacy use-case re-test session (no code changed; KI-166..168 opened). Before that: 2026-09-29 (night), by the Focus Legacy all-levels fix session (KI-020, KI-145..165, D-031; code changed, uncommitted). Before that: 2026-09-29, by the context-relevance / semantic-contract session (code changed, uncommitted; D-030, KI-030/032/034 and KI-130 to KI-135; **offline-verified only**, VPN down). Before that: 2026-09-28 (evening), by the CM Elevate all-blocks / all-villages fix session (code changed in `app/pipeline.py`, tests; uncommitted). Before that: 2026-09-28, by the PMAY-G fix session (code changed, uncommitted; D-029, KI-089 to KI-097). Before that: 2026-09-27 night, by the Focus Plus all-blocks / all-villages session (code changed in `app/pipeline.py`, tests in `tests/test_focusplus_usecase_fixes.py` and `tests/test_mgnrega_usecase_fixes.py`; **uncommitted**). Earlier the same day: the CM Elevate use-case QA **and fix** session (code changed in `app/pipeline.py` and `app/schema_context.py`, plus a new test file; **uncommitted**). Before that, the same day: the Focus Plus use-case QA **and fix** session (code changed in `app/pipeline.py` and `app/routers/query.py`, **uncommitted**, on top of the uncommitted 2026-09-26 MGNREGA and context work).
 **Branch / commit:** `main` @ `36b7427` (pushed to `origin/main`), plus the 2026-10-10 work committed on top (VERIFIED by `git status` on 2026-10-10).
 `docs/HANDOFF.md` was restored on 2026-10-07 (it had been deleted in the working tree although CLAUDE.md

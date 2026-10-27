@@ -785,8 +785,8 @@ CM ELEVATE RULES (breaking these produces a wrong number, not just an ugly query
             ELSE INITCAP(LOWER(current_file_status)) END AS status
      A status question is a GROUP BY over ALL values, never a single filtered COUNT.
      data_verified stays the column for VERIFICATION words only: "verified" /
-     "verification" / "valid" / "invalid" / "wrong" / "on hold" / "pending" (see
-     rules 3 and 14 and the vocabulary) — its values are 'Valid', 'On Hold',
+     "verification" / "valid" / "invalid" / "wrong" / "on hold" (see rules 3 and 14
+     and the vocabulary; "pending" is file_status, decided 2026-10-14) — its values are 'Valid', 'On Hold',
      'Invalid', 'Wrong' or NULL.
  14. "verified" / "verification completed" / "completed data verification" ->
      data_verified = 'Valid'. "not verified" / "verification pending" / "incomplete
@@ -817,11 +817,13 @@ CM ELEVATE RULES (breaking these produces a wrong number, not just an ugly query
 
 _CMELEVATE_VOCAB = """
 CM ELEVATE BUSINESS VOCABULARY (source: cmelevate_schema_partitions.yaml + cmelevate_entity_resolver.yaml)
+    DEFAULT SCOPE (decided 2026-10-14): every application / applicant / pending count counts ONLY VALID applications -> add data_verified = 'Valid' to the WHERE, and say "valid" in the answer. Two exceptions: (a) the question itself names a verification state ("on hold", "invalid", "wrong", "verified", "verification status", "not recorded") -> filter or group data_verified exactly as asked, no extra Valid filter; (b) the question explicitly asks for ALL applications ("all applications", "including invalid / on hold", "irrespective / regardless of verification") -> no Valid filter, and GROUP BY data_verified to show the split
     "applications" / "records" / "requests" -> COUNT(*)   (an application is a REQUEST, not an award — say "applications")
     "applicants" / "beneficiaries" / "distinct applications" / "unique applications" -> COUNT(DISTINCT request_id)   (request_id is NOT unique — about 36 numbers repeat, all inside Piggery — so a bare COUNT(*) overcounts "applicants"/"beneficiaries" by those duplicates; only "applications"/"requests" itself means the raw row count)
-    "on hold" / "pending" / "held" -> data_verified = 'On Hold'   (NEVER the onhold boolean)
-    ONLY when the question itself names a level ("pending at level 2", "pending in level1"): -> LOWER(current_level) = 'levelN' AND scheme_specific ->> 'file_status' = 'Pending' (decided 2026-10-05: the file sits at that level AND is still undecided — Rejected / Approved files at that level are NOT pending); do NOT also add data_verified = 'On Hold' (no level-2 application is on hold, so that AND returns a false 0). A plain "pending" with NO level named is still data_verified = 'On Hold' — never a current_level filter
-    "pending in each sector" / "<status> by sector" / "<status> by <dimension>" -> keep the status test INSIDE COUNT(*) FILTER (WHERE data_verified = '...') and GROUP BY the dimension with NO status test in the WHERE, so a group with none still shows 0
+    "on hold" / "held" -> data_verified = 'On Hold'   (NEVER the onhold boolean)
+    "pending" (decided 2026-10-14) -> scheme_specific ->> 'file_status' IN ('Pending', 'Send Back') (still undecided, including files sent back) AND data_verified = 'Valid' (the default scope) — NEVER data_verified = 'On Hold' (that is "on hold", a different question) and never a current_level filter unless a level is named
+    "pending at level N" ("pending at level 2", "pending in level1") -> LOWER(current_level) = 'levelN' AND scheme_specific ->> 'file_status' IN ('Pending', 'Send Back') AND data_verified = 'Valid'
+    "pending in each sector" / "<status> by sector" / "<status> by <dimension>" -> keep the status test INSIDE COUNT(*) FILTER (WHERE ...) and GROUP BY the dimension with NO status test in the WHERE, so a group with none still shows 0
     "approved" / "rejected" / "decision" -> scheme_specific ->> 'file_status' = 'Approved' / 'Rejected' (exact Title Case) — current_file_status NEVER holds approved/rejected/pending (only forward / sendback / resubmit), so filtering it for those returns a false 0   "sanctioned" / "cleared" / "funded" -> NOT AVAILABLE here (sanction lives in CM Elevate Legacy)   "status" / "status distribution" / "status-wise" / "application status" (default) -> current_file_status, send-back spellings merged (rule 13; decided 2026-09-28)   "verification status" -> data_verified
     "villages" -> COUNT(DISTINCT village_code) FILTER (WHERE entity_type <> 'Unresolved')   "districts" / "blocks" -> COUNT(DISTINCT lgd_district) / COUNT(DISTINCT lgd_block)
     "amount" / "money" / "disbursed" / "subsidy" / "loan" / "sanctioned amount" -> NOT AVAILABLE, no money column exists   "gender" -> scheme_specific ->> 'gender_id'
@@ -1278,19 +1280,22 @@ one closely, follow the procedure, do NOT pattern-match a near-miss example.
       help / assist / cover / provide for", etc. There is NO cross-scheme view for these,
       and it is NOT unanswerable.
         -> "beneficiaries" / "how many people/households" is a UNIQUE person-or-household
-           count. It is NEVER COUNT(*) of payment / disbursement / source rows, and NEVER
-           a SUM across financial years — the same household recurs in each scheme's fact
-           every year, so a multi-year SUM double-counts. "across all financial years" does
-           NOT mean "add every year together"; it means use each scheme's standing
-           distinct-beneficiary reading over the whole data window.
+           count. It is NEVER COUNT(*) of payment / disbursement / source rows.
+           ONE EXCEPTION, set by the user (2026-10-15): with no year asked, MGNREGA
+           beneficiaries = SUM(households_employed) over EVERY year in curated.v_employment
+           (state 1,494,437), and the answer says a household given work in more than one
+           year is counted once for each year. With a year asked, that year_key only.
         -> Compute EACH scheme's figure with EXACTLY the SQL its own single-scheme question
            would use: same view (curated.v_employment / curated.v_expenditure for MGNREGA,
            curated.v_pmay for PMAY-G, curated.v_focus_plus for Focus Plus), same filters
-           (curated.v_pmay ALWAYS `WHERE NOT is_placeholder`; a single latest year_key for
-           MGNREGA households_employed / persons_employed / job-card counts, since there is
-           no household id to dedupe across years), same aggregate (Focus Plus beneficiaries
-           = COUNT(DISTINCT beneficiary_key), rule 6 — NOT COUNT(*), which is payments) —
-           each inside its OWN subquery / CTE.
+           (curated.v_pmay `WHERE NOT is_placeholder` for money and stages, but a PMAY-G
+           beneficiary / house COUNT is COUNT(*) of EVERY record, no placeholder filter —
+           171,107, KI-127; a single latest year_key for MGNREGA persons_employed / job-card
+           counts, since there is no person id to dedupe across years), same aggregate
+           (Focus Plus beneficiaries = COUNT(DISTINCT beneficiary_key), rule 6 — NOT
+           COUNT(*), which is payments; Focus Legacy beneficiaries = SUM(no_of_pg_members),
+           NEVER COUNT(DISTINCT pg_id), which is producer groups) — each inside its OWN
+           subquery / CTE.
         -> Then combine the FINISHED per-scheme sub-results:
              * one statewide number per scheme -> CROSS JOIN the one-row subqueries.
              * a per-district / block / village table -> FULL OUTER JOIN the pre-aggregated
@@ -1318,8 +1323,8 @@ one closely, follow the procedure, do NOT pattern-match a near-miss example.
       NEVER UNION ALL the two schemes and then SELECT ... FROM (that union): the per-scheme
       columns do not line up and any outer aggregate counts union rows, not real records.
     * Each per-scheme figure MUST equal what that scheme's standalone query returns. If
-      "houses benefited for PMAY-G" alone is `COUNT(*) FROM curated.v_pmay WHERE NOT
-      is_placeholder`, the PMAY side of the cross-scheme answer is that identical expression.
+      "houses benefited for PMAY-G" alone is `COUNT(*) FROM curated.v_pmay` (every record,
+      KI-127), the PMAY side of the cross-scheme answer is that identical expression.
     * The two schemes measure DIFFERENT things (MGNREGA person-days / households given work
       vs PMAY-G houses). Do NOT add them into one "combined total" unless both sides are the
       SAME unit (money, both in crore). Otherwise report one figure per scheme and state

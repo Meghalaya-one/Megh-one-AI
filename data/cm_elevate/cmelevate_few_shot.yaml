@@ -949,8 +949,8 @@ sql_generation_examples:
   note: >
     "Status" / "current status" / "application status" means current_file_status
     (product decision 2026-09-28). The two send-back spellings are one bucket
-    (rule 7). Verification words (verified, valid, on hold, pending) stay on
-    data_verified — see the verification examples.
+    (rule 7). Verification words (verified, valid, on hold) stay on data_verified;
+    "pending" is file_status Pending / Send Back (2026-10-14).
 
 - question: How many CM Elevate applicants have completed data verification in Ri Bhoi?
   sql: |
@@ -1116,18 +1116,57 @@ sql_generation_examples:
 
 - question: How many CM Elevate unique applications are pending at level 1 for all of Meghalaya?
   sql: |
-    SELECT COUNT(DISTINCT request_id) AS unique_applications
+    SELECT COUNT(DISTINCT request_id) AS unique_valid_applications
     FROM curated.v_cm_elevate
     WHERE LOWER(current_level) = 'level1'
-      AND scheme_specific ->> 'file_status' = 'Pending';
+      AND scheme_specific ->> 'file_status' IN ('Pending', 'Send Back')
+      AND data_verified = 'Valid';
   tables:
   - curated.v_cm_elevate
   note: >
-    Decided 2026-10-05: "pending at level N" = the file sits at that level AND its
-    decision state is still Pending (file_status) - the Rejected and Approved files at
-    level 1 are not pending. "unique" /
-    "distinct" applications = COUNT(DISTINCT request_id), never COUNT(*). A plain
-    "pending" with no level is data_verified = 'On Hold'.
+    Decided 2026-10-14: "pending" = file_status Pending or Send Back (still undecided),
+    and every count is of VALID applications (data_verified = 'Valid') unless the question
+    names a verification state or asks for all applications. "pending at level N" adds
+    LOWER(current_level) = 'levelN'. "unique" / "distinct" applications =
+    COUNT(DISTINCT request_id), never COUNT(*).
+
+- question: How many CM Elevate applications are pending in Ri Bhoi?
+  sql: |
+    SELECT COUNT(*) AS valid_pending_applications
+    FROM curated.v_cm_elevate
+    WHERE lgd_district = 'RI BHOI'
+      AND scheme_specific ->> 'file_status' IN ('Pending', 'Send Back')
+      AND data_verified = 'Valid';
+  tables:
+  - curated.v_cm_elevate
+  note: >
+    Plain "pending" (decided 2026-10-14) is file_status Pending or Send Back - NOT
+    data_verified = 'On Hold', which answers "on hold". Valid applications only.
+
+- question: How many CM Elevate applications are there in West Garo Hills?
+  sql: |
+    SELECT COUNT(*) AS valid_applications
+    FROM curated.v_cm_elevate
+    WHERE lgd_district = 'WEST GARO HILLS'
+      AND data_verified = 'Valid';
+  tables:
+  - curated.v_cm_elevate
+  note: >
+    Default scope (decided 2026-10-14): counts are of VALID applications only. Say
+    "valid applications" in the answer.
+
+- question: How many CM Elevate applications are there in total, including invalid and on hold?
+  sql: |
+    SELECT COALESCE(data_verified, '(not recorded)') AS verification_state,
+           COUNT(*) AS applications
+    FROM curated.v_cm_elevate
+    GROUP BY 1
+    ORDER BY applications DESC;
+  tables:
+  - curated.v_cm_elevate
+  note: >
+    The question explicitly asks for ALL applications, so there is no Valid filter and the
+    answer shows the total with its split by verification state.
 
 - question: How many applications were withdrawn?
   sql: |
@@ -1419,12 +1458,13 @@ sql_generation_examples:
     SELECT scheme_name,
            COALESCE(scheme_specific ->> 'sector_id', '(not recorded)') AS sector,
            COUNT(*) AS applicant_count,
-           COUNT(*) FILTER (WHERE data_verified = 'On Hold') AS pending_applications
+           COUNT(*) FILTER (WHERE scheme_specific ->> 'file_status' IN ('Pending', 'Send Back')) AS pending_applications
     FROM curated.v_cm_elevate
     WHERE scheme_name IN ('Meghalaya Piggery Development Scheme',
                           'Meghalaya Poultry Farming Scheme',
                           'Meghalaya Dairy Development Scheme')
       AND lgd_district = 'RI BHOI'
+      AND data_verified = 'Valid'
     GROUP BY scheme_name, sector
     ORDER BY scheme_name, applicant_count DESC;
   tables:

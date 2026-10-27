@@ -82,8 +82,8 @@ check("a scheme-named question still skips the pause",
 # (applications only), so including it would report a misleading zero.
 print("5. THE RANKING SQL")
 _sql = p._CROSS_SCHEME_MONEY_SQL
-check("uses the sanctioned cross-scheme money view",
-      "curated.v_cross_scheme_money_district_year" in _sql)
+check("reads MGNREGA and PMAY-G from their base views, not the rounded money view (KI-239)",
+      "curated.v_expenditure" in _sql and "curated.v_pmay" in _sql and "v_cross_scheme_money_district_year" not in _sql)
 check("includes Focus Plus, whose money lives on its own view",
       "curated.v_focus_plus" in _sql)
 check("converts Focus Plus rupees to crore", "/ 1e7" in _sql)

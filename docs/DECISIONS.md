@@ -540,10 +540,11 @@ not recorded.*
 - **Decision:** the same pattern as `_cross_scheme_money_answer` and the PMAY-G facts path. A comparison
   across schemes is answered from one parameter-bound query per scheme and measure — each the figure that
   scheme's own question returns — shown side by side with each unit named and never added together. With
-  no year, each scheme's whole data window is used and stated (MGNREGA households: the latest year only).
+  no year, each scheme's whole data window is used and stated (MGNREGA households: every year summed since 2026-10-15, user request — a household given work in several years
+  is counted once per year, and the answer says so; it was the latest year only before).
   It runs in `_answer_data` before the which-scheme / scope / year pauses, and `classify_intent` keeps it
   on DATA.
-- **Measures:** MGNREGA households employed (latest FY) / total_exp ÷ 100 (lakh → crore); PMAY-G houses and
+- **Measures:** MGNREGA households employed (all FYs summed, 2026-10-15) / total_exp ÷ 100 (lakh → crore); PMAY-G houses and
   amount_released, `NOT is_placeholder`; Focus Plus `COUNT(DISTINCT beneficiary_key)` / amount_disbursed;
   CM Elevate `COUNT(DISTINCT request_id)`, **no money** ("no money recorded"); Focus Legacy memberships
   (`SUM(no_of_pg_members)`) in producer groups (`COUNT(DISTINCT pg_id)`) — never "people"; CM Elevate
@@ -558,3 +559,47 @@ not recorded.*
 - **Also:** the model path keeps working for every other wording, now with deterministic guards
   (`_cross_scheme_sql_issue`, `_verifier_join_complaint_on_aggregates`, `_range_claim_misstated`,
   `_cross_unit_total_stated`).
+
+### D-036 — Cross-scheme UAT rules: PMAY-G every record, four default schemes, combined figures on request
+- **Date:** 2026-10-16 (cross UAT `Megh_One_AI_Cross_UAT_Test_Report.xlsx`, KI-233 … KI-242; analysis
+  `docs/Cross_UAT_Failure_Analysis_2026-10-16.md`; tests `tests/test_cross_uat_fixes.py`).
+- **Decided by:** the user (product owner), in session: "for pmay include all houses 171107"; when a question
+  names no scheme or only excludes some, compare the four UAT schemes; leave the Focus+ data gaps alone.
+- **Decision (amends D-034):**
+  - PMAY-G beneficiaries in a cross-scheme answer = every house record, `COUNT(*)` with no placeholder filter
+    (state 171,107; 5,121 villages), as KI-127 already said for the single-scheme path. PMAY-G money keeps
+    `NOT is_placeholder` (the 126 records have ₹0 released). Supersedes the 2026-10-15 home-card value 1,70,981.
+  - A question that names no scheme, or only excludes some, compares MGNREGA, PMAY-G, Focus Plus and Focus Legacy
+    minus the excluded ones (`_XS_DEFAULT_SCHEMES`); NRLM, CM Elevate and CM Elevate Legacy only when named. This
+    also applies to the unnamed money ranking, which is now the comparison itself when the plan takes the question.
+  - "Excluding / leaving out / except X" removes X (`_excluded_schemes`, inside `_named_schemes`); excluding
+    "CM-ELEVATE" removes both CM Elevate datasets.
+  - A combined figure is given only when asked ("total", "combined", "altogether"; not "which has the highest
+    total") or when districts are ranked across schemes ("which districts", "top N districts"), and is labelled
+    as adding different units, indicative only. Otherwise the D-034 "never added together" wording stays.
+  - One explicit FY is allowed for a count or money comparison over schemes that carry year_key; a scheme
+    without that year reads "none — no records in FY …". Coverage + year, relative years and two years keep
+    the old path.
+- **Why deterministic:** CLAUDE.md §5. The model path also gets a guard (`_cross_scheme_sql_issue`: Focus Legacy
+  beneficiaries are `SUM(no_of_pg_members)`) and the FAMILY C prompt states the same rules.
+
+### D-035 — CM Elevate counts are of Valid applications; "pending" is file_status Pending or Send Back
+- **Date:** 2026-10-14 (KI-232; `app/pipeline.py` `_cm_elevate_valid_default`, `_cm_elevate_all_applications`,
+  `_cm_elevate_plain_pending`, `_cm_elevate_level_pending`; prompt `app/schema_context.py` `_CMELEVATE_VOCAB`;
+  few-shots in `data/cm_elevate/cmelevate_few_shot.yaml`).
+- **Decided by:** the user (product owner), in session, answering three explicit questions.
+- **Decision:**
+  - Every CM Elevate count (applications, applicants, pending, level-wise, status, programme, place) counts only
+    `data_verified = 'Valid'`. Statewide: 7,085 applications / 7,064 applicants (of 8,627 / 8,600).
+  - Two exceptions. A question that names a verification state ("on hold", "invalid", "verification status") is
+    answered as asked, with no extra Valid filter. A question that explicitly asks for ALL applications ("all
+    applications", "including invalid / on hold", "irrespective of verification") gets the full total plus its
+    split by verification state.
+  - "pending" = `scheme_specific ->> 'file_status' IN ('Pending', 'Send Back')` (Valid only). Statewide 7,031.
+  - "pending at level N" adds `LOWER(current_level) = 'levelN'`. Level 0 / 1 / 2 = 57 / 6,809 / 165.
+- **Supersedes:** KI-074 (2026-09-28, plain "pending" = On Hold) and the 2026-10-05 KI-186 level rule
+  (`file_status = 'Pending'` only). "on hold" still means `data_verified = 'On Hold'`.
+- **Why deterministic:** the project rule (CLAUDE.md §5) — a prompt rule, a few-shot, and a guard. The prompt rule
+  alone had already failed on "pending" once (KI-186 regression, 4 of 6 runs).
+- **Also:** the cross-scheme comparison's CM Elevate count (`_XS_MEASURES`) carries the same Valid filter.
+  List questions (no COUNT) are not filtered.

@@ -469,6 +469,11 @@
   .scheme-card.elevate-card { background: linear-gradient(135deg, #FFFBEB 0%, #FBF0DE 100%); }
   .scheme-card.cmelevate-card { background: linear-gradient(135deg, #EFF6FF 0%, #DBEAFE 100%); }
   .scheme-card.nrlm-card { background: linear-gradient(135deg, #FFF1F2 0%, #FFE4E6 100%); }
+  /* Focus Legacy and CM Elevate Legacy used to share MGNREGA's purple and CM Elevate's
+     blue. Each scheme now has its own colour, which its answer charts reuse
+     (SCHEME_COLORS in the analytics renderer — keep the two in step). */
+  .scheme-card.legacy-card { background: linear-gradient(135deg, #F7FEE7 0%, #ECFCCB 100%); }
+  .scheme-card.cmlegacy-card { background: linear-gradient(135deg, #FFF7ED 0%, #FFEDD5 100%); }
   .scheme-card-head { display: flex; align-items: center; gap: 10px; margin-bottom: 6px; }
   .scheme-card .ico {
     width: 36px; height: 36px; border-radius: 10px; display: flex;
@@ -479,6 +484,8 @@
   .elevate-card .ico { background: var(--amber-bg); color: var(--amber); }
   .cmelevate-card .ico { background: var(--blue-bg); color: var(--blue); }
   .nrlm-card .ico { background: #FFE4E6; color: #BE123C; }
+  .legacy-card .ico { background: #D9F99D; color: #4D7C0F; }
+  .cmlegacy-card .ico { background: #FED7AA; color: #C2410C; }
   .scheme-card h3 { margin: 0; font-size: 15px; font-weight: 700; color: var(--ink); }
   .scheme-card .meta {
     font-size: 11.5px; color: var(--ink-3); font-weight: 500; line-height: 1.45;
@@ -535,6 +542,9 @@
   .unified-card .stat-val { color: var(--teal); }
   .elevate-card .stat-val { color: var(--amber); }
   .cmelevate-card .stat-val { color: var(--blue); }
+  .legacy-card .stat-val { color: #4D7C0F; }
+  .cmlegacy-card .stat-val { color: #C2410C; }
+  .nrlm-card .stat-val { color: #BE123C; }
 
   /* PROMPT CHIPS */
   .prompts-section { margin: 16px 0 10px; }
@@ -1555,7 +1565,7 @@
                 </div>
               </div>
               <div class="stats">
-                <div><div class="stat-val">1,71,107</div><div class="stat-lbl">Houses sanctioned</div></div>
+                <div><div class="stat-val">1,71,107</div><div class="stat-lbl">Beneficiaries</div></div>
                 <div><div class="stat-val">1,29,941</div><div class="stat-lbl">Houses completed</div></div>
                 <div><div class="stat-val">₹2,185.26 Cr</div><div class="stat-lbl">Funds released</div></div>
               </div>
@@ -1583,12 +1593,12 @@
                 </div>
               </div>
               <div class="stats">
-                <div><div class="stat-val">8,543</div><div class="stat-lbl">Applications</div></div>
+                <div><div class="stat-val">7,149</div><div class="stat-lbl">Valid applications</div></div>
                 <div><div class="stat-val">15</div><div class="stat-lbl">Schemes</div></div>
                 <div><div class="stat-val">12</div><div class="stat-lbl">Districts covered</div></div>
               </div>
             </div>
-            <div data-scheme="focus_legacy" class="scheme-card focus-card">
+            <div data-scheme="focus_legacy" class="scheme-card legacy-card">
               <div class="scheme-card-head">
                 <div class="ico">🤝</div>
                 <div>
@@ -1602,7 +1612,7 @@
                 <div><div class="stat-val">₹51.01 Cr*</div><div class="stat-lbl">Amount remitted*</div></div>
               </div>
             </div>
-            <div data-scheme="cm_elevate_legacy" class="scheme-card cmelevate-card">
+            <div data-scheme="cm_elevate_legacy" class="scheme-card cmlegacy-card">
               <div class="scheme-card-head">
                 <div class="ico">💼</div>
                 <div>
@@ -2031,8 +2041,7 @@ function buildSchemePages() {
 /* Keep "Try a question" in step with the page on screen: a page showing a
    single scheme lists that scheme's own questions, while a page holding
    several falls back to the mixed set (one or two per scheme shown). Driven by
-   each card's data-scheme, since the colour classes are not unique — focus-card
-   is used by both MGNREGA and Focus Legacy. */
+   each card's data-scheme, the scheme's real key, not its colour class. */
 function _visibleSchemePage() {
   const track = document.getElementById('schemeCards');
   if (!track || !track.clientWidth) return null;
@@ -2256,6 +2265,57 @@ const AOPT = {
   }
 };
 
+/* A one-scheme answer draws its charts in that scheme's KPI-card colour (the .stat-val
+   colours in the CSS — keep the two in step). Cross-scheme answers, and anything whose
+   scheme can't be read from the SQL, keep the default purple. */
+const SCHEME_COLORS = {
+  'MGNREGA': '#5C2D91', 'PMAY-G': '#0F766E', 'Focus Plus': '#9A6700', 'CM Elevate': '#1D4ED8',
+  'Focus Legacy': '#4D7C0F', 'CM Elevate Legacy': '#C2410C', 'NRLM': '#BE123C'
+};
+const DEFAULT_CHART_THEME = { base: '#5C2D91', light: '#9558CF', fill: 'rgba(92,45,145,.10)', pal: PAL2 };
+function _tint(hex, t) {   // t = 0 keeps the colour, 1 is white
+  const n = parseInt(hex.slice(1), 16);
+  return '#' + [n >> 16, (n >> 8) & 255, n & 255]
+    .map(c => Math.round(c + (255 - c) * t).toString(16).padStart(2, '0')).join('');
+}
+function chartTheme(scheme) {
+  const c = SCHEME_COLORS[scheme];
+  if (!c) return DEFAULT_CHART_THEME;
+  const n = parseInt(c.slice(1), 16);
+  return { base: c, light: _tint(c, .35),
+           fill: `rgba(${n >> 16},${(n >> 8) & 255},${n & 255},.10)`,
+           pal: [0, .16, .3, .43, .55, .66, .76, .85].map(t => _tint(c, t)) };
+}
+// A chart label that IS a scheme name ("MGNREGA", "Focus Plus", "FOCUS+ beneficiaries") ->
+// that scheme's colour, else ''. Anchored at the start so a district or village name that
+// merely contains a scheme word never matches. Bare "Focus" is Focus Legacy (D-033).
+function schemeColorOf(label) {
+  const k = String(label || '').toLowerCase().replace(/\+/g, ' plus').replace(/[^a-z0-9]+/g, ' ').trim();
+  const s = /^cm elevate legacy\b/.test(k) ? 'CM Elevate Legacy'
+          : /^cm elevate\b/.test(k)        ? 'CM Elevate'
+          : /^focus plus\b/.test(k)        ? 'Focus Plus'
+          : /^focus( legacy)?\b/.test(k)   ? 'Focus Legacy'
+          : /^(mgnrega|nrega)\b/.test(k)   ? 'MGNREGA'
+          : /^pmay( g)?\b/.test(k)         ? 'PMAY-G'
+          : /^(nrlm|day nrlm)\b/.test(k)   ? 'NRLM' : '';
+  return SCHEME_COLORS[s] || '';
+}
+// Per-label scheme colours for a cross-scheme chart — only when EVERY label is a scheme.
+function schemeLabelColors(labels) {
+  const cols = (labels || []).map(schemeColorOf);
+  return cols.length && cols.every(Boolean) ? cols : null;
+}
+
+// The single scheme an answer's SQL read, or '' when it read none or several.
+function answerScheme(response) {
+  const sql = (response && response.sql_query) || '';
+  const found = new Set();
+  for (const m of sql.matchAll(/(?:from|join)\s+["']?([a-z0-9_.]+)["']?/gi)) {
+    sourceSchemes(m[1].replace(/["']/g, '').split('.').pop()).forEach(s => found.add(s));
+  }
+  return found.size === 1 ? [...found][0] : '';
+}
+
 const CI = {};
 window._QD = window._QD || {};
 let _chartIdx = 0;
@@ -2264,17 +2324,21 @@ function killChart(id) { if (CI[id]) { try { CI[id].destroy(); } catch(e){} dele
 function rQC(cid, type) {
   const qd = window._QD[cid]; if (!qd) return;
   const { labels, values } = qd; killChart(cid);
+  const th = qd.theme || DEFAULT_CHART_THEME;
+  // Cross-scheme answer (one bar / slice per scheme): each takes its own scheme's colour.
+  const perScheme = schemeLabelColors(labels);
   const cv = document.getElementById(cid); if (!cv) return;
   if (type === 'bar') {
     CI[cid] = new Chart(cv, { type:'bar', data:{ labels, datasets:[{ data:values,
-      backgroundColor: ctx=>{ const g=ctx.chart.ctx.createLinearGradient(0,0,0,220); g.addColorStop(0,'#5C2D91'); g.addColorStop(1,'#9558CF'); return g; },
+      backgroundColor: ctx=>{ const c = perScheme ? perScheme[ctx.dataIndex] : th.base;
+        const g=ctx.chart.ctx.createLinearGradient(0,0,0,220); g.addColorStop(0,c); g.addColorStop(1,perScheme ? _tint(c,.35) : th.light); return g; },
       borderRadius:5, borderWidth:0 }] }, options:{ ...AOPT } });
   } else if (type === 'doughnut') {
-    CI[cid] = new Chart(cv, { type:'doughnut', data:{ labels, datasets:[{ data:values, backgroundColor:PAL2, borderWidth:2, borderColor:'#fff', cutout:'65%' }] },
+    CI[cid] = new Chart(cv, { type:'doughnut', data:{ labels, datasets:[{ data:values, backgroundColor:perScheme || th.pal, borderWidth:2, borderColor:'#fff', cutout:'65%' }] },
       options:{ ...LOPT, plugins:{ ...LOPT.plugins, legend:{ ...LOPT.plugins.legend, position:'right' } } } });
   } else {
-    CI[cid] = new Chart(cv, { type:'line', data:{ labels, datasets:[{ data:values, borderColor:'#5C2D91', borderWidth:2.5,
-      backgroundColor:'rgba(92,45,145,.10)', tension:.4, fill:true, pointRadius:4, pointBackgroundColor:'#fff', pointBorderColor:'#5C2D91', pointBorderWidth:2 }] },
+    CI[cid] = new Chart(cv, { type:'line', data:{ labels, datasets:[{ data:values, borderColor:th.base, borderWidth:2.5,
+      backgroundColor:th.fill, tension:.4, fill:true, pointRadius:4, pointBackgroundColor:'#fff', pointBorderColor:th.base, pointBorderWidth:2 }] },
       options:{ ...AOPT, plugins:{ legend:{ display:false }, tooltip: CHART_TOOLTIP } } });
   }
 }
@@ -2283,15 +2347,17 @@ function swDyn(cid, type, btn) {
   btn.classList.add('on');
   rQC(cid, type);
 }
-function groupedBar(id, labels, datasets) {
+function groupedBar(id, labels, datasets, theme) {
   killChart(id);
-  const ds = datasets.map((d, i) => ({ label:d.label, data:d.values, backgroundColor:PAL2[i % PAL2.length], borderRadius:4, borderWidth:0 }));
+  const pal = (theme || DEFAULT_CHART_THEME).pal;
+  const ds = datasets.map((d, i) => ({ label:d.label, data:d.values, backgroundColor:schemeColorOf(d.label) || pal[i % pal.length], borderRadius:4, borderWidth:0 }));
   CI[id] = new Chart(document.getElementById(id), { type:'bar', data:{ labels, datasets: ds },
     options:{ ...AOPT, plugins:{ ...AOPT.plugins, legend:{ display:true, labels:{ font:{family:'Inter',size:11,weight:'600'}, color:'#1A1626', padding:14 } } } } });
 }
-function stackedBar(id, labels, datasets) {
+function stackedBar(id, labels, datasets, theme) {
   killChart(id);
-  const ds = datasets.map((d, i) => ({ label:d.label, data:d.data, backgroundColor:PAL2[i % PAL2.length], borderRadius:3, borderWidth:0 }));
+  const pal = (theme || DEFAULT_CHART_THEME).pal;
+  const ds = datasets.map((d, i) => ({ label:d.label, data:d.data, backgroundColor:schemeColorOf(d.label) || pal[i % pal.length], borderRadius:3, borderWidth:0 }));
   CI[id] = new Chart(document.getElementById(id), { type:'bar', data:{ labels, datasets: ds },
     options:{ ...AOPT, plugins:{ ...AOPT.plugins, legend:{ display:true, labels:{ font:{family:'Inter',size:11,weight:'600'}, color:'#1A1626', padding:14 } } },
       scales:{ x:{ ...AOPT.scales.x, stacked:true }, y:{ ...AOPT.scales.y, stacked:true } } } });
@@ -2349,8 +2415,10 @@ function buildRecordCard(row) {
     `</tbody></table></div>`;
 }
 
-function buildAnalytics(question, data, hintType) {
+function buildAnalytics(question, data, hintType, scheme) {
   if (!Array.isArray(data) || data.length === 0) return { html: '', init: () => {} };
+  const theme = chartTheme(scheme);
+  const dot = `<span class="chd-dot" style="background:${theme.base}"></span>`;
 
   if (data.length === 1 && hintType === 'kpi_bar') {
     _chartIdx++;
@@ -2376,7 +2444,7 @@ function buildAnalytics(question, data, hintType) {
     const labels = keys.map(k => k.replace(/_/g,' '));
     const values = keys.map(k => parseFloat(row[k]) || 0);
     const html = `<div class="analytics"><div class="dyn-grid single"><div class="dyn-chart-card">
-      <div class="chd"><div class="chd-left"><span class="chd-dot"></span><span class="chd-title">Summary</span></div>
+      <div class="chd"><div class="chd-left">${dot}<span class="chd-title">Summary</span></div>
         <div class="qctog">
           <button class="ctb on" onclick="swDyn('${cid}','bar',this)">Bar</button>
           <button class="ctb" onclick="swDyn('${cid}','doughnut',this)">Donut</button>
@@ -2384,7 +2452,7 @@ function buildAnalytics(question, data, hintType) {
       </div>
       <div class="chw"><canvas id="${cid}"></canvas></div>
     </div></div>${buildRecordCard(row)}</div>`;
-    const init = () => { window._QD[cid] = { labels, values }; rQC(cid, 'bar'); };
+    const init = () => { window._QD[cid] = { labels, values, theme }; rQC(cid, 'bar'); };
     return { html, init };
   }
 
@@ -2440,10 +2508,10 @@ function buildAnalytics(question, data, hintType) {
     const labels = data.map(r => String(r[lc]).length > 18 ? String(r[lc]).slice(0,16)+'…' : String(r[lc]));
     const datasets = numCols.map(nc => ({ label: nc.replace(/_/g,' '), values: data.map(r => parseFloat(r[nc]) || 0) }));
     const html = `<div class="analytics"><div class="dyn-grid single"><div class="dyn-chart-card">
-      <div class="chd"><div class="chd-left"><span class="chd-dot"></span><span class="chd-title">Grouped comparison by ${escapeHTML(lc.replace(/_/g,' '))}</span></div><span class="chd-pill">Grouped Bar</span></div>
+      <div class="chd"><div class="chd-left">${dot}<span class="chd-title">Grouped comparison by ${escapeHTML(lc.replace(/_/g,' '))}</span></div><span class="chd-pill">Grouped Bar</span></div>
       <div class="chw" style="height:280px"><canvas id="${cid}"></canvas></div>
     </div></div>${buildDynTable(data, true)}</div>`;
-    return { html, init: () => groupedBar(cid, labels, datasets) };
+    return { html, init: () => groupedBar(cid, labels, datasets, theme) };
   }
 
   if (hintType === 'stacked' && lblCols.length >= 2 && numCols.length >= 1) {
@@ -2451,10 +2519,10 @@ function buildAnalytics(question, data, hintType) {
     const cid = `dync_${myIdx}_s`;
     const { labels, datasets } = pivotStackedBar(data, xKey, sKey, vKey);
     const html = `<div class="analytics"><div class="dyn-grid single"><div class="dyn-chart-card">
-      <div class="chd"><div class="chd-left"><span class="chd-dot"></span><span class="chd-title">${escapeHTML(vKey.replace(/_/g,' '))} by ${escapeHTML(xKey.replace(/_/g,' '))} &amp; ${escapeHTML(sKey.replace(/_/g,' '))}</span></div><span class="chd-pill">Stacked Bar</span></div>
+      <div class="chd"><div class="chd-left">${dot}<span class="chd-title">${escapeHTML(vKey.replace(/_/g,' '))} by ${escapeHTML(xKey.replace(/_/g,' '))} &amp; ${escapeHTML(sKey.replace(/_/g,' '))}</span></div><span class="chd-pill">Stacked Bar</span></div>
       <div class="chw" style="height:320px"><canvas id="${cid}"></canvas></div>
     </div></div>${buildPivotTable(data, xKey, sKey, vKey)}</div>`;
-    return { html, init: () => stackedBar(cid, labels, datasets) };
+    return { html, init: () => stackedBar(cid, labels, datasets, theme) };
   }
 
   const chartsToRender = numCols.slice(0, 3);
@@ -2463,7 +2531,7 @@ function buildAnalytics(question, data, hintType) {
   chartsToRender.forEach((vc, i) => {
     const cid = `dync_${myIdx}_${i}`;
     html += `<div class="dyn-chart-card">
-      <div class="chd"><div class="chd-left"><span class="chd-dot"></span><span class="chd-title">${escapeHTML(vc.replace(/_/g,' '))} by ${escapeHTML(lc.replace(/_/g,' '))}</span></div>
+      <div class="chd"><div class="chd-left">${dot}<span class="chd-title">${escapeHTML(vc.replace(/_/g,' '))} by ${escapeHTML(lc.replace(/_/g,' '))}</span></div>
         <div class="qctog">
           <button class="ctb${defType==='bar'?' on':''}" onclick="swDyn('${cid}','bar',this)">Bar</button>
           <button class="ctb${defType==='doughnut'?' on':''}" onclick="swDyn('${cid}','doughnut',this)">Donut</button>
@@ -2480,7 +2548,7 @@ function buildAnalytics(question, data, hintType) {
       const cid = `dync_${myIdx}_${i}`;
       const labels = data.map(r => String(r[lc]).length > 18 ? String(r[lc]).slice(0,16)+'…' : String(r[lc]));
       const values = data.map(r => parseFloat(r[vc]) || 0);
-      window._QD[cid] = { labels, values };
+      window._QD[cid] = { labels, values, theme };
       rQC(cid, defType);
     });
   };
@@ -2826,7 +2894,7 @@ function addBotRich(question, response) {
   hideWelcome();
   const answerHTML = escapeHTML(response.answer || '').replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>').replace(/\n/g, '<br>');
   const wantsAnalytics = response.intent !== 'EDGE' && Array.isArray(response.data) && response.data.length >= 1;
-  const analytics = wantsAnalytics ? buildAnalytics(question, response.data, response.chart_type) : { html: '', init: () => {} };
+  const analytics = wantsAnalytics ? buildAnalytics(question, response.data, response.chart_type, answerScheme(response)) : { html: '', init: () => {} };
   const followUp = buildFollowUp(question, response);
   // A CLARIFY pause fetched nothing, so the "0 results" meta line would be misleading.
   const meta = (response.intent && response.intent !== 'EDGE' && response.intent !== 'CLARIFY')

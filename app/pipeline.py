@@ -1426,8 +1426,8 @@ _CMELEVATELEGACY_FORCING = re.compile(
     r"\bdisburs\w*|\bsanction\w*|\bsubsid(?:y|ies)\b|\bloans?\b|\bgrants?\b|"
     r"\bamounts?\b|\bmoney\b|\bfunds?\b|\brupees?\b|\bcrores?\b|\blakhs?\b|\brs\.?\s*\d|"
     r"\bpaid\b|\bpayments?\b|\breleased\b|\bentitlement\b|\butili[sz]ation\b|"
-    # NOT a bare "pending": in the applications data "pending" means on hold
-    # (data_verified = 'On Hold'). Only the money reading forces Legacy.
+    # NOT a bare "pending": in the applications data "pending" is an application
+    # state (file_status Pending / Send Back, KI-232). Only the money reading forces Legacy.
     r"\binstal{1,2}ments?\b|\btranch\w*|\bpending\s+(?:amount|money|disburs\w*)|"
     r"\bpending\s+to\s+be\s+(?:paid|disbursed|released)\b|\byet\s+to\s+be\s+(?:paid|disbursed)\b|"
     r"\brefused\b|\brefusals?\b|\bduplicates?\b|\bdesanction\w*|"
@@ -1507,10 +1507,12 @@ def _pin_bare_focus(question: str) -> str:
     if not q or not _BARE_FOCUS_WORD.search(q) or _pg_focus_group_name(q):
         return q
     taken = [m.span() for s in ("Focus Plus", "Focus Legacy") for m in _SCHEME_NAME_PATTERN[s].finditer(q)]
-    taken += [m.span() for m in _FOCUS_AS_NOUN.finditer(q)]
+    nouns = [m.span() for m in _FOCUS_AS_NOUN.finditer(q)]
     out, last = [], 0
     for m in _BARE_FOCUS_WORD.finditer(q):
         if any(a <= m.start() < b for a, b in taken):
+            continue
+        if any(a <= m.start() < b for a, b in nouns) and not _focus_listed_as_scheme(q, m):
             continue
         out.append(q[last:m.start()] + "Focus Legacy")
         last = m.end()
@@ -1519,6 +1521,29 @@ def _pin_bare_focus(question: str) -> str:
     pinned = "".join(out) + q[last:]
     logger.info("bare Focus pinned to Focus Legacy: %r -> %r", q, pinned)
     return pinned
+
+
+# "…NREGA, PMAY Gramin, Focus Plus and the FOCUS scheme" and "Rank MGNREGA, PMAY-G,
+# Focus+ and FOCUS on coverage" read as the English word ("the focus", "focus on")
+# and FOCUS dropped out of both comparisons (cross UAT 2026-10-15 T01.2 / T20.2,
+# KI-235). A "focus" followed by "scheme", or listed right after another scheme's
+# name ("Focus+ and FOCUS", "PMAY-G, FOCUS"), is the scheme.
+_FOCUS_LIST_SEPARATOR_END = re.compile(
+    # no article: "MGNREGA and the focus on women" is the English word
+    r"(?:,|\band\b|\bor\b|&|\bvs\.?|\bversus\b|\bwith\b)\s*$", re.IGNORECASE)
+
+
+def _focus_listed_as_scheme(question: str, m: "re.Match") -> bool:
+    q = question or ""
+    if re.match(r"\s+(?:scheme|programme|program)\b", q[m.end():], re.IGNORECASE):
+        return True
+    before = q[:m.start()]
+    sep = _FOCUS_LIST_SEPARATOR_END.search(before)
+    if not sep:
+        return False
+    head = before[:sep.start()].rstrip()
+    return any(n.end() == len(head) for pattern in _SCHEME_NAME_PATTERN.values()
+               for n in pattern.finditer(head))
 
 
 def _unpin_cm_elevate(question: str) -> str:
@@ -5355,12 +5380,21 @@ def _wants_cross_scheme_money_ranking(question: str) -> bool:
 # view in RUPEES (/1e7 -> crore). CM Elevate is deliberately absent — it has no
 # money column of any kind (v_cm_elevate carries applications only), so it is
 # reported as "not held" rather than as a misleading zero.
+# MGNREGA and PMAY-G are read from their base views, not from
+# v_cross_scheme_money_district_year: that view rounds each district-year to two
+# decimals before this sums them, so the ranking said ₹3,628.68 / ₹2,185.24 crore
+# while every other answer said ₹3,628.67 / ₹2,185.26 (cross UAT T12.2, KI-239).
 _CROSS_SCHEME_MONEY_SQL = """
-SELECT scheme_code AS scheme,
-       ROUND(SUM(amount_crore), 2) AS amount_crore,
-       MIN(measure_semantics) AS measure_semantics
-FROM curated.v_cross_scheme_money_district_year
-GROUP BY scheme_code
+SELECT 'MGNREGA' AS scheme,
+       ROUND(SUM(total_exp) / 100.0, 2) AS amount_crore,
+       'expenditure, annual FLOW, source total_exp is lakh rupees, divided by 100' AS measure_semantics
+FROM curated.v_expenditure
+UNION ALL
+SELECT 'PMAY' AS scheme,
+       ROUND(SUM(amount_released) / 1e7, 2) AS amount_crore,
+       'amount released, tied to sanction FY, rupees, divided by 1e7' AS measure_semantics
+FROM curated.v_pmay
+WHERE NOT is_placeholder
 UNION ALL
 SELECT 'Focus Plus' AS scheme,
        ROUND(SUM(amount_disbursed) / 1e7, 2) AS amount_crore,
@@ -5415,7 +5449,13 @@ async def _cross_scheme_money_answer(question: str) -> dict:
     cross-scheme money comparison, because MGNREGA's figure is expenditure
     incurred while PMAY-G's is money released against sanctions."""
     rows = await run_readonly(_CROSS_SCHEME_MONEY_SQL)
-    ranked = [r for r in rows if r.get("amount_crore") is not None]
+    # The schemes named, else the default four; never an excluded one (user decision
+    # 2026-10-16, KI-234).
+    named = set(_named_schemes(question))
+    keep = named or (set(_XS_DEFAULT_SCHEMES) - _excluded_schemes(question))
+    ranked = [r for r in rows if r.get("amount_crore") is not None
+              and _SCHEME_DISPLAY_NAME.get(str(r["scheme"]), str(r["scheme"])) in keep] \
+        or [r for r in rows if r.get("amount_crore") is not None]
     if not ranked:
         return {"route": "data", "intent": "DATA", "confidence": "low",
                 "answer": "I couldn't read the scheme spending figures just now.",
@@ -5489,11 +5529,20 @@ _XS_MONEY_CUE = re.compile(
     r"\bfinancial\b|\bassistance\b|\boutlay\b|\bbudget\b|\bcost\b|\brupees?\b",
     re.IGNORECASE)
 _XS_COVERAGE_CUE = re.compile(
-    r"\bcoverage\b|\bcover(?:ed|s)?\b|\bgeographic\w*|\bfootprint\b|\bwidest\b|\bspread\b",
+    r"\bcoverage\b|\bcover(?:ed|s)?\b|\bgeographic\w*|\bfootprint\b|\bwidest\b|\bspread\b|"
+    # "Excluding CM-ELEVATE, which scheme reaches the most villages?" (cross UAT T13.2)
+    r"\breach\w*\b[^?.!]{0,30}\bvillages?\b|\bmost\s+villages\b",
     re.IGNORECASE)
 _XS_OVERVIEW_CUE = re.compile(
-    r"\bperformance\b|\bperforming\b|\bsummary\b|\bsummari[sz]e\b|\boverview\b|\bscale\b",
+    r"\bperformance\b|\bperforming\b|\bsummary\b|\bsummari[sz]e\b|\boverview\b|\bscale\b|"
+    # "How are Focus Plus, FOCUS and PMAY-G doing in West Garo Hills?" went to model
+    # SQL, which counted producer groups as beneficiaries and printed raw rupees
+    # (cross UAT 2026-10-15 T08.2, KI-238).
+    r"\bdoing\b|\bfar(?:e|ing)\b",
     re.IGNORECASE)
+# "For each district, which is bigger: Focus+ or FOCUS?" names no measure; between
+# schemes, size is the beneficiary count (cross UAT T18.3, KI-238).
+_XS_SIZE_CUE = re.compile(r"\b(?:bigger|larger|smaller|biggest|largest|smallest)\b", re.IGNORECASE)
 # "across the schemes" / "each scheme" / "which scheme" — the only way an UNNAMED
 # question becomes a cross-scheme one here. Not "both schemes": that is the older
 # MGNREGA-and-PMAY-G phrasing and keeps its own path.
@@ -5505,15 +5554,50 @@ _XS_ACROSS_CUE = re.compile(
     re.IGNORECASE)
 _XS_BY_DISTRICT_CUE = re.compile(
     r"\b(?:each|every|per|by|all)\s+(?:the\s+)?districts?\b|\bdistrict[\s-]?wise\b|"
-    r"\bacross\s+(?:all\s+)?(?:the\s+)?districts\b|\bwhich\s+districts?\b",
+    r"\bacross\s+(?:all\s+)?(?:the\s+)?districts\b|\bwhich\s+districts?\b|"
+    r"\b(?:top|leading|bottom)\s+(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten)\s+districts?\b",
     re.IGNORECASE)
+# "Which of MGNREGA, PMAY-G, Focus+ and FOCUS …", "which reaches the most …",
+# "Rank MGNREGA, …" gave the figures but never said which scheme leads (cross UAT
+# T07.3 / T13.1 / T20.2, KI-237).
 _XS_RANK_CUE = re.compile(
     r"\bwhich\s+(?:scheme|programme|one)\b|\bidentify\s+which\b|\bleading\s+scheme\b|"
-    r"\bscheme\s+(?:that\s+)?leads\b",
+    r"\bscheme\s+(?:that\s+)?leads\b|\bwhich\s+of\b|"
+    r"\bwhich\s+(?:is|reaches|has|have|gives|delivers|provides|covers|spent|spends)\b|"
+    r"\brank(?:s|ed|ing)?\b",
     re.IGNORECASE)
 _XS_TOP_DISTRICT_CUE = re.compile(
-    r"\bwhich\s+districts?\b|\b(?:top|leading)\s+districts?\b|\bconcentration\b",
+    r"\bwhich\s+districts?\b|\b(?:top|leading)\s+(?:\d+\s+|one\s+|two\s+|three\s+|four\s+|five\s+|"
+    r"six\s+|seven\s+|eight\s+|nine\s+|ten\s+)?districts?\b|\bconcentration\b",
     re.IGNORECASE)
+_XS_WORD_NUM = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7,
+                "eight": 8, "nine": 9, "ten": 10}
+_XS_TOP_N = re.compile(
+    r"\b(?:top|leading)\s+(\d+|one|two|three|four|five|six|seven|eight|nine|ten)\b", re.IGNORECASE)
+# "which of PMAY-G, Focus+ and FOCUS comes second after MGNREGA" (cross UAT T18.2).
+_XS_ORDINAL = re.compile(r"\b(second|2nd|third|3rd)\b", re.IGNORECASE)
+_XS_AFTER_SCHEME = re.compile(r"\b(?:after|behind)\b", re.IGNORECASE)
+# "In which districts does Focus+ have more beneficiaries than PMAY-G?" (cross UAT
+# T03.3): a pairwise test per district, not each scheme's own top district.
+_XS_PAIR_CUE = re.compile(
+    r"\b(more|higher|greater|bigger|larger|exceed\w*|fewer|less|lower|smaller)\b[^?.!]{0,60}?\bthan\b",
+    re.IGNORECASE)
+_XS_PAIR_LESS = {"fewer", "less", "lower", "smaller"}
+# Asked for one figure across the schemes ("total beneficiary count across …",
+# "money released under … combined") or for districts ranked across them (cross UAT
+# T01.1 / T04.2 / T15.x, KI-236): the sum is given, labelled as adding different
+# units. Read on the text with the all-years wording scrubbed ("all years combined").
+_XS_COMBINED_CUE = re.compile(
+    r"\bcombined\b|\btotal\b|\baltogether\b|\bin\s+all\b|\bsum\b|\badd(?:ed)?\s+(?:up|together)\b",
+    re.IGNORECASE)
+# A question that names no scheme, or only excludes some, compares the four
+# schemes of the cross-scheme UAT; NRLM, CM Elevate and CM Elevate Legacy only
+# when named (user decision 2026-10-16).
+_XS_DEFAULT_SCHEMES = ["MGNREGA", "PMAY-G", "Focus Plus", "Focus Legacy"]
+# Schemes whose comparison view carries year_key, so a named FY can be filtered.
+_XS_YEAR_VIEWS = {"MGNREGA", "PMAY-G", "Focus Plus", "Focus Legacy", "CM Elevate Legacy"}
+_XS_RELATIVE_YEAR = re.compile(
+    r"\b(?:this|last|current|previous|next|past)\s+(?:financial\s+|fiscal\s+)?years?\b", re.IGNORECASE)
 # A measure only one scheme holds, a sub-scheme, a status / share / trend, a
 # village/block/constituency breakdown or a set question: the single-scheme logic
 # owns it, so the deterministic comparison steps aside.
@@ -5551,14 +5635,19 @@ _XS_YEAR_WORDS = re.compile(r"\b(?:financial|fiscal)\s+years?\b", re.IGNORECASE)
 # Money is in crore: MGNREGA total_exp is LAKH (/100), every other scheme RUPEES
 # (/1e7). CM Elevate has no money of any kind, so it has no money entry.
 _XS_MEASURES: "dict[tuple[str, str], tuple[str, str, str | None, str | None]]" = {
-    ("MGNREGA", "count"): ("v_employment", "SUM(households_employed)", None,
-                           "year_key = (SELECT MAX(year_key) FROM curated.v_employment)"),
+    # Every year, not the latest only: the user asked 2026-10-15 for all MGNREGA years in
+    # the cross-scheme beneficiary count. There is no household id to dedupe across
+    # years, so the answer says a household is counted once per year it got work.
+    ("MGNREGA", "count"): ("v_employment", "SUM(households_employed)", None, None),
     ("MGNREGA", "money"): ("v_expenditure", "SUM(total_exp) / 100.0", None, None),
-    ("PMAY-G", "count"): ("v_pmay", "COUNT(*)", None, "NOT is_placeholder"),
+    # Every house record, the 126 with no sanction date / year / amount included:
+    # PMAY-G beneficiaries = 171,107 (KI-127; user 2026-10-16, cross UAT KI-233).
+    ("PMAY-G", "count"): ("v_pmay", "COUNT(*)", None, None),
     ("PMAY-G", "money"): ("v_pmay", "SUM(amount_released) / 1e7", None, "NOT is_placeholder"),
     ("Focus Plus", "count"): ("v_focus_plus", "COUNT(DISTINCT beneficiary_key)", None, None),
     ("Focus Plus", "money"): ("v_focus_plus", "SUM(amount_disbursed) / 1e7", None, None),
-    ("CM Elevate", "count"): ("v_cm_elevate", "COUNT(DISTINCT request_id)", None, None),
+    # valid applicants only — the CM Elevate default scope (KI-232, user decision 2026-10-14)
+    ("CM Elevate", "count"): ("v_cm_elevate", "COUNT(DISTINCT request_id)", None, "data_verified = 'Valid'"),
     ("Focus Legacy", "count"): ("v_focus_legacy", "SUM(no_of_pg_members)",
                                 "COUNT(DISTINCT pg_id)", None),
     ("Focus Legacy", "money"): ("v_focus_legacy", "SUM(amount_disbursed) / 1e7", None, None),
@@ -5604,47 +5693,107 @@ def _cross_scheme_compare_plan(question: str) -> "dict | None":
     """The schemes, measures and grain of a cross-scheme comparison this module
     answers deterministically, or None to leave the question on its normal path."""
     q = question or ""
+    # "How do Focus Plus beneficiary numbers compare with the old FOCUS …" is a data
+    # comparison, not how a scheme works (cross UAT T02.2: the model path then failed
+    # after the year chip).
+    know = re.sub(r"\bhow\s+(?:do|does)\b", " ", q, flags=re.IGNORECASE) if re.search(
+        r"\bhow\s+(?:do|does)\b[^?.!]{0,80}\bcompare\b", q, re.IGNORECASE) else q
     if not q or _CROSS_SCHEME_SET_QUESTION.search(q) or _XS_NOT_COVERED.search(q) \
-            or _XS_KNOWLEDGE_CUE.search(q):
+            or _XS_KNOWLEDGE_CUE.search(know):
         return None
     scrub = _XS_YEAR_WORDS.sub(" ", _ALL_YEARS_CUE.sub(" ", q))
+    year_key = None
     if _XS_SPECIFIC_YEAR.search(scrub):
-        return None
+        # One named FY, e.g. "… each cover in FY 2025-26?" (cross UAT T01.3, KI-238):
+        # the model counted Focus Legacy producer groups as beneficiaries. Only an
+        # explicit single FY, for counts and money; every other dated shape keeps
+        # its own path.
+        if _XS_RELATIVE_YEAR.search(scrub):
+            return None
+        years = {_parse_year_key(t.group(1)) for t in _year_tokens_in(scrub)}
+        years.discard(None)
+        if len(years) != 1:
+            return None
+        year_key = years.pop()
     named = _named_schemes(q)
+    excluded = _excluded_schemes(q)
     if len(named) >= 2:
-        if set(named) <= {"MGNREGA", "PMAY-G"}:
+        if set(named) <= {"MGNREGA", "PMAY-G"} and not excluded:
             return None
         schemes = [s for s in SCHEME_CATALOG if s in named]
-    elif not named and _XS_ACROSS_CUE.search(q):
-        schemes = list(SCHEME_CATALOG)
+    elif not named and (_XS_ACROSS_CUE.search(q) or excluded):
+        schemes = [s for s in _XS_DEFAULT_SCHEMES if s not in excluded]
+        if len(schemes) < 2:
+            return None
     else:
         return None
     families = [f for f, rx in (("count", _XS_COUNT_CUE), ("money", _XS_MONEY_CUE),
                                 ("coverage", _XS_COVERAGE_CUE)) if rx.search(scrub)]
+    # "How many beneficiaries did … each cover" — the verb, not a coverage ask.
+    if "count" in families and "coverage" in families and not re.search(
+            r"\bcoverage\b|\bgeographic\w*|\bfootprint\b|\bwidest\b|\bspread\b", scrub, re.IGNORECASE):
+        families.remove("coverage")
     if not families:
-        if not _XS_OVERVIEW_CUE.search(scrub):
+        if _XS_OVERVIEW_CUE.search(scrub):
+            families = ["count", "money"]
+        elif _XS_SIZE_CUE.search(scrub):
+            families = ["count"]
+        else:
             return None
-        families = ["count", "money"]
+    # One FY: counts and money ("disbursed under Focus+ and FOCUS in FY 2025-26", cross UAT
+    # T04.3, where the model SQL kept reading the MGNREGA/PMAY money view); not coverage.
+    if year_key is not None and (not set(families) <= {"count", "money"}
+                                 or not set(schemes) <= _XS_YEAR_VIEWS):
+        return None
+    top = _XS_TOP_N.search(q)
+    ordinal = _XS_ORDINAL.search(q)
+    pair = None
+    pm = _XS_PAIR_CUE.search(q)
+    if pm and len(schemes) == 2:
+        pos = {s: [m.start() for m in _SCHEME_NAME_PATTERN[s].finditer(q)] for s in schemes}
+        a = [s for s in schemes if any(x < pm.start() for x in pos[s])]
+        b = [s for s in schemes if any(x > pm.end() for x in pos[s])]
+        if a and b and a[-1] != b[0]:
+            pair = (a[-1], b[0], pm.group(1).lower() in _XS_PAIR_LESS)
+    rank = bool(_CROSS_SCHEME_SUPERLATIVE.search(q) or _XS_RANK_CUE.search(q))
+    # "Which scheme has the highest total …" asks for each scheme's total, not their sum.
+    combined = bool(_XS_COMBINED_CUE.search(scrub)) and not (
+        rank and not re.search(r"\bcombined\b|\baltogether\b|\bin\s+all\b|\bsum\b|\badd(?:ed)?\s+",
+                               scrub, re.IGNORECASE))
+    after = None
+    if ordinal:
+        am = _XS_AFTER_SCHEME.search(q, ordinal.end())
+        if am:
+            after = next((s for s in schemes if _SCHEME_NAME_PATTERN[s].search(q[am.end():am.end() + 40])), None)
     return {
         "schemes": schemes, "families": families,
         "by_district": bool(_XS_BY_DISTRICT_CUE.search(q)),
-        "rank": bool(_CROSS_SCHEME_SUPERLATIVE.search(q) or _XS_RANK_CUE.search(q)),
+        "rank": rank,
         "top_district": bool(_XS_TOP_DISTRICT_CUE.search(q)),
+        "top_n": (int(top.group(1)) if top.group(1).isdigit() else _XS_WORD_NUM[top.group(1).lower()])
+        if top else None,
+        "place": ({"second": 2, "2nd": 2, "third": 3, "3rd": 3}[ordinal.group(1).lower()]
+                  if ordinal else None),
+        "after": after,
+        "pair": pair,
+        "combined": combined,
+        "year_key": year_key,
     }
 
 
 def _xs_query(scheme: str, family: str, area: "tuple[str, list[str]] | None",
-              grouped: bool) -> "tuple[str, list] | None":
+              grouped: bool, year_key: "int | None" = None) -> "tuple[str, list] | None":
     """One parameter-bound query: a scheme's figure for one measure, for the whole
-    State or an area, optionally per district. None when the scheme has no such
-    measure (CM Elevate money)."""
+    State or an area, optionally per district, optionally for one FY. None when
+    the scheme has no such measure (CM Elevate money)."""
     if family == "coverage":
         view = _XS_COVERAGE_VIEW[scheme]
         # The Unresolved placeholder is never a real village (schema_context.py,
-        # every scheme that has one) — off village counts only. PMAY-G has none.
+        # every scheme that has one) — off village counts only. PMAY-G has none,
+        # and counts the villages of every house record, 5,121 (KI-233).
         value = ("COUNT(DISTINCT village_code)" if scheme == "PMAY-G" else
                  "COUNT(DISTINCT village_code) FILTER (WHERE entity_type IS DISTINCT FROM 'Unresolved')")
-        extra, fixed = "COUNT(DISTINCT lgd_district)", ("NOT is_placeholder" if scheme == "PMAY-G" else None)
+        extra, fixed = "COUNT(DISTINCT lgd_district)", None
     else:
         spec = _XS_MEASURES.get((scheme, family))
         if spec is None:
@@ -5656,7 +5805,10 @@ def _xs_query(scheme: str, family: str, area: "tuple[str, list[str]] | None",
         # Focus Plus maps blocks on block_name_raw (lgd_block is NULL on 15% of rows).
         col = "UPPER(block_name_raw)" if area[0] == "block" and scheme == "Focus Plus" else f"lgd_{area[0]}"
         params.append(area[1])
-        conds.append(f"{col} = ANY($1::text[])")
+        conds.append(f"{col} = ANY(${len(params)}::text[])")
+    if year_key is not None:
+        params.append(int(year_key))
+        conds.append(f"year_key = ${len(params)}")
     if grouped:
         conds.append("lgd_district IS NOT NULL")
     cols = (["lgd_district AS district"] if grouped else []) + [f"{value} AS value"] + \
@@ -5670,11 +5822,14 @@ def _xs_query(scheme: str, family: str, area: "tuple[str, list[str]] | None",
 
 
 def _xs_shown(sql: str, params: list) -> str:
-    """The query as shown to the user: the bound area list written in."""
-    if not params:
-        return sql
-    lits = ", ".join("'" + str(v).replace("'", "''") + "'" for v in params[0])
-    return sql.replace("$1::text[]", f"ARRAY[{lits}]")
+    """The query as shown to the user: the bound area list and year written in."""
+    for i, v in enumerate(params, 1):
+        if isinstance(v, list):
+            lits = ", ".join("'" + str(x).replace("'", "''") + "'" for x in v)
+            sql = sql.replace(f"${i}::text[]", f"ARRAY[{lits}]")
+        else:
+            sql = re.sub(rf"\${i}\b", str(v), sql)
+    return sql
 
 
 def _xs_number(family: str, v) -> "float | int":
@@ -5683,10 +5838,15 @@ def _xs_number(family: str, v) -> "float | int":
     return round(float(v), 2) if family == "money" else int(v)
 
 
-def _xs_count_text(scheme: str, v: int, x: "int | None", latest_fy: str) -> str:
+def _xs_count_text(scheme: str, v: int, x: "int | None", mg_years: str,
+                   year_key: "int | None" = None) -> str:
+    fy = f"in FY {_fy_short(year_key)}" if year_key is not None else None
     return {
-        "MGNREGA": f"{v:,} households given work in {latest_fy}",
-        "PMAY-G": f"{v:,} houses sanctioned",
+        "MGNREGA": (f"{v:,} households given work {fy}" if fy else
+                    f"{v:,} households given work, {mg_years} combined (a household given "
+                    "work in more than one year is counted once for each year)"),
+        # every house record, the 126 not yet sanctioned included (KI-127 / KI-233)
+        "PMAY-G": f"{v:,} houses (beneficiaries — every house record)",
         "Focus Plus": f"{v:,} beneficiaries (individual farmers paid)",
         "CM Elevate": f"{v:,} applicants (applications received — a request, not proof of funding)",
         "Focus Legacy": f"{v:,} memberships paid for, in {x or 0:,} producer groups "
@@ -5707,12 +5867,26 @@ def _xs_place(area: "tuple[str, list[str]] | None", display: dict) -> str:
     return ", ".join(names[:-1]) + " and " + names[-1]
 
 
+# Units named when counts or amounts are shown together or added (KI-236).
+_XS_UNITS = {"MGNREGA": "households", "PMAY-G": "houses", "Focus Plus": "farmers",
+             "CM Elevate": "applications", "Focus Legacy": "memberships",
+             "CM Elevate Legacy": "applicant records", "NRLM": "SHG members"}
+_XS_FAMILY_WORD = {"count": "beneficiaries", "money": "money", "coverage": "villages covered"}
+
+
+def _xs_fmt(fam: str, v) -> str:
+    return f"₹{v:,.2f} crore" if fam == "money" else f"{v:,}"
+
+
 async def _cross_scheme_compare_answer(question: str, plan: dict, entity_result: dict,
                                        scope: "auth.UserScope | None" = None) -> "dict | None":
     """Answer a cross-scheme comparison from fixed queries (see the block comment
     above). None when the resolved scope is one this module does not cover."""
     resolved = dict(entity_result.get("resolved") or {})
-    if resolved.get("year_key") and _ALL_YEARS_CUE.search(question or ""):
+    year_key = plan.get("year_key")
+    if resolved.get("year_key") and (
+            _ALL_YEARS_CUE.search(question or "")
+            or (year_key is not None and int(resolved["year_key"]) == int(year_key))):
         resolved.pop("year_key")
     allowed = {"district", "district_list", "district_list_region", "block"}
     if any(v for k, v in resolved.items() if k not in allowed):
@@ -5733,17 +5907,16 @@ async def _cross_scheme_compare_answer(question: str, plan: dict, entity_result:
     by_district = (plan["by_district"] and (area is None or (area[0] == "district" and len(area[1]) >= 2))) \
         or (area is not None and area[0] == "district" and len(area[1]) >= 2)
     place = _xs_place(area, display)
-    # MGNREGA households are counted afresh each year with no household id to
-    # dedupe across years, so the figure is the latest year's (schema_context.py
-    # FAMILY C: "a single latest year_key for MGNREGA households_employed").
-    _mg_years = sorted(_SCHEME_DATA_YEARS.get("MGNREGA") or [], key=_fy_start)
-    latest_fy = f"FY {_mg_years[-1]}" if _mg_years else "the latest year"
+    fy = _fy_short(year_key) if year_key is not None else None
+    # MGNREGA households are summed over every year (user, 2026-10-15). They are
+    # counted afresh each year with no household id to dedupe, so the text says so.
+    mg_years = _scheme_years_text("MGNREGA")
 
     jobs = []
     for fam in families:
         for s in schemes:
             for grouped in ((False, True) if by_district else (False,)):
-                q = _xs_query(s, fam, area, grouped)
+                q = _xs_query(s, fam, area, grouped, year_key)
                 if q is not None:
                     jobs.append((s, fam, grouped, q[0], q[1]))
     shown = ";\n\n".join(_xs_shown(sql, params) for _s, _f, g, sql, params in jobs if not g)
@@ -5772,11 +5945,17 @@ async def _cross_scheme_compare_answer(question: str, plan: dict, entity_result:
             r = rows[0] if rows else {}
             total[(s, fam)] = (_xs_number(fam, r.get("value")),
                                _xs_number("count", r.get("extra")) if "extra" in r else None)
-    logger.info("cross-scheme deterministic answer: schemes=%s families=%s area=%s by_district=%s",
-                schemes, families, area, by_district)
+    logger.info("cross-scheme deterministic answer: schemes=%s families=%s area=%s by_district=%s year=%s",
+                schemes, families, area, by_district, year_key)
 
+    def _summable(fam: str) -> "list[str]":
+        return [s for s in schemes if not (fam == "money" and s == "CM Elevate")]
+
+    # A combined figure only when asked for, and labelled as adding unlike units (KI-236).
+    combine = plan.get("combined") and len(schemes) > 1
     heading = {"count": "Beneficiaries / applications", "money": "Money", "coverage": "Coverage"}
-    lines = [f"{'Across' if area is None or by_district else 'In'} {place}, each scheme's own figure:"]
+    where = f"{'Across' if area is None or by_district else 'In'} {place}"
+    lines = [f"{where}{f' in FY {fy}' if fy else ''}, each scheme's own figure:"]
     for fam in families:
         if len(families) > 1:
             lines.append(f"\n**{heading[fam]}**")
@@ -5787,14 +5966,23 @@ async def _cross_scheme_compare_answer(question: str, plan: dict, entity_result:
                 continue
             v, x = total.get((s, fam), (0, None))
             if fam == "count":
-                txt = _xs_count_text(s, v, x, latest_fy)
+                txt = _xs_count_text(s, v, x, mg_years, year_key)
             elif fam == "money":
                 txt = f"₹{v:,.2f} crore — {_MEASURE_PLAIN.get(s, 'amount')}"
             else:
                 txt = f"{v:,} villages" + ("" if area else f" in {x or 0} districts")
-            if not v and area:
+            if fy and not v and fy not in (_SCHEME_DATA_YEARS.get(s) or []):
+                txt = f"none — no {s} records in FY {fy} (its data covers {_scheme_years_text(s)})"
+            elif not v and area:
                 txt += f" (none recorded in {place})"
             lines.append(f"- **{s}** — {txt}")
+        if combine and fam != "coverage":
+            pool = _summable(fam)
+            tot = sum(total.get((s, fam), (0, None))[0] for s in pool)
+            what = (" + ".join(_XS_UNITS[s] for s in pool) if fam == "count"
+                    else "different kinds of money")
+            lines.append(f"- **Combined** — {_xs_fmt(fam, round(tot, 2) if fam == 'money' else tot)} "
+                         f"(adds {what}, so it is indicative only)")
 
     def _lead(fam: str, vals: "dict[str, tuple]") -> "list[str]":
         pool = {s: t for s, t in vals.items() if not (fam == "money" and s == "CM Elevate")}
@@ -5817,14 +6005,67 @@ async def _cross_scheme_compare_answer(question: str, plan: dict, entity_result:
                 lines.append(f"\nWidest coverage: {who} — {v:,} villages"
                              + ("" if area else f" across {x or 0} districts") + ".")
             else:
-                lines.append(f"\nLargest figure: {who} ({_xs_count_text(top[0], v, x, latest_fy)}).")
+                lines.append(f"\nLargest figure: {who} ({_xs_count_text(top[0], v, x, mg_years, year_key)}).")
+        # "Rank MGNREGA, PMAY-G, Focus+ and FOCUS on coverage, beneficiaries and money"
+        # (cross UAT T20.2, KI-237): the order, for every measure asked.
+        if len(schemes) > 2:
+            for fam in families:
+                pool = _summable(fam)
+                order = sorted(pool, key=lambda s: -total.get((s, fam), (0, None))[0])
+                lines.append(f"Order by {_XS_FAMILY_WORD[fam]}: " + " > ".join(
+                    f"{s} ({_xs_fmt(fam, total.get((s, fam), (0, None))[0])})" for s in order) + ".")
+    pair = plan.get("pair")
+    if pair and not by_district:
+        a, b, less = pair
+        fam = rank_fam
+        va, vb = total.get((a, fam), (0, None))[0], total.get((b, fam), (0, None))[0]
+        rel = "more than" if va > vb else ("fewer than" if va < vb else "the same as")
+        lines.append(f"\n{a} has {rel} {b} in {place}: {_xs_fmt(fam, va)} vs {_xs_fmt(fam, vb)}.")
 
     rows_out: list[dict] = []
+    combined_by_d: dict = {}
     if by_district:
         dists = area[1] if area and area[0] == "district" else sorted(
             {d for t in per_d.values() for d in t if d})
         lead_fam = rank_fam if rank_fam in families else families[0]
-        if plan["rank"] and len(schemes) > 1:
+
+        def dval(s: str, d: str, fam: str = None):
+            return per_d.get((s, fam or lead_fam), {}).get(d, (0, None))[0]
+        if pair:
+            # T03.3: "In which districts does Focus+ have more beneficiaries than PMAY-G?"
+            a, b, less = pair
+            hits = [d for d in dists if (dval(a, d) < dval(b, d) if less else dval(a, d) > dval(b, d))]
+            rel = "fewer" if less else "more"
+            word = _XS_FAMILY_WORD[lead_fam]
+            if hits:
+                lines.append(f"\n{a} has {rel} {word} than {b} in {len(hits)} "
+                             f"district{'s' if len(hits) != 1 else ''}:")
+                for d in hits:
+                    lines.append(f"- {str(d).title()} ({a} {_xs_fmt(lead_fam, dval(a, d))} vs "
+                                 f"{b} {_xs_fmt(lead_fam, dval(b, d))})")
+                lines.append(f"In the other {len(dists) - len(hits)} districts it does not.")
+            else:
+                lines.append(f"\n{a} has {rel} {word} than {b} in none of the {len(dists)} districts.")
+        elif plan.get("place") and len(schemes) > 1:
+            # T18.2: "which of PMAY-G, Focus+ and FOCUS comes second after MGNREGA?"
+            nth = plan["place"]
+            after = plan.get("after")
+            pool = [s for s in _summable(lead_fam) if s != after]
+            idx = nth - 2 if after else nth - 1
+            ordw = {2: "Second", 3: "Third"}.get(nth, f"#{nth}")
+            lines.append(f"\n{ordw}-largest figure by district" + (f" (after {after})" if after else "") + ":")
+            tally: dict = {}
+            for d in dists:
+                order = sorted(pool, key=lambda s: -dval(s, d))
+                if 0 <= idx < len(order) and dval(order[idx], d):
+                    s = order[idx]
+                    tally.setdefault(s, []).append(str(d).title())
+                    lines.append(f"- {str(d).title()}: **{s}** ({_xs_fmt(lead_fam, dval(s, d))})")
+            if tally:
+                lines.append("In all: " + "; ".join(
+                    f"{s} in {len(ds)} district{'s' if len(ds) != 1 else ''}"
+                    for s, ds in sorted(tally.items(), key=lambda kv: -len(kv[1]))) + ".")
+        elif plan["rank"] and len(schemes) > 1:
             leaders: dict = {}
             for d in dists:
                 top = _lead(lead_fam, {s: per_d.get((s, lead_fam), {}).get(d, (0, None)) for s in schemes})
@@ -5838,6 +6079,26 @@ async def _cross_scheme_compare_answer(question: str, plan: dict, entity_result:
                 for who, ds in sorted(leaders.items(), key=lambda kv: -len(kv[1])):
                     lines.append(f"- **{who}** — {len(ds)} district{'s' if len(ds) != 1 else ''} "
                                  f"({', '.join(ds)})")
+        elif plan["top_district"] and len(schemes) > 1 and lead_fam != "coverage":
+            # T15.x: districts ranked by the schemes' figures added together (KI-236).
+            pool = _summable(lead_fam)
+            combined_by_d = {d: sum(dval(s, d) for s in pool) for d in dists}
+            grand = sum(combined_by_d.values()) or 1
+            ranked = sorted(dists, key=lambda d: -combined_by_d[d])
+            n = plan.get("top_n") or min(5, len(ranked))
+            what = (" + ".join(_XS_UNITS[s] for s in pool) if lead_fam == "count"
+                    else "different kinds of money")
+            lines.append(f"\nTop {min(n, len(ranked))} district{'s' if n != 1 else ''} by combined "
+                         f"{_XS_FAMILY_WORD[lead_fam]} ({', '.join(pool)}; adds {what}, so indicative only):")
+            for i, d in enumerate(ranked[:n], 1):
+                v = round(combined_by_d[d], 2) if lead_fam == "money" else combined_by_d[d]
+                parts = ", ".join(f"{s} {_xs_fmt(lead_fam, dval(s, d))}" for s in pool)
+                lines.append(f"{i}. {str(d).title()}: {_xs_fmt(lead_fam, v)} "
+                             f"({combined_by_d[d] / grand:.1%}) — {parts}")
+            if len(ranked) > n:
+                lo = ranked[-1]
+                v = round(combined_by_d[lo], 2) if lead_fam == "money" else combined_by_d[lo]
+                lines.append(f"Lowest: {str(lo).title()} ({_xs_fmt(lead_fam, v)}).")
         else:
             lines.append("\nWhere each scheme is highest" +
                          (" and lowest" if not plan["top_district"] else "") + ":")
@@ -5867,6 +6128,9 @@ async def _cross_scheme_compare_answer(question: str, plan: dict, entity_result:
                         row[f"{s} (₹ crore)"] = v
                     else:
                         row[f"{s} villages"] = v
+            if combined_by_d:
+                row["Combined (indicative)"] = round(combined_by_d[d], 2) if lead_fam == "money" \
+                    else combined_by_d[d]
             rows_out.append(row)
     else:
         for fam in families:
@@ -5880,24 +6144,22 @@ async def _cross_scheme_compare_answer(question: str, plan: dict, entity_result:
 
     if len(schemes) > 1:
         notes = []
+        added = combine or bool(combined_by_d)
         if "count" in families:
-            units = {"MGNREGA": "households", "PMAY-G": "houses", "Focus Plus": "farmers",
-                     "CM Elevate": "applications", "Focus Legacy": "memberships",
-                     "CM Elevate Legacy": "applicant records", "NRLM": "SHG members"}
-            named = [units[s] for s in schemes if s in units]
+            named = [_XS_UNITS[s] for s in schemes if s in _XS_UNITS]
             notes.append("The counts measure different things — " + ", ".join(named[:-1]) +
-                         f" and {named[-1]} — so they are shown side by side and never added together.")
+                         f" and {named[-1]} — so "
+                         + ("any combined figure adds different units and is indicative only."
+                            if added else "they are shown side by side and never added together."))
         if "money" in families:
             notes.append("The amounts are different kinds of money (expenditure incurred, money "
                          "released, cash disbursed, remittances to groups), so they compare only "
-                         "indicatively and are not added together.")
-        win = []
-        for s in schemes:
-            yrs = _scheme_years_text(s)
-            if s == "MGNREGA" and "count" in families:
-                yrs += f" (households: {latest_fy} only — they cannot be added across years)"
-            win.append(f"{s} {yrs}")
-        notes.append("Years covered: " + "; ".join(win) + ".")
+                         "indicatively" + (" and any combined amount is indicative only."
+                                           if added else " and are not added together."))
+        if fy:
+            notes.append(f"Financial year: FY {fy}.")
+        else:
+            notes.append("Years covered: " + "; ".join(f"{s} {_scheme_years_text(s)}" for s in schemes) + ".")
         lines.append("\n" + " ".join(notes))
     return {
         "route": "data", "intent": "DATA", "confidence": "high", "schemes": schemes,
@@ -5916,7 +6178,11 @@ async def _cross_scheme_compare_data(question: str, plan: dict,
     _near = acronym_near_misses(question)
     if _near:
         raise _acronym_near_miss_clarification(question, _near)
-    entity_result = await resolve_entities(question, schemes, prior_resolved=prior_resolved,
+    # A named FY is applied by the comparison itself, per scheme (a scheme without
+    # that year reads "none"); resolving it here would trip the year-gap rewrite
+    # for a scheme that lacks it (PMAY-G has no FY 2025-26).
+    place_q = _ANY_YEAR_PHRASE_RE.sub(" ", question) if plan.get("year_key") is not None else question
+    entity_result = await resolve_entities(place_q, schemes, prior_resolved=prior_resolved,
                                             village_hint=village_hint)
     if entity_result.get("question"):          # a year-gap rewrite: the normal path owns it
         return None
@@ -6396,8 +6662,45 @@ def _named_schemes(question: str) -> list[str]:
     of being understood."""
     exact = [s for s, pattern in _SCHEME_NAME_PATTERN.items() if pattern.search(question)]
     if exact:
-        return exact
+        # A scheme the question EXCLUDES is not one it names (KI-234). Never fall
+        # back to fuzzy matching here: it would find the excluded name again.
+        excluded = _excluded_schemes(question)
+        return [s for s in exact if s not in excluded]
     return _fuzzy_named_schemes(question)
+
+
+# "Leaving out MGNREGA and CM-ELEVATE, which scheme has the most beneficiaries in
+# each district?" compared exactly the two schemes it excluded; "Excluding MGNREGA,
+# which districts …" kept MGNREGA; "scheme-wise spending …, excluding CM-ELEVATE"
+# became a CM Elevate reference-material answer (cross UAT 2026-10-15 T07.2 / T15.3 /
+# T11.2 / T12.2, KI-234). The exclusion runs from the cue to the end of its clause.
+_EXCLUSION_CUE = re.compile(
+    r"\b(?:excluding|exclude|leaving\s+out|leave\s+out|except(?:\s+for)?|other\s+than|"
+    r"apart\s+from|not\s+counting|barring|without)\b",
+    re.IGNORECASE)
+_EXCLUSION_CLAUSE_END = re.compile(
+    r"[,;:?.!]|\b(?:which|what|how|across|among|in\s+each|for\s+each|by\s+district|"
+    r"district[\s-]?wise|in\s+(?:the\s+)?(?:state|meghalaya))\b",
+    re.IGNORECASE)
+
+
+def _excluded_schemes(question: str) -> set:
+    """The schemes the question asks to leave out ("excluding X", "leaving out X
+    and Y", "except X")."""
+    q = question or ""
+    out: set = set()
+    for m in _EXCLUSION_CUE.finditer(q):
+        rest = q[m.end():]
+        end = _EXCLUSION_CLAUSE_END.search(rest)
+        span = rest[:end.start()] if end else rest
+        # "excluding CM-ELEVATE" also leaves out its Legacy dataset: the officer
+        # means the CM Elevate scheme, whichever of its two datasets.
+        for s, pattern in _SCHEME_NAME_PATTERN.items():
+            if pattern.search(span):
+                out.add(s)
+                if s in ("CM Elevate", "CM Elevate Legacy"):
+                    out |= {"CM Elevate", "CM Elevate Legacy"}
+    return out
 
 
 def _shortcut_scheme(question: str) -> list[str] | None:
@@ -11785,8 +12088,14 @@ _CME_LEVEL_PENDING_Q = re.compile(
 _CME_ON_HOLD_PRED = r"(?:\w+\.)?data_verified\s*=\s*'On Hold'"
 
 
-_CME_FILE_PENDING_PRED = "scheme_specific ->> 'file_status' = 'Pending'"
-_CME_FILE_PENDING_RE = re.compile(r"(?:\w+\.)?scheme_specific\s*->>\s*'file_status'\s*=\s*'Pending'", re.IGNORECASE)
+# "pending" = file_status Pending or Send Back (user decision 2026-10-14, KI-232).
+_CME_FILE_PENDING_PRED = "scheme_specific ->> 'file_status' IN ('Pending', 'Send Back')"
+_CME_FILE_PENDING_RE = re.compile(
+    r"(?:\w+\.)?scheme_specific\s*->>\s*'file_status'\s*(?:=\s*'Pending'|"
+    r"IN\s*\(\s*'(?:Pending|Send Back)'\s*,\s*'(?:Pending|Send Back)'\s*\))", re.IGNORECASE)
+_CME_FILE_PENDING_ONLY_RE = re.compile(r"(?:\w+\.)?scheme_specific\s*->>\s*'file_status'\s*=\s*'Pending'",
+                                       re.IGNORECASE)
+_CME_NOT_PLAIN_PENDING_Q = re.compile(r"on[\s-]?hold|\bheld\b|verif\w*|\bfile[\s_-]*status\b", re.IGNORECASE)
 
 
 def _cm_elevate_level_pending(question: str, schemes: list[str], sql: str) -> str:
@@ -11801,7 +12110,10 @@ def _cm_elevate_level_pending(question: str, schemes: list[str], sql: str) -> st
     still Pending (scheme_specific ->> 'file_status' = 'Pending'), so the 64
     Rejected and 1 Approved level-1 files are not "pending" — level 1 = 8,307.
     current_file_status holds no pending value (forward / sendback / resubmit).
-    Plain "pending" with no level stays data_verified = 'On Hold' (KI-074)."""
+    KI-232 (user decision 2026-10-14): "pending" = file_status Pending OR Send Back,
+    so a level test carries IN ('Pending', 'Send Back') and an old = 'Pending' test
+    is widened (level 0 = its 90 Send Back files). Plain "pending" (no level) is the
+    same file_status test — no longer On Hold (_cm_elevate_plain_pending)."""
     if (schemes != ["CM Elevate"] or not sql or not _CME_LEVEL_PENDING_Q.search(question or "")
             or re.search(r"\bon[\s-]?hold\b", question or "", re.IGNORECASE)
             or not re.search(r"\bcurrent_level\b", sql, re.IGNORECASE)):
@@ -11811,6 +12123,9 @@ def _cm_elevate_level_pending(question: str, schemes: list[str], sql: str) -> st
         out = _drop_where_conjunct(out, _CME_ON_HOLD_PRED)
         if out != sql:
             logger.info("CM Elevate: 'pending at level N' — dropped the On Hold filter, level is the scope")
+    if _CME_FILE_PENDING_ONLY_RE.search(out):
+        out = _CME_FILE_PENDING_ONLY_RE.sub(_CME_FILE_PENDING_PRED, out)
+        logger.info("CM Elevate: 'pending at level N' — file_status widened to Pending + Send Back (KI-232)")
     if not _CME_FILE_PENDING_RE.search(out) and re.search(_CME_LEVEL_PRED, out, re.IGNORECASE):
         # every level test (WHERE or COUNT FILTER) carries the Pending state with it
         out = re.sub(_CME_LEVEL_PRED, lambda m: f"({m.group(0)} AND {_CME_FILE_PENDING_PRED})", out,
@@ -11921,18 +12236,22 @@ def _cm_elevate_pending_without_level(question: str, schemes: list[str], sql: st
     """The other side of KI-070, found in its own re-test (2026-09-27): "which
     programs have the highest number of pending applications" — no level named —
     came back as current_level = 'level1' (SEED 3,633 "pending" against a true
-    286 on hold). A plain "pending" is data_verified = 'On Hold' (vocabulary);
-    a level filter the question never asked for is swapped back to it."""
+    286 on hold). A level filter the question never asked for is swapped for the
+    plain "pending" test — file_status Pending / Send Back since 2026-10-14
+    (KI-232; it was data_verified = 'On Hold' before)."""
     q = question or ""
     if (schemes != ["CM Elevate"] or not sql or not re.search(r"\bpending\b|\bpendency\b", q, re.IGNORECASE)
             or re.search(r"\blevel\s*-?\s*\d|\blevels?\b|\bstage\b", q, re.IGNORECASE)
-            or re.search(_CME_ON_HOLD_PRED, sql, re.IGNORECASE)
+            or _CME_NOT_PLAIN_PENDING_Q.search(q)
             or len(re.findall(_CME_ANY_LEVEL_PRED, sql, re.IGNORECASE)) != 1):
         return sql
     # any level literal, not just 'level<d>': "pending in 12TH MER" came back as
     # current_level = 'level12' (final pass 2026-09-28, KI-120)
-    logger.info("CM Elevate: plain 'pending' was filtered on current_level — restored data_verified = 'On Hold'")
-    return re.sub(_CME_ANY_LEVEL_PRED, "data_verified = 'On Hold'", sql, flags=re.IGNORECASE)
+    if _CME_FILE_PENDING_RE.search(sql):
+        logger.info("CM Elevate: plain 'pending' carried an unasked current_level filter — dropped")
+        return _drop_where_conjunct(sql, _CME_ANY_LEVEL_PRED)
+    logger.info("CM Elevate: plain 'pending' was filtered on current_level — restored the file_status test")
+    return re.sub(_CME_ANY_LEVEL_PRED, _CME_FILE_PENDING_PRED, sql, flags=re.IGNORECASE)
 
 
 _CME_FILE_STATUS_WORDS_Q = re.compile(r"\bstatus\b|sen[dt][\s-]*back|\bforward\w*|\bresubmit\w*|\blevels?\b|\bstage\b",
@@ -11945,13 +12264,14 @@ def _cm_elevate_plain_pending_file_status(question: str, schemes: list[str], sql
     pending applications?" came back 4 times in 6 as
     WHERE LOWER(current_file_status) LIKE 'sendback%' OR current_file_status IS NULL
     ("Tourism Vehicle 89" against the true On Hold leader Piggery 472). A plain
-    "pending" (no level / stage / status / sent-back word) is data_verified =
-    'On Hold' (KI-074): a WHERE whose conjunct tests only current_file_status is
-    swapped back. Anything mixing other columns into that test is left alone."""
+    "pending" (no level / stage / status / sent-back word) has a WHERE conjunct
+    that tests only current_file_status swapped for the plain "pending" test —
+    file_status Pending / Send Back since 2026-10-14 (KI-232). Anything mixing
+    other columns into that test is left alone."""
     q = question or ""
     if (schemes != ["CM Elevate"] or not sql or not re.search(r"\bpending\b|\bpendency\b", q, re.IGNORECASE)
-            or _CME_FILE_STATUS_WORDS_Q.search(q) or re.search(r"on[\s-]?hold", q, re.IGNORECASE)
-            or re.search(_CME_ON_HOLD_PRED, sql, re.IGNORECASE)):
+            or _CME_FILE_STATUS_WORDS_Q.search(q) or _CME_NOT_PLAIN_PENDING_Q.search(q)
+            or _CME_FILE_PENDING_RE.search(sql)):
         return sql
     span = _top_level_where_span(sql)
     if not span:
@@ -11976,7 +12296,7 @@ def _cm_elevate_plain_pending_file_status(question: str, schemes: list[str], sql
                                               r"village_code|entity_type|scheme_specific|\w+_id)\b", conj_m, re.IGNORECASE)}
         if cols == {"current_file_status"}:
             if not swapped:
-                out_parts.append(" data_verified = 'On Hold' ")
+                out_parts.append(f" {_CME_FILE_PENDING_PRED} ")
                 swapped = True
             continue
         if "current_file_status" in cols:
@@ -11984,8 +12304,126 @@ def _cm_elevate_plain_pending_file_status(question: str, schemes: list[str], sql
         out_parts.append(conj)
     if not swapped:
         return sql
-    logger.info("CM Elevate: plain 'pending' was filtered on current_file_status — restored data_verified = 'On Hold'")
+    logger.info("CM Elevate: plain 'pending' was filtered on current_file_status — restored the file_status test")
     return sql[:span[1]] + " " + " AND ".join(p.strip() for p in out_parts) + " " + sql[span[2]:].lstrip()
+
+
+def _cm_elevate_plain_pending(question: str, schemes: list[str], sql: str) -> str:
+    """KI-232 (user decision 2026-10-14): "pending" = scheme_specific ->> 'file_status'
+    IN ('Pending', 'Send Back') — still undecided, files sent back included — and no
+    longer data_verified = 'On Hold' (KI-074 superseded; "on hold" keeps that test).
+    The generator's habits from the old rule are swapped, in the WHERE or inside a
+    COUNT FILTER: data_verified = 'On Hold' and a bare file_status = 'Pending'.
+    A question naming on hold / verification / file status is left as asked."""
+    q = question or ""
+    if (schemes != ["CM Elevate"] or not sql or not re.search(r"\bpending\b|\bpendency\b", q, re.IGNORECASE)
+            or _CME_NOT_PLAIN_PENDING_Q.search(q)):
+        return sql
+    out = re.sub(_CME_ON_HOLD_PRED, _CME_FILE_PENDING_PRED, sql, flags=re.IGNORECASE)
+    out = _CME_FILE_PENDING_ONLY_RE.sub(_CME_FILE_PENDING_PRED, out)
+    if out != sql:
+        logger.info("CM Elevate: plain 'pending' — On Hold / Pending-only test became file_status Pending + Send Back")
+    return out
+
+
+# KI-232 (user decision 2026-10-14): CM Elevate counts are of VALID applications
+# (data_verified = 'Valid') unless the question names a verification state itself,
+# or explicitly asks for ALL applications (then the total is shown with its split).
+_CME_VERIFICATION_NAMED_Q = re.compile(
+    r"verif\w*|\bvalid\b|\binvalid\b|\bwrong\b|on[\s-]?hold|\bheld\b|not[\s-]+recorded|unverified|"
+    r"data[\s_]verified", re.IGNORECASE)
+_CME_ALL_APPLICATIONS_Q = re.compile(
+    r"\ball\s+(?:the\s+)?(?:cm\s+elevate\s+)?(?:applications?|applicants?|records?|requests?)\b"
+    r"(?!\s+(?:in|under|for|at|from|of)\s+(?:each|every|all)\b)|"
+    r"\bevery\s+application\b|\bincluding\s+(?:the\s+)?(?:invalid|on[\s-]?hold|unverified|wrong|all)\b|"
+    r"\b(?:irrespective|regardless)\s+of\s+(?:the\s+)?(?:verification|data\s+verification|status)\b|"
+    r"\bwithout\s+(?:any\s+|the\s+)?(?:verification\s+)?filters?\b|\ball\s+verification\s+(?:states|statuses)\b",
+    re.IGNORECASE)
+_CME_VALID_PRED = "data_verified = 'Valid'"
+_CME_VIEW_RE = re.compile(r"\bcurated\.v_cm_elevate\b(?!_)|(?<![\w.])v_cm_elevate\b(?!_)", re.IGNORECASE)
+_CME_FROM_VIEW_RE = re.compile(
+    r"\b(FROM|JOIN)\s+((?:curated\.)?v_cm_elevate)\b(?!_)"
+    r"(?:\s+(?:AS\s+)?(?!(?:WHERE|GROUP|ORDER|LIMIT|HAVING|JOIN|LEFT|RIGHT|INNER|FULL|CROSS|ON|UNION|"
+    r"WINDOW|FETCH|OFFSET)\b)([A-Za-z_]\w*))?", re.IGNORECASE)
+_CME_VERIFICATION_ALIAS = "verification_state"
+
+
+def _cme_add_where(sql: str, pred: str) -> str:
+    """`pred` AND-ed into a simple query's own WHERE (created when absent). A body
+    with a top-level OR is parenthesised first, so the predicate binds to all of it."""
+    span = _top_level_where_span(sql)
+    masked = _mask_sql_literals(sql)
+    if span:
+        body = sql[span[1]:span[2]]
+        body_m = masked[span[1]:span[2]]
+        depth, has_or = 0, False
+        for m in re.finditer(r"[()]|\bOR\b", body_m, re.IGNORECASE):
+            depth += {"(": 1, ")": -1}.get(m.group(0), 0)
+            has_or = has_or or (m.group(0).upper() == "OR" and depth == 0)
+        core = body.rstrip()
+        tail_ws = body[len(core):]
+        core = f"({core.strip()})" if has_or else core.strip()
+        return sql[:span[1]] + f" {core} AND {pred}{tail_ws or ' '}" + sql[span[2]:].lstrip()
+    tail = re.search(r"\b(?:GROUP\s+BY|HAVING|ORDER\s+BY|LIMIT|OFFSET)\b|;\s*$", masked, re.IGNORECASE)
+    pos = tail.start() if tail else len(sql.rstrip())
+    return sql[:pos].rstrip() + f"\nWHERE {pred}\n" + sql[pos:].lstrip()
+
+
+def _cm_elevate_valid_default(question: str, schemes: list[str], sql: str) -> str:
+    """KI-232 (user decision 2026-10-14): every CM Elevate count — applications,
+    applicants, pending, level-wise — counts only VALID applications. Added to any
+    CM Elevate COUNT that has no data_verified test of its own, unless the question
+    names a verification state (answered as asked) or asks for all applications
+    (_cm_elevate_all_applications). A simple query gets the test in its own WHERE;
+    any other shape reads the view through a Valid-only subquery, so every CTE,
+    join and subquery is covered."""
+    q = question or ""
+    if (schemes != ["CM Elevate"] or not sql or not _CME_VIEW_RE.search(sql)
+            or _CME_VERIFICATION_NAMED_Q.search(q) or _CME_ALL_APPLICATIONS_Q.search(q)):
+        return sql
+    masked = _mask_sql_literals(sql)
+    if "data_verified" in masked.lower() or not re.search(r"\bCOUNT\s*\(", masked, re.IGNORECASE):
+        return sql
+    if _simple_select(masked) and len(_CME_FROM_VIEW_RE.findall(masked)) == 1:
+        out = _cme_add_where(sql, _CME_VALID_PRED)
+    else:
+        out = _CME_FROM_VIEW_RE.sub(
+            lambda m: f"{m.group(1)} (SELECT * FROM curated.v_cm_elevate WHERE {_CME_VALID_PRED}) AS "
+                      f"{m.group(3) or 'v_cm_elevate'}", sql)
+    if out != sql:
+        logger.info("CM Elevate: counts are of valid applications — added data_verified = 'Valid' (KI-232)")
+    return out
+
+
+def _cm_elevate_all_applications(question: str, schemes: list[str], sql: str) -> str:
+    """KI-232: "all applications" / "including invalid" / "irrespective of
+    verification" asks for every application. Any data_verified = 'Valid' test the
+    generator added from the default is dropped, and a single-figure count is split
+    by verification state (alias verification_state) so the answer shows the total
+    and what it is made of (_cme_all_applications_answer). A grouped query keeps its
+    shape, unfiltered."""
+    q = question or ""
+    if (schemes != ["CM Elevate"] or not sql or not _CME_VIEW_RE.search(sql)
+            or not _CME_ALL_APPLICATIONS_Q.search(q)):
+        return sql
+    out = _drop_where_conjunct(sql, r"(?:\w+\.)?data_verified\s*=\s*'Valid'")
+    masked = _mask_sql_literals(out)
+    sel = re.search(r"\bSELECT\s+(?!DISTINCT\b)", masked, re.IGNORECASE)
+    frm = re.search(r"\bFROM\b", masked, re.IGNORECASE)
+    if (not _simple_select(masked) or not sel or not frm or "data_verified" in masked.lower()
+            or re.search(r"\bGROUP\s+BY\b|\bHAVING\b", masked, re.IGNORECASE)):
+        return out
+    items = [x.strip() for x in re.split(r",(?![^()]*\))", masked[sel.end():frm.start()])]
+    if not items or not all(re.match(r"COUNT\s*\(", x, re.IGNORECASE) for x in items):
+        return out
+    head = (out[:sel.end()] + f"COALESCE(data_verified, '(not recorded)') AS {_CME_VERIFICATION_ALIAS}, "
+            + out[sel.end():])
+    om = _mask_sql_literals(head)
+    tail = re.search(r"\b(?:ORDER\s+BY|LIMIT|OFFSET)\b|;\s*$", om, re.IGNORECASE)
+    pos = tail.start() if tail else len(head.rstrip())
+    out = head[:pos].rstrip() + "\nGROUP BY 1\nORDER BY 2 DESC"
+    logger.info("CM Elevate: 'all applications' — no Valid filter, split by verification state (KI-232)")
+    return out
 
 
 # CM Elevate Legacy constituency SQL joins curated.dim_geography for ac_name, and
@@ -13203,12 +13641,23 @@ def _verifier_join_complaint_is_false(issue: str, sql: str) -> bool:
     if not joins and len(in_sql) <= 1:
         return True
     named = {t.lower() for t in _SQL_TABLE_REF.findall(issue or "")}
+    # A UNION ALL of single-view selects joins nothing: "Focus+ and Focus Legacy side by
+    # side" (SUM(no_of_pg_members) FROM curated.v_focus_legacy) was rejected three times
+    # as joining v_focus_legacy to curated.fact_focus_legacy_disbursement, a table the
+    # query never reads (cross UAT T19.2, 2026-10-16). Only when the query reads no fact
+    # or bridge table at all, so a privacy table in a subquery is still flagged.
+    if not joins and (named - in_sql) and not any(
+            re.search(r"\.(?:fact|bridge)_", t) for t in in_sql):
+        return True
     return bool(named) and not (named & in_sql)
 
 
 # Keys read live from curated.v_cm_elevate.scheme_specific on 2026-09-27
 # (jsonb_object_keys): populated on every row except sector_id.
 _CME_LIVE_JSON_KEYS = ("file_status", "sector_id", "gender_id", "occupation_id")
+_VERIFIER_JSON_MISREAD = re.compile(r"not\s+an?\s+json|json\s+(?:path|cast)\s+operator|\bboolean\b|"
+                                    r"(?:standard|plain|regular)\s+text\s+column|\bstring\s+column|not\s+jsonb?\b",
+                                    re.IGNORECASE)
 _VERIFIER_NO_COLUMN = re.compile(r"not\s+(?:list|exist|a\s+column|present|defined|in\s+the\s+(?:view|schema))|"
                                  r"non-?existent|does\s+not\s+(?:have|contain|include)|no\s+such|"
                                  r"isn['’]?t\s+(?:a\s+column|listed)", re.IGNORECASE)
@@ -13321,9 +13770,19 @@ def _verifier_scheme_specific_complaint_is_false(issue: str, schemes: list[str],
     "rejected in Ri Bhoi" query three times until the repair budget ran out
     (generalisation probe, 2026-09-27). scheme_specific IS a view column
     (schema_context CM ELEVATE TABLES) and these keys were read live."""
-    if schemes != ["CM Elevate"] or "scheme_specific" not in (issue or "").lower():
+    if schemes != ["CM Elevate"]:
         return False
-    if not _VERIFIER_NO_COLUMN.search(issue or ""):
+    # KI-232 live check (2026-10-14): "pending in Ri Bhoi" (file_status IN ('Pending',
+    # 'Send Back')) was rejected 3-4 times as "a JSON path operator (->>) on a column
+    # named 'file_status' which is not a JSON column … scheme_specific … is a boolean
+    # flag" -> 10 of 28 "couldn't build a working query"; a re-run met the same claim
+    # without naming scheme_specific ("… on a column that is not a JSON type … 'file_status'
+    # is a string column"). scheme_specific is jsonb and file_status a live key.
+    _low = (issue or "").lower()
+    if _VERIFIER_JSON_MISREAD.search(issue or "") and ("scheme_specific" in _low or "file_status" in _low
+                                                       or "->>" in _low):
+        pass
+    elif "scheme_specific" not in _low or not _VERIFIER_NO_COLUMN.search(issue or ""):
         return False
     keys = re.findall(r"scheme_specific\s*->>?\s*'(\w+)'", sql or "", re.IGNORECASE)
     return bool(keys) and all(k.lower() in _CME_LIVE_JSON_KEYS for k in keys)
@@ -13423,6 +13882,23 @@ def _cross_scheme_sql_issue(question: str, schemes: list[str], entity_result: di
                     "row is one PAYMENT (385,671 payments for 105,813 beneficiaries). Count Focus Plus "
                     "beneficiaries with COUNT(DISTINCT beneficiary_key), and keep every other clause "
                     "as it was.")
+    # KI-238: "How many beneficiaries did MGNREGA, PMAY-G, Focus+ and FOCUS each cover in
+    # FY 2025-26?" counted Focus Legacy COUNT(DISTINCT pg_id) — 8,806 producer GROUPS —
+    # as beneficiaries; the members are 37,018 (cross UAT 2026-10-15 T01.3 / T08.2 /
+    # T18.3). Unless the question asks for groups, the Focus Legacy people figure is
+    # SUM(no_of_pg_members).
+    if re.search(r"\bbeneficiar\w*|\bmembers?\b|\bpeople\b|\bpersons?\b|\bfarmers?\b|\bbigger\b|\blarger\b",
+                 question or "", re.IGNORECASE) and not re.search(
+            r"\bgroups?\b|\bpgs?\b|\bremittances?\b|\bpayments?\b", question or "", re.IGNORECASE):
+        for view, sel_list, _text in segs:
+            if view.lower() == "v_focus_legacy" and "no_of_pg_members" not in sel_list.lower() \
+                    and re.search(r"\bCOUNT\s*\(", sel_list, re.IGNORECASE):
+                return (
+                    "the Focus Legacy part counts producer groups or payment rows, but Focus Legacy "
+                    "records no individual person: its beneficiary figure is the members paid for, "
+                    "SUM(no_of_pg_members) (102,021 members in 11,906 groups). Use "
+                    "SUM(no_of_pg_members) for Focus Legacy, add COUNT(DISTINCT pg_id) AS "
+                    "producer_groups beside it if useful, and keep every other clause as it was.")
     # KI-223: one branch with no aggregate beside aggregated ones returns one row
     # per record (CROSS-10: 8,627 blank "CM Elevate" rows, cut at the 1,000-row cap;
     # CROSS-11: "SELECT 'CM Elevate', 0.00 FROM curated.v_cm_elevate" — a made-up
@@ -13618,11 +14094,14 @@ async def execute_with_repair(question: str, schemes: list[str], entity_result: 
         sql = _cm_elevate_sector_zero_groups(schemes, sql)
         sql = _cm_elevate_level_pending(question, schemes, sql)
         sql = _cm_elevate_unique_applications(question, schemes, sql)
+        sql = _cm_elevate_plain_pending(question, schemes, sql)
         sql = _cm_elevate_pending_without_level(question, schemes, sql)
         sql = _cm_elevate_plain_pending_file_status(question, schemes, sql)
         sql = _cm_elevate_unasked_level_filter(question, schemes, sql)
         sql = _cm_elevate_status_is_file_status(question, schemes, sql)
         sql = _cm_elevate_decision_status_column(schemes, sql)
+        sql = _cm_elevate_all_applications(question, schemes, sql)
+        sql = _cm_elevate_valid_default(question, schemes, sql)
         sql = _cm_legacy_qualify_shared_geo_cols(schemes, sql)
         sql = _mgnrega_numeric_division(schemes, sql)
         sql = _mgnrega_lakh_not_divided(schemes, sql)
@@ -14747,7 +15226,7 @@ def _cme_programme_count_filters(sql: str) -> "tuple[list[str], list[tuple[str, 
     progs: list[str] = []
     places: list[tuple[str, str, str, str]] = []      # (func, column, op, value)
     quals: list[str] = []
-    file_pending = False
+    file_pending = valid = False
     body_m = masked[span[1]:span[2]]
     pos = 0
     for part in re.split(r"(\s+AND\s+)", body_m, flags=re.IGNORECASE):
@@ -14766,7 +15245,10 @@ def _cme_programme_count_filters(sql: str) -> "tuple[list[str], list[tuple[str, 
         if re.fullmatch(r"(?:\w+\.)?entity_type\s*<>\s*'Unresolved'", conj, re.IGNORECASE):
             continue
         if re.fullmatch(r"\(?\s*" + _CME_FILE_PENDING_RE.pattern + r"\s*\)?", conj, re.IGNORECASE):
-            file_pending = True       # part of "pending at level N" (KI-186)
+            file_pending = True       # "pending" / part of "pending at level N" (KI-186, KI-232)
+            continue
+        if re.fullmatch(r"\(?\s*(?:\w+\.)?data_verified\s*=\s*'Valid'\s*\)?", conj, re.IGNORECASE):
+            valid = True              # the default scope (KI-232): "valid applications"
             continue
         qm = next(((rx.match(conj), words) for rx, words in _CME_ZERO_QUALIFIERS if rx.match(conj)), None)
         if qm:
@@ -14778,7 +15260,7 @@ def _cme_programme_count_filters(sql: str) -> "tuple[list[str], list[tuple[str, 
         places.append(((pm.group(1) or "").upper(), pm.group(2).lower(), pm.group(3).upper(),
                        pm.group(4).replace("''", "'")))
     if file_pending and not any(q.startswith("pending at level") for q in quals):
-        quals.append("with file status Pending")
+        quals.append("pending")
     if not progs or len(quals) > 1:
         return None
     alias = re.search(r"\bcount\s*\([^)]*\)\s*(?:as\s+)?(\w+)", select_list, re.IGNORECASE)
@@ -14787,7 +15269,8 @@ def _cme_programme_count_filters(sql: str) -> "tuple[list[str], list[tuple[str, 
             or re.search(r"count\s*\(\s*distinct\s+(?:\w+\.)?request_id", select_list, re.IGNORECASE)
             else "applications")
     q = f" {quals[0]}" if quals else ""
-    return progs, places, (noun + q, noun[:-1] + q)
+    adj = "valid " if valid else ""
+    return progs, places, (adj + noun + q, adj + noun[:-1] + q)
 
 
 def _cme_place_words(places: "list[tuple[str, str, str, str]]") -> str:
@@ -15020,9 +15503,65 @@ async def _cm_elevate_answer_guarantees(question: str, sql: str, rows: list[dict
     answer = _cme_grouped_rows(answer, rows)
     answer = _cme_complete_list(question, answer, rows)
     answer = _cme_multi_scheme_total(question, sql, rows, answer)
-    # KI-074 decided 2026-09-28 (product owner): "pending" = verification On Hold
-    # only. The interim second line with the file_status Pending count is gone.
-    return _cme_comparison(question, rows, answer)
+    # KI-232 (user decision 2026-10-14) supersedes KI-074: "pending" = file_status
+    # Pending / Send Back, and counts are of VALID applications by default.
+    answer = _cme_comparison(question, rows, answer)
+    all_answer = _cme_all_applications_answer(sql, rows)
+    if all_answer:
+        return all_answer
+    return _cme_valid_scope_note(question, sql, answer)
+
+
+_CME_VERIFICATION_ORDER = ("Valid", "On Hold", "Invalid", "Wrong", "(not recorded)")
+
+
+def _cme_scope_words(sql: str) -> str:
+    """" in West Garo Hills under the Meghalaya Piggery Development Scheme" from the
+    SQL's own place and programme filters — for answers built without the composer."""
+    places = [_CME_ZERO_PLACE_COLS[c.lower()].format(_fp_title(v.replace("''", "'").upper()))
+              for c, v in re.findall(r"\b(lgd_district|lgd_block|lgd_village_name)\s*\)?\s*=\s*'((?:[^']|'')*)'",
+                                     sql or "", re.IGNORECASE)]
+    m = _CME_SCHEME_IN_RE.search(sql or "")
+    progs = [x.replace("''", "'") for x in _SQL_LITERAL.findall(m.group(1))] if m else []
+    progs += [x.replace("''", "'") for x in re.findall(r"\bscheme_name\s*=\s*'((?:[^']|'')*)'", sql or "",
+                                                       re.IGNORECASE)]
+    out = f" in {', '.join(dict.fromkeys(places))}" if places else ""
+    if progs:
+        out += " under the " + _cme_join_names(list(dict.fromkeys(progs)))
+    return out
+
+
+def _cme_all_applications_answer(sql: str, rows: list[dict]) -> "str | None":
+    """KI-232: "all applications" — the total and its split by verification state,
+    from the rows _cm_elevate_all_applications produced (alias verification_state).
+    Built here, not by the composer: every figure is a row value or their sum."""
+    if not rows or not all(_CME_VERIFICATION_ALIAS in r for r in rows):
+        return None
+    nums = [k for k in rows[0] if k != _CME_VERIFICATION_ALIAS and _as_number(rows[0].get(k)) is not None]
+    if not nums:
+        return None
+    col = nums[0]
+    noun = "applicants" if "applicant" in col.lower() or re.search(
+        r"count\s*\(\s*distinct\s+(?:\w+\.)?request_id", sql or "", re.IGNORECASE) else "applications"
+    vals = {str(r[_CME_VERIFICATION_ALIAS]): _as_number(r.get(col)) or 0 for r in rows}
+    total = sum(vals.values())
+    order = sorted(vals, key=lambda k: (_CME_VERIFICATION_ORDER.index(k) if k in _CME_VERIFICATION_ORDER
+                                        else len(_CME_VERIFICATION_ORDER), -vals[k]))
+    lines = "\n".join(f"- {k}: {_fmt_num(vals[k])}" for k in order)
+    return (f"There {'is' if total == 1 else 'are'} {_fmt_num(total)} CM Elevate "
+            f"{noun[:-1] if total == 1 else noun}{_cme_scope_words(sql)} in total — every application, "
+            f"whatever its verification state:\n{lines}")
+
+
+def _cme_valid_scope_note(question: str, sql: str, answer: str) -> str:
+    """KI-232: a default-scope count (data_verified = 'Valid' added because the
+    question named no verification state) says so, so the figure is not read as
+    every application. Silent when the answer already says "valid"."""
+    if (not answer or _CME_VERIFICATION_NAMED_Q.search(question or "")
+            or not re.search(r"\bdata_verified\s*=\s*'Valid'", sql or "", re.IGNORECASE)
+            or re.search(r"\bvalid\b", answer, re.IGNORECASE)):
+        return answer
+    return answer.rstrip() + "\n\nThese figures count valid applications only (data verification: Valid)."
 
 
 # schemes whose one-figure answers must state THAT figure (see compose_response).
@@ -15735,9 +16274,11 @@ async def _answer_data(question: str, scope: "auth.UserScope | None" = None,
     # for). Answered deterministically across every scheme that records money.
     # A ranking between NAMED schemes ("higher: Focus+ or CM-ELEVATE?") is the
     # cross-scheme comparison below instead, restricted to the schemes asked.
+    # An unnamed ranking the comparison takes ("Leaving out CM-ELEVATE, which scheme
+    # has spent the most money?") is answered there, over the default schemes and
+    # without the excluded ones (cross UAT T12.2, KI-234 / KI-239).
     _xs_plan = _cross_scheme_compare_plan(question)
-    if _wants_cross_scheme_money_ranking(question) and (
-            _xs_plan is None or len(_named_schemes(question)) < 2):
+    if _wants_cross_scheme_money_ranking(question) and _xs_plan is None:
         return await _cross_scheme_money_answer(question)
 
     # A comparison across schemes (officer cross-scheme cases, 2026-10-10): fixed

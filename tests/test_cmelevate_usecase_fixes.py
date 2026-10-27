@@ -346,7 +346,7 @@ def test_pending_at_level_drops_the_on_hold_filter():
            "WHERE LOWER(current_level) = 'level2'\n  AND data_verified = 'On Hold'\nLIMIT 1")
     out = p._cm_elevate_level_pending("How many CM ELEVATE applications are pending at level 2?", CME, sql)
     assert "On Hold" not in out and "current_level) = 'level2'" in out
-    assert "(LOWER(current_level) = 'level2' AND scheme_specific ->> 'file_status' = 'Pending')" in out  # KI-186
+    assert "(LOWER(current_level) = 'level2' AND scheme_specific ->> 'file_status' IN ('Pending', 'Send Back'))" in out  # KI-186/187
 
 
 # ── KI-186: pending at level N = level AND file_status 'Pending'; "unique" = distinct ──
@@ -360,14 +360,14 @@ SHOT_SQL = ("SELECT COUNT(*) AS applications\nFROM curated.v_cm_elevate\n"
 def test_screenshot_question_gets_pending_state_and_distinct_count():
     out = p._cm_elevate_unique_applications(SHOT_Q, CME, p._cm_elevate_level_pending(SHOT_Q, CME, SHOT_SQL))
     assert out == ("SELECT COUNT(DISTINCT request_id) AS applications\nFROM curated.v_cm_elevate\n"
-                   "WHERE (LOWER(current_level) = 'level1' AND scheme_specific ->> 'file_status' = 'Pending')\nLIMIT 1")
+                   "WHERE (LOWER(current_level) = 'level1' AND scheme_specific ->> 'file_status' IN ('Pending', 'Send Back'))\nLIMIT 1")
 
 
 def test_pending_state_added_inside_a_count_filter_too():
     sql = ("SELECT lgd_district, COUNT(*) FILTER (WHERE LOWER(current_level) = 'level2') AS pending "
            "FROM curated.v_cm_elevate GROUP BY lgd_district")
     out = p._cm_elevate_level_pending("applications pending at level 2 by district", CME, sql)
-    assert "FILTER (WHERE (LOWER(current_level) = 'level2' AND scheme_specific ->> 'file_status' = 'Pending'))" in out
+    assert "FILTER (WHERE (LOWER(current_level) = 'level2' AND scheme_specific ->> 'file_status' IN ('Pending', 'Send Back')))" in out
 
 
 @pytest.mark.parametrize("q,sql", [
@@ -379,7 +379,7 @@ def test_pending_state_added_inside_a_count_filter_too():
      "SELECT COUNT(*) FROM curated.v_cm_elevate WHERE LOWER(current_level) = 'level2'"),
     # already carries the Pending state
     ("pending at level 1", "SELECT COUNT(*) FROM curated.v_cm_elevate WHERE LOWER(current_level) = 'level1' "
-                           "AND scheme_specific ->> 'file_status' = 'Pending'"),
+                           "AND scheme_specific ->> 'file_status' IN ('Pending', 'Send Back')"),
     # "on hold at level 1" is asked explicitly
     ("How many applications are on hold pending at level 1?",
      "SELECT COUNT(*) FROM curated.v_cm_elevate WHERE LOWER(current_level) = 'level1' AND data_verified = 'On Hold'"),
@@ -450,11 +450,11 @@ TOP_Q = "Which CM ELEVATE programs have the highest number of pending applicatio
 @pytest.mark.parametrize("where,expected", [
     # live 2026-10-05, 4 of 6 runs: "Tourism Vehicle 89" against the true On Hold leader
     ("WHERE LOWER(current_file_status) LIKE 'sendback%' OR current_file_status IS NULL GROUP BY scheme_name",
-     "WHERE data_verified = 'On Hold' GROUP BY scheme_name"),
+     "WHERE scheme_specific ->> 'file_status' IN ('Pending', 'Send Back') GROUP BY scheme_name"),
     ("WHERE lgd_district = 'RI BHOI' AND LOWER(current_file_status) = 'forward' GROUP BY scheme_name",
-     "WHERE lgd_district = 'RI BHOI' AND data_verified = 'On Hold' GROUP BY scheme_name"),
+     "WHERE lgd_district = 'RI BHOI' AND scheme_specific ->> 'file_status' IN ('Pending', 'Send Back') GROUP BY scheme_name"),
 ])
-def test_plain_pending_on_file_status_is_restored_to_on_hold(where, expected):
+def test_plain_pending_on_file_status_is_restored_to_file_status_pending(where, expected):  # KI-232
     sql = f"SELECT scheme_name, COUNT(*) AS pending FROM curated.v_cm_elevate {where} ORDER BY pending DESC LIMIT 10"
     assert p._cm_elevate_plain_pending_file_status(TOP_Q, CME, sql) == \
         f"SELECT scheme_name, COUNT(*) AS pending FROM curated.v_cm_elevate {expected} ORDER BY pending DESC LIMIT 10"
@@ -488,13 +488,14 @@ def test_explicit_on_hold_at_a_level_is_kept():
     assert p._cm_elevate_level_pending("How many are on hold at level 1?", CME, sql) == sql
 
 
-def test_plain_pending_filtered_on_a_level_is_restored_to_on_hold():
+def test_plain_pending_filtered_on_a_level_becomes_file_status_pending():  # KI-232
     # the 019a re-test regression: no level named, SQL filtered level1 (SEED "3,633 pending")
     sql = ("SELECT scheme_name, COUNT(*) AS pending_applications FROM curated.v_cm_elevate "
            "WHERE LOWER(current_level) = 'level1' GROUP BY scheme_name ORDER BY pending_applications DESC LIMIT 10")
     out = p._cm_elevate_pending_without_level(
         "Which CM ELEVATE programs have the highest number of pending applications?", CME, sql)
-    assert "WHERE data_verified = 'On Hold' GROUP BY scheme_name" in out and "current_level" not in out
+    assert "WHERE scheme_specific ->> 'file_status' IN ('Pending', 'Send Back') GROUP BY scheme_name" in out \
+        and "current_level" not in out
 
 
 @pytest.mark.parametrize("q", ["How many applications are pending at level 2?",
@@ -850,12 +851,12 @@ def test_cm_elevate_is_allowed_the_village_or_outside_place_check():
     assert '["CM Elevate"]' in inspect.getsource(p._mgnrega_village_not_out_of_area)
 
 
-def test_plain_pending_with_a_two_digit_level_becomes_on_hold():
+def test_plain_pending_with_a_two_digit_level_becomes_file_status_pending():  # KI-232
     sql = ("SELECT COUNT(*) AS applications FROM curated.v_cm_elevate WHERE LOWER(current_level) = 'level12' "
            "AND lgd_block = 'KHATARSHNONG LAITKROH' LIMIT 1")
     q = "How many CM ELEVATE applications are pending in 12TH MER, Khatarshnong Laitkroh block?"
     out = p._cm_elevate_unasked_level_filter(q, CME, p._cm_elevate_pending_without_level(q, CME, sql))
-    assert "data_verified = 'On Hold'" in out and "current_level" not in out
+    assert "scheme_specific ->> 'file_status' IN ('Pending', 'Send Back')" in out and "current_level" not in out
 
 
 def test_verifier_grain_complaint_on_the_view_is_discarded():
@@ -901,3 +902,140 @@ def test_status_rule_and_vocab_say_current_file_status():
     from app import schema_context as sc
     src = open(sc.__file__, encoding="utf-8").read()
     assert "ALWAYS means current_file_status" in src and '"status" (default) -> data_verified' not in src
+
+
+# ── KI-232 (user decision 2026-10-14): Valid-only counts; pending = Pending + Send Back ──
+PEND_IN = "scheme_specific ->> 'file_status' IN ('Pending', 'Send Back')"
+VALID = "data_verified = 'Valid'"
+
+
+def _chain(q, sql):
+    for f in (p._cm_elevate_level_pending, p._cm_elevate_unique_applications, p._cm_elevate_plain_pending,
+              p._cm_elevate_pending_without_level, p._cm_elevate_plain_pending_file_status,
+              p._cm_elevate_all_applications, p._cm_elevate_valid_default):
+        sql = f(q, CME, sql)
+    return " ".join(sql.split())
+
+
+def test_plain_application_count_is_valid_only():
+    out = _chain("How many CM Elevate applications are there in Ri Bhoi?",
+                 "SELECT COUNT(*) AS applications FROM curated.v_cm_elevate WHERE lgd_district = 'RI BHOI' LIMIT 1")
+    assert out == ("SELECT COUNT(*) AS applications FROM curated.v_cm_elevate WHERE lgd_district = 'RI BHOI' "
+                   "AND data_verified = 'Valid' LIMIT 1")
+
+
+def test_applicants_with_no_where_get_one():
+    out = _chain("How many applicants are there in each district?",
+                 "SELECT lgd_district, COUNT(DISTINCT request_id) AS applicants FROM curated.v_cm_elevate "
+                 "GROUP BY lgd_district ORDER BY 2 DESC")
+    assert "FROM curated.v_cm_elevate WHERE data_verified = 'Valid' GROUP BY lgd_district" in out
+
+
+def test_top_level_or_is_parenthesised_before_the_valid_test():
+    out = _chain("How many applicants under SEED or Piggery?",
+                 "SELECT COUNT(*) FROM curated.v_cm_elevate WHERE scheme_name = 'A' OR scheme_name = 'B'")
+    assert out.endswith("WHERE (scheme_name = 'A' OR scheme_name = 'B') AND data_verified = 'Valid'")
+
+
+def test_complex_query_reads_a_valid_only_subquery():
+    out = _chain("Compare applicants in Ri Bhoi and East Khasi Hills",
+                 "WITH a AS (SELECT lgd_district, COUNT(*) n FROM curated.v_cm_elevate v GROUP BY 1) SELECT * FROM a")
+    assert "FROM (SELECT * FROM curated.v_cm_elevate WHERE data_verified = 'Valid') AS v GROUP BY 1" in out
+
+
+def test_plain_pending_is_file_status_pending_or_sent_back_and_valid():
+    out = _chain("How many applications are pending in Ri Bhoi?",
+                 "SELECT COUNT(*) FROM curated.v_cm_elevate WHERE lgd_district = 'RI BHOI' "
+                 "AND data_verified = 'On Hold'")
+    assert out == f"SELECT COUNT(*) FROM curated.v_cm_elevate WHERE lgd_district = 'RI BHOI' AND {PEND_IN} AND {VALID}"
+
+
+def test_pending_at_level_is_level_and_pending_or_sent_back_and_valid():
+    out = _chain("how many cm elevate unique applications are pending at level 1 for all of Meghalaya",
+                 "SELECT COUNT(*) AS applications FROM curated.v_cm_elevate WHERE LOWER(current_level) = 'level1' LIMIT 1")
+    assert out == (f"SELECT COUNT(DISTINCT request_id) AS applications FROM curated.v_cm_elevate WHERE "
+                   f"(LOWER(current_level) = 'level1' AND {PEND_IN}) AND {VALID} LIMIT 1")
+
+
+def test_old_pending_only_level_test_is_widened():
+    sql = ("SELECT COUNT(*) FROM curated.v_cm_elevate WHERE LOWER(current_level) = 'level0' "
+           "AND scheme_specific ->> 'file_status' = 'Pending'")
+    assert PEND_IN in p._cm_elevate_level_pending("pending at level 0", CME, sql)
+
+
+def test_pending_by_sector_filter_becomes_file_status():
+    out = _chain("Give me pendency status for Piggery broken down by sector",
+                 "SELECT COUNT(*) AS n, COUNT(*) FILTER (WHERE data_verified = 'On Hold') AS pending "
+                 "FROM curated.v_cm_elevate WHERE scheme_name = 'Meghalaya Piggery Development Scheme' GROUP BY 1")
+    assert f"FILTER (WHERE {PEND_IN})" in out and out.count(VALID) == 1 and "On Hold" not in out
+
+
+@pytest.mark.parametrize("q,sql", [
+    ("How many applications are on hold in Ri Bhoi?",
+     "SELECT COUNT(*) FROM curated.v_cm_elevate WHERE lgd_district = 'RI BHOI' AND data_verified = 'On Hold'"),
+    ("What is the verification status breakdown?", "SELECT data_verified, COUNT(*) FROM curated.v_cm_elevate GROUP BY 1"),
+    ("How many applications have verification pending?",
+     "SELECT COUNT(*) FROM curated.v_cm_elevate WHERE data_verified IS DISTINCT FROM 'Valid'"),
+    ("How many invalid applications are there?",
+     "SELECT COUNT(*) FROM curated.v_cm_elevate WHERE data_verified = 'Invalid'"),
+    ("Which villages have applications in Ri Bhoi?",       # a list, not a count
+     "SELECT DISTINCT lgd_village_name FROM curated.v_cm_elevate WHERE lgd_district = 'RI BHOI'"),
+])
+def test_a_named_verification_state_or_a_list_is_answered_as_asked(q, sql):
+    assert _chain(q, sql) == " ".join(sql.split())
+
+
+@pytest.mark.parametrize("q", ["How many CM Elevate applications are there in total, including invalid and on hold?",
+                               "Show all applications in Ri Bhoi",
+                               "How many applications irrespective of verification?"])
+def test_all_applications_are_split_by_verification_state(q):
+    out = _chain(q, "SELECT COUNT(*) AS applications FROM curated.v_cm_elevate WHERE data_verified = 'Valid' LIMIT 1")
+    assert out.startswith("SELECT COALESCE(data_verified, '(not recorded)') AS verification_state, COUNT(*)")
+    assert "'Valid'" not in out.split("AS verification_state")[1] and out.endswith("GROUP BY 1 ORDER BY 2 DESC")
+
+
+def test_all_applications_answer_states_total_and_split():
+    sql = ("SELECT COALESCE(data_verified, '(not recorded)') AS verification_state, COUNT(*) AS applications "
+           "FROM curated.v_cm_elevate WHERE lgd_district = 'RI BHOI' GROUP BY 1 ORDER BY 2 DESC")
+    rows = [{"verification_state": "Valid", "applications": 2028}, {"verification_state": "On Hold", "applications": 492},
+            {"verification_state": "(not recorded)", "applications": 18}, {"verification_state": "Invalid", "applications": 68}]
+    out = p._cme_all_applications_answer(sql, rows)
+    assert out.startswith("There are 2,606 CM Elevate applications in Ri Bhoi in total")
+    assert out.index("- Valid: 2,028") < out.index("- On Hold: 492") < out.index("- Invalid: 68")
+    assert out.index("- Invalid: 68") < out.index("- (not recorded): 18")
+
+
+def test_default_scope_answer_says_valid():
+    sql = "SELECT COUNT(*) AS applications FROM curated.v_cm_elevate WHERE lgd_district = 'RI BHOI' AND data_verified = 'Valid'"
+    out = p._cme_valid_scope_note("How many applications in Ri Bhoi?", sql, "There are 2,028 applications in Ri Bhoi.")
+    assert out.endswith("These figures count valid applications only (data verification: Valid).")
+    said = "There are 2,028 valid applications in Ri Bhoi."
+    assert p._cme_valid_scope_note("How many applications in Ri Bhoi?", sql, said) == said
+
+
+def test_breakdown_wording_names_valid_and_pending():
+    sql = (f"SELECT scheme_name, COUNT(*) AS applications FROM curated.v_cm_elevate WHERE lgd_district = 'RI BHOI' "
+           f"AND scheme_name IN ('{CIN}', '{WAR}') AND {PEND_IN} AND {VALID} GROUP BY scheme_name")
+    out = p._cme_multi_scheme_total("q", sql, [{"scheme_name": WAR, "applications": 4}], "x")
+    assert out.startswith("There are 4 valid applications pending in Ri Bhoi across the 2 programmes")
+
+
+def test_cross_scheme_cm_elevate_count_is_valid_only():
+    assert p._XS_MEASURES[("CM Elevate", "count")][3] == "data_verified = 'Valid'"
+
+
+def test_verifier_json_misread_on_file_status_is_discarded():
+    # KI-232 live check 2026-10-14: 10 of 28 "pending in <district>" died on this complaint
+    sql = ("SELECT COUNT(*) AS valid_pending_applications FROM curated.v_cm_elevate WHERE lgd_district = 'RI BHOI' "
+           "AND scheme_specific ->> 'file_status' IN ('Pending', 'Send Back') AND data_verified = 'Valid' LIMIT 1")
+    issue = ("Check 1: The SQL uses a JSON path operator (->>) on a column named 'file_status' which is not a JSON "
+             "column. Additionally, the WHERE clause filters on 'scheme_specific' which is a boolean flag, not a JSON "
+             "object, making the operator invalid.")
+    assert p._verifier_scheme_specific_complaint_is_false(issue, CME, sql, {"district": "RI BHOI"})
+    # the same claim without naming scheme_specific (re-run, West Khasi Hills)
+    issue2 = ("Check 1: The SQL uses a JSON path operator (->>) on a column that is not a JSON type. The schema "
+              "shows 'file_status' is a string column, not a JSON object.")
+    assert p._verifier_scheme_specific_complaint_is_false(issue2, CME, sql, {"district": "RI BHOI"})
+    # an unknown key is still a real problem
+    bad = sql.replace("'file_status'", "'status'")
+    assert not p._verifier_scheme_specific_complaint_is_false(issue, CME, bad, {"district": "RI BHOI"})
